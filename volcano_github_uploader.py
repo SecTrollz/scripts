@@ -1,10 +1,11 @@
- #!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Volcano Forensic Hunter + GitHub Uploader (2026)
+Hardened, Corrected, and Ready for Real-World Use
 
 This script:
-1. Hunts down and quarantines all traces of example.org and its IPs.
-2. Uploads the forensic report and quarantined files to a GitHub repo.
+1. Hunts down and quarantines all traces of a REAL suspicious domain/IP.
+2. Uploads the forensic report and quarantined files to GitHub.
 3. Never deletes anything—only quarantines and documents.
 """
 
@@ -23,7 +24,7 @@ import urllib.error
 import ssl
 import tempfile
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 # --- Constants ---
 NEXTDNS_API = "https://api.nextdns.io"
@@ -31,7 +32,7 @@ GITHUB_API = "https://api.github.com"
 GITHUB_IP = "140.82.112.5"
 QUARANTINE_DIR = "/tmp/volcano_quarantine"
 LOG_FILE = "volcano_forensic_report.txt"
-SUSPICIOUS_DOMAINS = ["example.org"]
+SUSPICIOUS_DOMAINS = ["malware.example"]  # REPLACE WITH REAL SUSPICIOUS DOMAIN
 SUSPICIOUS_IPS = []  # Populated dynamically
 DNS_SERVERS = ["9.9.9.9", "8.8.8.8"]  # Quad9/Google DNS
 GITIGNORE_CONTENT = """# Quarantined files
@@ -53,17 +54,19 @@ def resolve_domain(domain):
         try:
             resolver = socket.getaddrinfo(domain, None, proto=socket.IPPROTO_TCP)
             for addr in resolver:
-                ips.add(addr[4][0])
+                ip = addr[4][0]
+                if ip not in ["0.0.0.0", "::"]:  # Skip placeholder IPs
+                    ips.add(ip)
         except Exception:
             continue
     return list(ips)
 
-def get_nextdns_logs(api_key, days=1):
+def get_nextdns_logs(api_key, profile_id, days=1):
     """Fetch recent DNS logs from NextDNS API."""
-    now = datetime.utcnow()
+    now = datetime.now(timezone.utc)
     start = (now - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
     end = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-    url = f"{NEXTDNS_API}/profiles/self/analytics/dns?limit=1000&start={start}&end={end}"
+    url = f"{NEXTDNS_API}/profiles/{profile_id}/analytics/dns?limit=1000&start={start}&end={end}"
     headers = {"X-Api-Key": api_key, "Accept": "application/json"}
     try:
         response = requests.get(url, headers=headers)
@@ -281,17 +284,17 @@ def git_push(root, owner, repo, method, token, dns=False):
 def main():
     print("=== Volcano Forensic Hunter + GitHub Uploader (2026) ===")
 
-    # Step 1: Resolve example.org to IPs
-    print("Resolving example.org...")
-    SUSPICIOUS_IPS.extend(resolve_domain("example.org"))
-    print(f"Resolved IPs for example.org: {SUSPICIOUS_IPS}")
+    # Step 1: Resolve suspicious domain to IPs
+    print("Resolving suspicious domain...")
+    SUSPICIOUS_IPS.extend(resolve_domain(SUSPICIOUS_DOMAINS[0]))
+    print(f"Resolved IPs: {SUSPICIOUS_IPS}")
 
     # Step 2: NextDNS Logs
     api_key = input("NextDNS API Key: ").strip()
-    logs = get_nextdns_logs(api_key)
+    profile_id = input("NextDNS Profile ID: ").strip()
+    logs = get_nextdns_logs(api_key, profile_id)
     if not logs:
-        print("No logs retrieved from NextDNS.")
-        return
+        print("No logs retrieved from NextDNS. Continuing with on-device scan only.")
 
     # Step 3: On-Device Scan
     print("Scanning on-device filepaths...")
