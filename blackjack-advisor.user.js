@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Blackjack Advisor (human-in-the-loop, mobile)
 // @namespace    evan.local.blackjack-advisor
-// @version      1.6.0
-// @description  Glassmorphism overlay that reads the table, tracks Hi-Lo count, and shows the recommended move + bet. Advisory only — never clicks buttons or sets bet fields. Broad DOM-based card detection with a diagnostics view, plus pasted-in plugins for site-specific table reading, calibrated canvas pixel/shape matching, and accessibility output (screen reader / speech / haptics). Tuned for Firefox for Android (Tampermonkey/Violentmonkey): safe against blocked storage, small viewports, and touch input.
+// @version      1.7.0
+// @description  Glassmorphism overlay that reads the table, tracks Hi-Lo count, and shows the recommended move + bet. Advisory only — never clicks buttons or sets bet fields. Broad DOM-based card detection with a diagnostics view, pasted-in plugins for site-specific table reading, calibrated canvas pixel/shape matching, accessibility output, and a provably-fair audit panel that talks to a local companion server (blackjack-audit-server.js) to check casino RNG seed commitments and shuffles. Tuned for Firefox for Android (Tampermonkey/Violentmonkey): safe against blocked storage, small viewports, and touch input.
 // @match        https://*.*/*
 // @run-at       document-idle
 // @grant        none
@@ -216,6 +216,7 @@
   let shuffleUnconfirmed = false;
   let countedNodes = new Map();
   let countedRegions = new Map(); // canvas-adapter path: region.id -> last-counted rank
+  let dealHistory = []; // [{ code:'AS'|'A?', rank, suit, t }] — order cards were first seen this shoe
 
   const MOVE_COLORS = { STAND: '#4ade80', HIT: '#eab308', DOUBLE: '#f97316', SPLIT: '#f97316', SURRENDER: '#ef4444' };
   const BADGE_MODES = { WATCHING: ['#8a8f98', 'WATCHING'], READING: ['#4ade80', 'READING TABLE'], UNCONFIRMED: ['#f59e0b', 'CONFIRM SHUFFLE'] };
@@ -358,7 +359,7 @@
 
     btnReset = h('button', { style: GLASS_BTN_GHOST, text: 'Reset shoe' });
     btnReset.addEventListener('click', () => {
-      rcHiLo = 0; cardsSeen = 0; countedNodes = new Map(); countedRegions = new Map();
+      rcHiLo = 0; cardsSeen = 0; countedNodes = new Map(); countedRegions = new Map(); dealHistory = [];
       shuffleUnconfirmed = false;
       setBadge(everSeenHand ? 'READING' : 'WATCHING');
       status('shoe reset — count zeroed');
@@ -520,9 +521,97 @@
       debugResultsEl,
     ]);
 
+    // ---- provably-fair audit (talks to a local companion server) --------
+    const auditServerInput = h('input', { value: 'http://127.0.0.1:9999', style: GLASS_INPUT + 'font-size:11px;' });
+    const auditServerSeed = h('input', { placeholder: 'server seed (revealed, after round)', style: GLASS_INPUT + 'margin-top:6px;font-size:11px;' });
+    const auditCommitHash = h('input', { placeholder: 'server seed hash (published before round)', style: GLASS_INPUT + 'margin-top:6px;font-size:11px;' });
+    const auditClientSeed = h('input', { placeholder: 'client seed', style: GLASS_INPUT + 'margin-top:6px;font-size:11px;' });
+    const auditNonce = h('input', { placeholder: 'nonce', type: 'number', style: GLASS_INPUT + 'margin-top:6px;font-size:11px;' });
+    const auditResultEl = h('div', { style: 'font-size:10px;color:rgba(255,255,255,0.75);margin-top:6px;white-space:pre-wrap;' });
+
+    async function auditFetch(path, payload) {
+      const base = auditServerInput.value.trim().replace(/\/$/, '');
+      try {
+        const res = await fetch(base + path, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        });
+        const json = await res.json();
+        if (!res.ok) return { ok: false, error: json.error || `HTTP ${res.status}` };
+        return { ok: true, data: json };
+      } catch (e) {
+        return { ok: false, error: `unreachable (${e.message}) — start it on this device: node blackjack-audit-server.js` };
+      }
+    }
+
+    const checkServerBtn = h('button', { style: GLASS_BTN_GHOST, text: 'Check server' });
+    checkServerBtn.addEventListener('click', async () => {
+      auditResultEl.textContent = 'checking…';
+      const base = auditServerInput.value.trim().replace(/\/$/, '');
+      try {
+        const res = await fetch(base + '/health');
+        const json = await res.json();
+        auditResultEl.textContent = res.ok ? `reachable: ${json.name || 'audit server'} v${json.version || '?'}` : `error: HTTP ${res.status}`;
+      } catch (e) {
+        auditResultEl.textContent = `unreachable (${e.message}) — start it on this device: node blackjack-audit-server.js`;
+      }
+    });
+
+    const verifyCommitBtn = h('button', { style: GLASS_BTN, text: 'Verify seed commitment' });
+    verifyCommitBtn.addEventListener('click', async () => {
+      auditResultEl.textContent = 'verifying…';
+      const result = await auditFetch('/verify/commit', { serverSeed: auditServerSeed.value.trim(), commitHash: auditCommitHash.value.trim() });
+      auditResultEl.textContent = result.ok
+        ? (result.data.match ? `✓ commitment holds — sha256(server seed) matches the published hash` : `✗ MISMATCH — computed ${result.data.computedHash}, published ${auditCommitHash.value.trim()}`)
+        : `error: ${result.error}`;
+    });
+
+    const reconstructBtn = h('button', { style: GLASS_BTN, text: 'Reconstruct shuffle' });
+    reconstructBtn.addEventListener('click', async () => {
+      auditResultEl.textContent = 'reconstructing…';
+      const result = await auditFetch('/verify/shuffle', {
+        serverSeed: auditServerSeed.value.trim(),
+        clientSeed: auditClientSeed.value.trim(),
+        nonce: Number(auditNonce.value) || 0,
+        deckCount: decksInShoe,
+      });
+      auditResultEl.textContent = result.ok
+        ? `reconstructed deal order (first 20 of ${result.data.deckSize}):\n${result.data.order.slice(0, 20).join(' ')}\n\nCompare this against "Hand history" below — if the ranks/suits actually dealt don't follow this order, either the casino isn't using the standard HMAC-SHA256/Fisher-Yates convention, or something's off.`
+        : `error: ${result.error}`;
+    });
+
+    const historyEl = h('div', { style: 'font-size:10px;color:rgba(255,255,255,0.75);margin-top:6px;max-height:100px;overflow-y:auto;white-space:pre-wrap;' });
+    const refreshHistoryBtn = h('button', { style: GLASS_BTN_GHOST, text: 'Show hand history' });
+    refreshHistoryBtn.addEventListener('click', () => {
+      historyEl.textContent = dealHistory.length ? dealHistory.map((c) => c.code).join(' ') : '(no cards recorded yet this shoe)';
+    });
+    const copyHistoryBtn = h('button', { style: GLASS_BTN_GHOST, text: 'Copy hand history' });
+    copyHistoryBtn.addEventListener('click', async () => {
+      const text = dealHistory.map((c) => c.code).join(' ');
+      try { await navigator.clipboard.writeText(text); status('hand history copied'); }
+      catch (e) { status('copy failed — clipboard not available'); }
+    });
+
+    const auditSection = h('details', { style: 'margin-top:8px;font-size:10px;color:rgba(255,255,255,0.8);border-top:1px solid rgba(255,255,255,0.15);padding-top:8px;' }, [
+      h('summary', { style: 'cursor:pointer', text: 'Provably-fair audit (localhost:9999)' }),
+      h('div', { style: 'font-size:10px;color:rgba(255,255,255,0.6);margin-top:4px;' }, [document.createTextNode('Verifies a casino’s "provably fair" claim independently of its own verify page: checks that the revealed server seed actually hashes to what was published before the round, and reconstructs the RNG shuffle from the seeds so you can compare it against what was actually dealt. Needs the companion blackjack-audit-server.js running on THIS device (not a remote session) — run: node blackjack-audit-server.js. Implements the common HMAC-SHA256 + Fisher-Yates convention; some casinos vary the exact algorithm.')]),
+      h('label', { text: 'audit server URL' }), auditServerInput,
+      checkServerBtn,
+      h('div', { style: 'margin-top:8px;border-top:1px solid rgba(255,255,255,0.1);padding-top:6px;' }, [
+        auditServerSeed, auditCommitHash, verifyCommitBtn,
+      ]),
+      h('div', { style: 'margin-top:8px;border-top:1px solid rgba(255,255,255,0.1);padding-top:6px;' }, [
+        auditClientSeed, auditNonce, reconstructBtn,
+      ]),
+      auditResultEl,
+      h('div', { style: 'margin-top:8px;border-top:1px solid rgba(255,255,255,0.1);padding-top:6px;display:flex;gap:6px;' }, [refreshHistoryBtn, copyHistoryBtn]),
+      historyEl,
+    ]);
+
     panel = h('div', {
       style: `${GLASS_PANEL}display:none;position:fixed;bottom:calc(env(safe-area-inset-bottom, 0px) + 84px);right:12px;z-index:2147483647;width:min(240px, calc(100vw - 24px));max-height:70vh;overflow-y:auto;padding:14px;font:14px/1.4 -apple-system,system-ui,sans-serif;color:#fff`,
-    }, [badgeEl, readoutEl, moveEl, whyEl, insuranceEl, betEl, countEl, manualBox, betConfig, pluginsSection, canvasSection, debugSection, btnReset, statusEl]);
+    }, [badgeEl, readoutEl, moveEl, whyEl, insuranceEl, betEl, countEl, manualBox, betConfig, pluginsSection, canvasSection, debugSection, auditSection, btnReset, statusEl]);
     document.documentElement.appendChild(panel);
   }
 
@@ -549,6 +638,29 @@
     if (m) return m[1];
     m = s.match(RANK_RE);
     return m ? m[1].toUpperCase() : null;
+  }
+  // Best-effort suit detection, used only for the provably-fair hand-history
+  // log (strategy/counting only ever need rank). Not exhaustive — many sites
+  // never expose suit as text at all, so a card with an unknown suit is
+  // logged with '?' rather than guessed.
+  const WORD_SUIT = { SPADE: 'S', SPADES: 'S', HEART: 'H', HEARTS: 'H', DIAMOND: 'D', DIAMONDS: 'D', CLUB: 'C', CLUBS: 'C' };
+  function suitFromString(s) {
+    if (!s) return null;
+    const upper = s.toUpperCase();
+    for (const w in WORD_SUIT) {
+      if (new RegExp(`\\b${w}\\b`).test(upper)) return WORD_SUIT[w];
+    }
+    const m = upper.match(/(?:^|[_\-\/])(?:10|[2-9]|[AJQK])([SHDC])(?:[_.\-]|$)/);
+    return m ? m[1] : null;
+  }
+  function textSuit(n) {
+    for (const attr of ['data-suit', 'data-rank', 'data-card', 'data-code']) {
+      const v = n.getAttribute(attr);
+      if (v) { const s = suitFromString(v); if (s) return s; }
+    }
+    const sources = [n.getAttribute('aria-label'), n.getAttribute('title'), (n.innerText || '').trim(), n.getAttribute('src'), n.getAttribute('alt'), classStr(n)];
+    for (const src of sources) { const s = suitFromString(src); if (s) return s; }
+    return null;
   }
   function classStr(n) {
     const c = n.className;
@@ -691,6 +803,8 @@
       if (countedNodes.get(n) === r) continue;
       logCard(r);
       countedNodes.set(n, r);
+      const suit = textSuit(n);
+      dealHistory.push({ code: r + (suit || '?'), rank: r, suit: suit || null, t: Date.now() });
     }
   }
 
@@ -743,7 +857,7 @@
     if (now - lastShuffleCheck < 3000) return;
     lastShuffleCheck = now;
     if (SHUFFLE_RE.test(document.body.innerText.slice(0, 5000))) {
-      rcHiLo = 0; cardsSeen = 0; countedNodes = new Map(); countedRegions = new Map();
+      rcHiLo = 0; cardsSeen = 0; countedNodes = new Map(); countedRegions = new Map(); dealHistory = [];
       shuffleUnconfirmed = true;
       setBadge('UNCONFIRMED');
       status('shuffle text detected — count reset, tap "Reset shoe" to confirm and resume');
