@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Blackjack Advisor (human-in-the-loop, mobile)
 // @namespace    evan.local.blackjack-advisor
-// @version      1.5.0
-// @description  Glassmorphism overlay that reads the table, tracks Hi-Lo count, and shows the recommended move + bet. Advisory only — never clicks buttons or sets bet fields. Supports pasted-in plugins for site-specific table reading and accessibility output (screen reader / speech / haptics). Tuned for Firefox for Android (Tampermonkey/Violentmonkey): safe against blocked storage, small viewports, and touch input.
+// @version      1.6.0
+// @description  Glassmorphism overlay that reads the table, tracks Hi-Lo count, and shows the recommended move + bet. Advisory only — never clicks buttons or sets bet fields. Broad DOM-based card detection with a diagnostics view, plus pasted-in plugins for site-specific table reading, calibrated canvas pixel/shape matching, and accessibility output (screen reader / speech / haptics). Tuned for Firefox for Android (Tampermonkey/Violentmonkey): safe against blocked storage, small viewports, and touch input.
 // @match        https://*.*/*
 // @run-at       document-idle
 // @grant        none
@@ -215,6 +215,7 @@
   let everSeenHand = false;
   let shuffleUnconfirmed = false;
   let countedNodes = new Map();
+  let countedRegions = new Map(); // canvas-adapter path: region.id -> last-counted rank
 
   const MOVE_COLORS = { STAND: '#4ade80', HIT: '#eab308', DOUBLE: '#f97316', SPLIT: '#f97316', SURRENDER: '#ef4444' };
   const BADGE_MODES = { WATCHING: ['#8a8f98', 'WATCHING'], READING: ['#4ade80', 'READING TABLE'], UNCONFIRMED: ['#f59e0b', 'CONFIRM SHUFFLE'] };
@@ -357,7 +358,7 @@
 
     btnReset = h('button', { style: GLASS_BTN_GHOST, text: 'Reset shoe' });
     btnReset.addEventListener('click', () => {
-      rcHiLo = 0; cardsSeen = 0; countedNodes = new Map();
+      rcHiLo = 0; cardsSeen = 0; countedNodes = new Map(); countedRegions = new Map();
       shuffleUnconfirmed = false;
       setBadge(everSeenHand ? 'READING' : 'WATCHING');
       status('shoe reset — count zeroed');
@@ -418,9 +419,110 @@
     ]);
     renderPluginList();
 
+    // ---- canvas calibration (pixel/shape matching for canvas-rendered tables) ----
+    const calibStatusEl = h('div', { style: 'font-size:10px;color:rgba(255,255,255,0.6);margin-top:4px;' });
+    const calibRegionsEl = h('div', { style: 'margin-top:6px;' });
+    let highlightEls = [];
+
+    function clearHighlights() {
+      highlightEls.forEach((el) => el.remove());
+      highlightEls = [];
+    }
+    function activeCanvasAdapter() {
+      return pluginRegistry.canvasAdapters.find((p) => {
+        try { return typeof p.matches !== 'function' || p.matches(window.location.hostname); }
+        catch (e) { return false; }
+      }) || null;
+    }
+    function renderRegions() {
+      while (calibRegionsEl.firstChild) calibRegionsEl.removeChild(calibRegionsEl.firstChild);
+      clearHighlights();
+      const adapter = activeCanvasAdapter();
+      if (!adapter) {
+        calibStatusEl.textContent = 'load a canvas-adapter plugin first (see example below)';
+        return;
+      }
+      let regions = [];
+      try { regions = adapter.findCardRegions(pluginCtx()) || []; }
+      catch (e) { calibStatusEl.textContent = `findCardRegions threw: ${e.message}`; return; }
+      const templates = loadCanvasTemplates(adapter.id);
+      calibStatusEl.textContent = `${regions.length} region(s) found — ${Object.keys(templates).length} label(s) calibrated`;
+      regions.forEach((region, i) => {
+        const box = h('div', { style: `position:fixed;left:${region.x}px;top:${region.y}px;width:${region.w}px;height:${region.h}px;border:2px solid #4ade80;z-index:2147483646;pointer-events:none;box-sizing:border-box;` });
+        document.documentElement.appendChild(box);
+        highlightEls.push(box);
+
+        const rankSelect = h('select', { style: 'font-size:11px;border-radius:8px;' });
+        ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'].forEach((r) => rankSelect.appendChild(h('option', { value: r, text: r })));
+        const captureBtn = h('button', { style: 'padding:2px 8px;font-size:10px;border-radius:20px;border:1px solid rgba(255,255,255,0.18);background:rgba(75,139,180,0.4);color:#fff;cursor:pointer;', text: 'capture' });
+        captureBtn.addEventListener('click', () => {
+          const sample = sampleCanvasRegion(region.x, region.y, region.w, region.h);
+          if (!sample) { calibStatusEl.textContent = `region ${region.id || i}: canvas unreadable (tainted or WebGL)`; return; }
+          const t = loadCanvasTemplates(adapter.id);
+          t[rankSelect.value] = { grid: sample.grid, colorHint: sample.colorHint };
+          saveCanvasTemplates(adapter.id, t);
+          calibStatusEl.textContent = `captured "${rankSelect.value}" from region ${region.id || i}`;
+          renderRegions();
+        });
+        calibRegionsEl.appendChild(h('div', { style: 'display:flex;align-items:center;gap:6px;font-size:11px;margin-top:4px;' }, [
+          h('span', { text: `${region.id || ('#' + i)} (${region.role || '?'})` }),
+          rankSelect,
+          captureBtn,
+        ]));
+      });
+    }
+    const rescanBtn = h('button', { style: GLASS_BTN_GHOST, text: 'Detect regions' });
+    rescanBtn.addEventListener('click', renderRegions);
+    const clearTemplatesBtn = h('button', { style: GLASS_BTN_GHOST, text: 'Clear calibration for this site' });
+    clearTemplatesBtn.addEventListener('click', () => {
+      const adapter = activeCanvasAdapter();
+      if (!adapter) return;
+      saveCanvasTemplates(adapter.id, {});
+      renderRegions();
+    });
+
+    const canvasSection = h('details', { style: 'margin-top:8px;font-size:10px;color:rgba(255,255,255,0.8);border-top:1px solid rgba(255,255,255,0.15);padding-top:8px;' }, [
+      h('summary', { style: 'cursor:pointer', text: 'Canvas calibration (pixel/shape matching)' }),
+      h('div', { style: 'font-size:10px;color:rgba(255,255,255,0.6);margin-top:4px;' }, [document.createTextNode('For canvas/WebGL tables with no readable DOM. Load a canvas-adapter plugin that reports pixel regions for each card slot, then capture one reference snapshot per rank label while that card is visibly showing at that slot — capture 10, J, Q, and K separately since they look different even though they play the same. A region is only read once its best match clears a confidence threshold; low-confidence regions are left blank rather than guessed.')]),
+      calibStatusEl,
+      calibRegionsEl,
+      rescanBtn,
+      clearTemplatesBtn,
+      h('details', { style: 'margin-top:6px;' }, [
+        h('summary', { style: 'cursor:pointer;font-size:10px;color:rgba(255,255,255,0.6);', text: 'Example: canvas adapter' }),
+        h('pre', { style: 'white-space:pre-wrap;font-size:10px;background:rgba(0,0,0,0.25);padding:6px;border-radius:8px;overflow-x:auto;margin-top:4px;' }, [document.createTextNode(EXAMPLE_CANVAS_ADAPTER)]),
+      ]),
+    ]);
+
+    // ---- debug: card detection diagnostics -------------------------------
+    const debugResultsEl = h('div', { style: 'margin-top:6px;max-height:160px;overflow-y:auto;' });
+    function renderDebugResults() {
+      while (debugResultsEl.firstChild) debugResultsEl.removeChild(debugResultsEl.firstChild);
+      const diag = diagnoseTable();
+      debugResultsEl.appendChild(h('div', { style: 'font-size:10px;color:rgba(255,255,255,0.7);', text:
+        `${diag.rows.length} candidate element(s)${diag.usedFallback ? ' (via whole-page text fallback)' : ''}; ${diag.canvases.length} canvas element(s) on page`
+      }));
+      diag.rows.slice(0, 40).forEach((row) => {
+        const highlightBtn = h('button', { style: 'padding:1px 6px;font-size:9px;border-radius:12px;border:1px solid rgba(255,255,255,0.18);background:rgba(255,255,255,0.08);color:#fff;cursor:pointer;', text: 'show' });
+        highlightBtn.addEventListener('click', () => flashHighlight(row.el));
+        debugResultsEl.appendChild(h('div', { style: 'display:flex;align-items:center;gap:6px;font-size:10px;margin-top:3px;' }, [
+          h('span', { text: `${row.rank || '?'}${row.faceDown ? ' (face-down)' : ''} via ${row.matchedVia || '—'}${row.dealer ? ' [dealer]' : ''}` }),
+          highlightBtn,
+        ]));
+      });
+    }
+    const debugScanBtn = h('button', { style: GLASS_BTN_GHOST, text: 'Scan now' });
+    debugScanBtn.addEventListener('click', renderDebugResults);
+    const debugSection = h('details', { style: 'margin-top:8px;font-size:10px;color:rgba(255,255,255,0.8);border-top:1px solid rgba(255,255,255,0.15);padding-top:8px;' }, [
+      h('summary', { style: 'cursor:pointer', text: 'Debug: card detection' }),
+      h('div', { style: 'font-size:10px;color:rgba(255,255,255,0.6);margin-top:4px;' }, [document.createTextNode('Lists every element the DOM reader currently sees as a candidate card, what matched it, and whether it landed in dealer or player. Use this to figure out why a site isn’t reading, then write a site-adapter or canvas-adapter plugin for it.')]),
+      debugScanBtn,
+      debugResultsEl,
+    ]);
+
     panel = h('div', {
       style: `${GLASS_PANEL}display:none;position:fixed;bottom:calc(env(safe-area-inset-bottom, 0px) + 84px);right:12px;z-index:2147483647;width:min(240px, calc(100vw - 24px));max-height:70vh;overflow-y:auto;padding:14px;font:14px/1.4 -apple-system,system-ui,sans-serif;color:#fff`,
-    }, [badgeEl, readoutEl, moveEl, whyEl, insuranceEl, betEl, countEl, manualBox, betConfig, pluginsSection, btnReset, statusEl]);
+    }, [badgeEl, readoutEl, moveEl, whyEl, insuranceEl, betEl, countEl, manualBox, betConfig, pluginsSection, canvasSection, debugSection, btnReset, statusEl]);
     document.documentElement.appendChild(panel);
   }
 
@@ -453,19 +555,50 @@
     if (!c) return '';
     return c.baseVal !== undefined ? c.baseVal : c.toString();
   }
-  function textRank(n) {
-    const attrs = n.getAttribute('data-rank') || n.getAttribute('data-card') || n.getAttribute('data-value') || n.getAttribute('aria-label');
-    if (attrs) { const r = rankFromString(attrs); if (r) return r; }
+  // Tries each signal in turn and reports which one matched, so the debug
+  // panel can show *why* an element was read as a given rank (or wasn't).
+  function textRankDetailed(n) {
+    for (const attr of ['data-rank', 'data-card', 'data-value', 'data-code', 'data-testid']) {
+      const v = n.getAttribute(attr);
+      if (v) { const r = rankFromString(v); if (r) return { rank: r, source: attr }; }
+    }
+    const aria = n.getAttribute('aria-label') || n.getAttribute('title');
+    if (aria) { const r = rankFromString(aria); if (r) return { rank: r, source: 'aria-label/title' }; }
     const text = (n.innerText || '').trim();
-    if (text) { const r = rankFromString(text); if (r) return r; }
+    if (text) { const r = rankFromString(text); if (r) return { rank: r, source: 'text' }; }
     const src = n.getAttribute('src') || n.getAttribute('xlink:href') || n.getAttribute('href');
-    if (src) { const r = rankFromString(src); if (r) return r; }
+    if (src) { const r = rankFromString(src); if (r) return { rank: r, source: 'src/href' }; }
     const alt = n.getAttribute('alt');
-    if (alt) { const r = rankFromString(alt); if (r) return r; }
-    return rankFromString(classStr(n));
+    if (alt) { const r = rankFromString(alt); if (r) return { rank: r, source: 'alt' }; }
+    let bg = '';
+    try { bg = getComputedStyle(n).backgroundImage || ''; } catch (e) { /* unreachable in most engines */ }
+    if (bg && bg !== 'none') { const r = rankFromString(bg); if (r) return { rank: r, source: 'background-image' }; }
+    const cls = classStr(n);
+    if (cls) { const r = rankFromString(cls); if (r) return { rank: r, source: 'class' }; }
+    return { rank: null, source: null };
+  }
+  function textRank(n) { return textRankDetailed(n).rank; }
+
+  const FACE_DOWN_RE = /\b(back|facedown|face-down|hidden|flipped|folded)\b/i;
+  function isFaceDown(n) {
+    if (FACE_DOWN_RE.test(classStr(n))) return true;
+    const probe = [n.getAttribute('data-rank'), n.getAttribute('data-card'), n.getAttribute('alt'), n.getAttribute('src')].filter(Boolean).join(' ');
+    return FACE_DOWN_RE.test(probe);
   }
 
-  const CARD_SELECTOR = '[class*="card" i], [data-rank], [data-card], img[src*="card" i], img[alt*="card" i], svg use, [class*="playing-card" i]';
+  const CARD_SELECTOR = '[class*="card" i], [data-rank], [data-card], [data-code], [data-suit], [data-value], [data-testid*="card" i], img[src*="card" i], img[alt*="card" i], svg use, use[href*="card" i], object[data*="card" i], [class*="playing-card" i], [id*="card" i]';
+
+  // Last-resort scan when the selector-based pass finds nothing: any small
+  // leaf element whose own text is exactly a card rank (± suit letter).
+  function fallbackTextScan() {
+    return deepQueryAll('*').filter((n) => {
+      if (n.children.length > 0) return false;
+      const r = n.getBoundingClientRect();
+      if (r.width <= 0 || r.width > 80 || r.height > 100) return false;
+      const t = (n.innerText || '').trim();
+      return /^(10|[2-9]|[AJQK])[SHDC]?$/i.test(t);
+    });
+  }
 
   function readTable() {
     const hostname = window.location.hostname;
@@ -487,17 +620,43 @@
             activeHandIdx: res.activeHandIdx || 0,
           };
         }
-        console.error(`[blackjack-advisor] site-adapter "${adapter.id}" returned an invalid shape, falling back to generic reader`);
+        console.error(`[blackjack-advisor] site-adapter "${adapter.id}" returned an invalid shape, falling back`);
       } catch (e) {
-        console.error(`[blackjack-advisor] site-adapter "${adapter.id}" threw, falling back to generic reader:`, e);
+        console.error(`[blackjack-advisor] site-adapter "${adapter.id}" threw, falling back:`, e);
       }
     }
+
+    const canvasAdapter = pluginRegistry.canvasAdapters.find((p) => {
+      try { return typeof p.matches !== 'function' || p.matches(hostname); }
+      catch (e) { return false; }
+    });
+    if (canvasAdapter) {
+      try {
+        const regions = canvasAdapter.findCardRegions(pluginCtx());
+        if (Array.isArray(regions) && regions.length) {
+          const classify = (regs) => regs.map((r) => ({ region: r, ...classifyRegion(canvasAdapter.id, r) }));
+          const dealerClassified = classify(regions.filter((r) => r.role === 'dealer'));
+          const playerClassified = classify(regions.filter((r) => r.role !== 'dealer'));
+          return {
+            dealer: dealerClassified.filter((c) => c.rank).map((c) => c.rank),
+            player: playerClassified.filter((c) => c.rank).map((c) => c.rank),
+            dealerEls: [], playerEls: [],
+            split: false, handCount: 1, activeHandIdx: 0,
+            canvasClassified: { dealer: dealerClassified, player: playerClassified },
+          };
+        }
+      } catch (e) {
+        console.error(`[blackjack-advisor] canvas-adapter "${canvasAdapter.id}" threw, falling back:`, e);
+      }
+    }
+
     return genericReadTable();
   }
 
   function genericReadTable() {
-    const cardEls = deepQueryAll(CARD_SELECTOR)
-      .filter((n) => n.getBoundingClientRect().width > 0);
+    let cardEls = deepQueryAll(CARD_SELECTOR)
+      .filter((n) => n.getBoundingClientRect().width > 0 && !isFaceDown(n));
+    if (!cardEls.length) cardEls = fallbackTextScan();
     const dealerEls = cardEls.filter((n) => /dealer/i.test(classStr(n) + classStr(n.closest('[class*="dealer"]') || document.createElement('div'))));
     const playerEls = cardEls.filter((n) => !dealerEls.includes(n));
 
@@ -535,6 +694,47 @@
     }
   }
 
+  function countNewRegions(classified) {
+    for (const c of classified) {
+      if (!c.rank) continue;
+      const key = c.region.id || `${c.region.x},${c.region.y}`;
+      if (countedRegions.get(key) === c.rank) continue;
+      logCard(c.rank);
+      countedRegions.set(key, c.rank);
+    }
+  }
+
+  // ---- detection diagnostics ---------------------------------------------
+  // Read-only: re-runs the same selector/fallback pass genericReadTable()
+  // uses, but keeps every candidate (including rejects) with the reason it
+  // matched, so a stuck site can be debugged from the panel instead of guesswork.
+  function diagnoseTable() {
+    const primary = deepQueryAll(CARD_SELECTOR).filter((n) => n.getBoundingClientRect().width > 0);
+    const usedFallback = primary.length === 0;
+    const candidates = usedFallback ? fallbackTextScan() : primary;
+    const rows = candidates.map((n) => {
+      const faceDown = !usedFallback && isFaceDown(n);
+      const detail = faceDown ? { rank: null, source: null } : textRankDetailed(n);
+      return {
+        el: n,
+        rank: detail.rank,
+        matchedVia: usedFallback ? 'fallback-text' : detail.source,
+        faceDown,
+        dealer: /dealer/i.test(classStr(n) + classStr(n.closest('[class*="dealer"]') || document.createElement('div'))),
+      };
+    });
+    return { rows, usedFallback, canvases: deepQueryAll('canvas').filter((c) => c.getBoundingClientRect().width > 0) };
+  }
+
+  function flashHighlight(el) {
+    const prevOutline = el.style.outline;
+    const prevOffset = el.style.outlineOffset;
+    el.style.outline = '3px solid #f43f5e';
+    el.style.outlineOffset = '2px';
+    try { el.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (e) { /* scrollIntoView options unsupported */ }
+    setTimeout(() => { el.style.outline = prevOutline; el.style.outlineOffset = prevOffset; }, 1500);
+  }
+
   // ---- shuffle handling ---------------------------------------------------
   const SHUFFLE_RE = /\bshuffl\w*\b|\bnew shoe\b/i;
   let lastShuffleCheck = 0;
@@ -543,7 +743,7 @@
     if (now - lastShuffleCheck < 3000) return;
     lastShuffleCheck = now;
     if (SHUFFLE_RE.test(document.body.innerText.slice(0, 5000))) {
-      rcHiLo = 0; cardsSeen = 0; countedNodes = new Map();
+      rcHiLo = 0; cardsSeen = 0; countedNodes = new Map(); countedRegions = new Map();
       shuffleUnconfirmed = true;
       setBadge('UNCONFIRMED');
       status('shuffle text detected — count reset, tap "Reset shoe" to confirm and resume');
@@ -560,16 +760,27 @@
   }
 
   // ---- PLUGIN SYSTEM -----------------------------------------------------
-  // Two plugin kinds, both plain object literals the user pastes into the
-  // "Plugins" panel below (see EXAMPLE_SITE_ADAPTER / EXAMPLE_A11Y_OUTPUT):
+  // Three plugin kinds, all plain object literals the user pastes into the
+  // panels below (see EXAMPLE_SITE_ADAPTER / EXAMPLE_CANVAS_ADAPTER / EXAMPLE_A11Y_OUTPUT):
   //
-  //   site-adapter  { id, type:'site-adapter', name?, version?, matches(hostname), readTable(ctx) }
+  //   site-adapter    { id, type:'site-adapter', name?, version?, matches(hostname), readTable(ctx) }
   //     readTable(ctx) must return { dealer:[ranks], player:[ranks], dealerEls?:[nodes], playerEls?:[nodes] }
-  //     ctx = { deepQueryAll, textRank, classStr, rankFromString, document }
+  //     ctx = { deepQueryAll, textRank, classStr, rankFromString, document, canvases }
   //     Omitting dealerEls/playerEls is fine but means those cards won't
   //     feed the Hi-Lo counter (no elements to dedupe against).
   //
-  //   a11y-output   { id, type:'a11y-output', name?, version?, onUpdate(ctx) }
+  //   canvas-adapter  { id, type:'canvas-adapter', name?, version?, matches(hostname), findCardRegions(ctx) }
+  //     findCardRegions(ctx) must return [{ id, role:'dealer'|'player', x, y, w, h }, ...]
+  //     in page (viewport) coordinates. `id` must stay stable for the same
+  //     visual slot across ticks — it's how the Hi-Lo counter tells "still
+  //     the same card" from "a new card was dealt". Used for tables that
+  //     render entirely on <canvas>/WebGL with no readable DOM: the advisor
+  //     calibrates a small reference template per rank against the region's
+  //     pixels (see the "Canvas calibration" panel) and pixel/shape-matches
+  //     live regions against those templates. Regions that don't clear the
+  //     confidence threshold are left unread rather than guessed.
+  //
+  //   a11y-output     { id, type:'a11y-output', name?, version?, onUpdate(ctx) }
   //     ctx = { move, why, insurance, bet, betProblems, tc, cardsSeen,
   //             playerHand, dealerUp, split, handCount, badge, status }
   //     Called only when the advisor's state actually changes (deduped).
@@ -581,7 +792,7 @@
   // calls anything else a plugin exposes, and plugins are never wired up to
   // click buttons or set bet fields.
   const PLUGINS_KEY = 'blackjackAdvisor_plugins_v1';
-  const pluginRegistry = { siteAdapters: [], a11yOutputs: [] };
+  const pluginRegistry = { siteAdapters: [], canvasAdapters: [], a11yOutputs: [] };
   let pluginRecords = []; // [{ id, type, name, version, source }] — successfully loaded plugins only
 
   const EXAMPLE_SITE_ADAPTER = `{
@@ -598,6 +809,28 @@
       player: playerEls.map(ctx.textRank).filter(Boolean),
       dealerEls, playerEls,
     };
+  },
+}`;
+
+  const EXAMPLE_CANVAS_ADAPTER = `{
+  id: 'my-canvas-table',
+  type: 'canvas-adapter',
+  name: 'My Canvas Table',
+  matches: (hostname) => hostname.includes('example.com'),
+  // Return the pixel rectangles (page/viewport coordinates) where cards
+  // render. Each id must stay stable for the same visual slot across ticks.
+  // Find these coordinates by inspecting the table (or use "Detect regions"
+  // in the Canvas calibration panel once this plugin is loaded, and adjust
+  // the numbers below to match what gets highlighted).
+  findCardRegions: (ctx) => {
+    const canvas = ctx.canvases[0];
+    if (!canvas) return [];
+    const rect = canvas.getBoundingClientRect();
+    return [
+      { id: 'dealer-0', role: 'dealer', x: rect.left + 120, y: rect.top + 40, w: 40, h: 56 },
+      { id: 'player-0', role: 'player', x: rect.left + 120, y: rect.top + 220, w: 40, h: 56 },
+      { id: 'player-1', role: 'player', x: rect.left + 170, y: rect.top + 220, w: 40, h: 56 },
+    ];
   },
 }`;
 
@@ -634,12 +867,20 @@
     if (!obj.id || typeof obj.id !== 'string') return { ok: false, error: 'plugin needs a string "id"' };
     if (obj.type === 'site-adapter') {
       if (typeof obj.readTable !== 'function') return { ok: false, error: 'site-adapter plugin needs a readTable(ctx) function' };
+    } else if (obj.type === 'canvas-adapter') {
+      if (typeof obj.findCardRegions !== 'function') return { ok: false, error: 'canvas-adapter plugin needs a findCardRegions(ctx) function' };
     } else if (obj.type === 'a11y-output') {
       if (typeof obj.onUpdate !== 'function') return { ok: false, error: 'a11y-output plugin needs an onUpdate(ctx) function' };
     } else {
-      return { ok: false, error: 'plugin "type" must be "site-adapter" or "a11y-output"' };
+      return { ok: false, error: 'plugin "type" must be "site-adapter", "canvas-adapter", or "a11y-output"' };
     }
     return { ok: true, plugin: obj };
+  }
+
+  function registryFor(type) {
+    if (type === 'site-adapter') return pluginRegistry.siteAdapters;
+    if (type === 'canvas-adapter') return pluginRegistry.canvasAdapters;
+    return pluginRegistry.a11yOutputs;
   }
 
   function addPlugin(source, persist) {
@@ -647,8 +888,9 @@
     if (!result.ok) return result;
     const { plugin } = result;
     pluginRegistry.siteAdapters = pluginRegistry.siteAdapters.filter((p) => p.id !== plugin.id);
+    pluginRegistry.canvasAdapters = pluginRegistry.canvasAdapters.filter((p) => p.id !== plugin.id);
     pluginRegistry.a11yOutputs = pluginRegistry.a11yOutputs.filter((p) => p.id !== plugin.id);
-    (plugin.type === 'site-adapter' ? pluginRegistry.siteAdapters : pluginRegistry.a11yOutputs).push(plugin);
+    registryFor(plugin.type).push(plugin);
     pluginRecords = pluginRecords.filter((r) => r.id !== plugin.id);
     pluginRecords.push({ id: plugin.id, type: plugin.type, name: plugin.name || plugin.id, version: plugin.version || '', source });
     if (persist !== false) savePluginSources();
@@ -657,6 +899,7 @@
 
   function removePlugin(id) {
     pluginRegistry.siteAdapters = pluginRegistry.siteAdapters.filter((p) => p.id !== id);
+    pluginRegistry.canvasAdapters = pluginRegistry.canvasAdapters.filter((p) => p.id !== id);
     pluginRegistry.a11yOutputs = pluginRegistry.a11yOutputs.filter((p) => p.id !== id);
     pluginRecords = pluginRecords.filter((r) => r.id !== id);
     savePluginSources();
@@ -670,7 +913,104 @@
   }
 
   function pluginCtx() {
-    return { deepQueryAll, textRank, classStr, rankFromString, document };
+    return {
+      deepQueryAll, textRank, classStr, rankFromString, document,
+      canvases: deepQueryAll('canvas').filter((c) => c.getBoundingClientRect().width > 0),
+    };
+  }
+
+  // ---- canvas pixel/shape matching (calibrated per plugin id + hostname) ----
+  // Downsamples a card-slot region to a small grayscale grid plus a red/black
+  // color hint, then compares it to reference templates the user captures via
+  // the "Canvas calibration" panel. No template guessing: a region that
+  // doesn't clear CANVAS_CONFIDENCE_THRESHOLD comes back unread. The
+  // threshold and grid size are starting points — tune them against the
+  // actual table you're calibrating against.
+  const CANVAS_TEMPLATE_W = 14, CANVAS_TEMPLATE_H = 20;
+  const CANVAS_CONFIDENCE_THRESHOLD = 0.82;
+
+  function canvasTemplatesKey(adapterId) {
+    return 'blackjackAdvisor_canvasTemplates_' + adapterId + '_' + window.location.hostname;
+  }
+  function loadCanvasTemplates(adapterId) {
+    try {
+      const raw = safeStorage.get(canvasTemplatesKey(adapterId));
+      return raw ? JSON.parse(raw) : {};
+    } catch (e) { return {}; }
+  }
+  function saveCanvasTemplates(adapterId, templates) {
+    safeStorage.set(canvasTemplatesKey(adapterId), JSON.stringify(templates));
+  }
+
+  function findSourceCanvas(x, y) {
+    const atPoint = document.elementFromPoint(x + 1, y + 1);
+    if (atPoint && atPoint.tagName === 'CANVAS') return atPoint;
+    return deepQueryAll('canvas').find((c) => {
+      const r = c.getBoundingClientRect();
+      return x >= r.left && x <= r.right && y >= r.top && y <= r.bottom;
+    }) || null;
+  }
+
+  function sampleCanvasRegion(x, y, w, h) {
+    const canvas = findSourceCanvas(x, y);
+    if (!canvas) return null;
+    const rect = canvas.getBoundingClientRect();
+    if (!rect.width || !rect.height) return null;
+    const scaleX = canvas.width / rect.width;
+    const scaleY = canvas.height / rect.height;
+    const sx = Math.round((x - rect.left) * scaleX);
+    const sy = Math.round((y - rect.top) * scaleY);
+    const sw = Math.max(1, Math.round(w * scaleX));
+    const sh = Math.max(1, Math.round(h * scaleY));
+    let ctx2d;
+    try { ctx2d = canvas.getContext('2d'); } catch (e) { return null; }
+    if (!ctx2d) return null; // WebGL/other context type — no 2D pixel readback this way
+    let imageData;
+    try { imageData = ctx2d.getImageData(sx, sy, sw, sh); }
+    catch (e) { return null; } // tainted canvas (cross-origin draw without CORS)
+
+    const grid = new Array(CANVAS_TEMPLATE_W * CANVAS_TEMPLATE_H).fill(0);
+    let redCount = 0, darkCount = 0, sampleCount = 0;
+    for (let gy = 0; gy < CANVAS_TEMPLATE_H; gy++) {
+      for (let gx = 0; gx < CANVAS_TEMPLATE_W; gx++) {
+        const px = Math.min(sw - 1, Math.floor((gx / CANVAS_TEMPLATE_W) * sw));
+        const py = Math.min(sh - 1, Math.floor((gy / CANVAS_TEMPLATE_H) * sh));
+        const idx = (py * sw + px) * 4;
+        const r = imageData.data[idx], g = imageData.data[idx + 1], b = imageData.data[idx + 2];
+        const lum = (r * 0.299 + g * 0.587 + b * 0.114) / 255;
+        grid[gy * CANVAS_TEMPLATE_W + gx] = lum;
+        if (r > 120 && r > g * 1.4 && r > b * 1.4) redCount++;
+        if (lum < 0.35) darkCount++;
+        sampleCount++;
+      }
+    }
+    const colorHint = redCount > sampleCount * 0.04 ? 'red' : (darkCount > sampleCount * 0.15 ? 'black' : 'unknown');
+    return { grid, colorHint };
+  }
+
+  function templateSimilarity(a, b) {
+    if (!a || !b || a.length !== b.length) return 0;
+    let sumSq = 0;
+    for (let i = 0; i < a.length; i++) { const d = a[i] - b[i]; sumSq += d * d; }
+    const mse = sumSq / a.length;
+    return Math.max(0, 1 - mse * 4);
+  }
+
+  function classifyRegion(adapterId, region) {
+    const sample = sampleCanvasRegion(region.x, region.y, region.w, region.h);
+    if (!sample) return { rank: null, confidence: 0, reason: 'unreadable canvas (tainted or WebGL)' };
+    const templates = loadCanvasTemplates(adapterId);
+    let best = null, bestScore = 0;
+    for (const label in templates) {
+      const entry = templates[label];
+      if (entry.colorHint && entry.colorHint !== 'unknown' && sample.colorHint !== 'unknown' && entry.colorHint !== sample.colorHint) continue;
+      const score = templateSimilarity(sample.grid, entry.grid);
+      if (score > bestScore) { bestScore = score; best = label; }
+    }
+    if (!best || bestScore < CANVAS_CONFIDENCE_THRESHOLD) {
+      return { rank: null, confidence: bestScore, reason: best ? 'low confidence' : 'no calibrated templates matched region color' };
+    }
+    return { rank: best, confidence: bestScore };
   }
 
   let lastA11ySignature = null;
@@ -687,9 +1027,14 @@
   // ---- main loop (advisory only — never clicks or fills anything) -----------
   function tick() {
     checkReshuffle();
-    const { dealer, player, dealerEls, playerEls, split, handCount } = readTable();
-    countNewCards(dealerEls);
-    countNewCards(playerEls);
+    const { dealer, player, dealerEls, playerEls, split, handCount, canvasClassified } = readTable();
+    if (canvasClassified) {
+      countNewRegions(canvasClassified.dealer);
+      countNewRegions(canvasClassified.player);
+    } else {
+      countNewCards(dealerEls);
+      countNewCards(playerEls);
+    }
     const tc = tcHiLo();
     const bet = suggestedBet(tc);
     const problems = validateBetConfig();
