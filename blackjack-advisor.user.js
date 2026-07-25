@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Blackjack Advisor (human-in-the-loop, mobile)
 // @namespace    evan.local.blackjack-advisor
-// @version      1.4.1
-// @description  Glassmorphism overlay that reads the table, tracks Hi-Lo count, and shows the recommended move + bet. Advisory only — never clicks buttons or sets bet fields. Tuned for Firefox for Android (Tampermonkey/Violentmonkey): safe against blocked storage, small viewports, and touch input.
+// @version      1.5.0
+// @description  Glassmorphism overlay that reads the table, tracks Hi-Lo count, and shows the recommended move + bet. Advisory only — never clicks buttons or sets bet fields. Supports pasted-in plugins for site-specific table reading and accessibility output (screen reader / speech / haptics). Tuned for Firefox for Android (Tampermonkey/Violentmonkey): safe against blocked storage, small viewports, and touch input.
 // @match        https://*.*/*
 // @run-at       document-idle
 // @grant        none
@@ -219,7 +219,10 @@
   const MOVE_COLORS = { STAND: '#4ade80', HIT: '#eab308', DOUBLE: '#f97316', SPLIT: '#f97316', SURRENDER: '#ef4444' };
   const BADGE_MODES = { WATCHING: ['#8a8f98', 'WATCHING'], READING: ['#4ade80', 'READING TABLE'], UNCONFIRMED: ['#f59e0b', 'CONFIRM SHUFFLE'] };
 
+  let currentBadgeMode = 'WATCHING';
+  let currentStatus = '';
   function setBadge(mode) {
+    currentBadgeMode = mode;
     const [color, label] = BADGE_MODES[mode] || BADGE_MODES.WATCHING;
     badgeDot.style.background = color;
     badgeDot.style.boxShadow = `0 0 8px ${color}`;
@@ -229,7 +232,7 @@
     moveEl.textContent = move || '—';
     moveEl.style.color = MOVE_COLORS[move] || '#a6ffcb';
   }
-  function status(m) { statusEl.textContent = m; }
+  function status(m) { currentStatus = m; statusEl.textContent = m; }
 
   // ---- domain confirmation dialog ---------------------------------------
   function showConfirmationDialog() {
@@ -305,6 +308,11 @@
       setMove(res.move);
       whyEl.textContent = res.why || '';
       insuranceEl.textContent = res.insurance || '';
+      notifyA11yPlugins({
+        move: res.move, why: res.why || '', insurance: res.insurance || '', bet: null, betProblems: [], tc, cardsSeen,
+        playerHand: hand, dealerUp: up, split: false, handCount: 1,
+        badge: currentBadgeMode, status: currentStatus,
+      });
     });
     manualBox = h('details', { style: 'margin-top:10px;padding-top:8px;border-top:1px solid rgba(255,255,255,0.15)' }, [
       h('summary', { style: 'cursor:pointer;font-size:11px;color:rgba(255,255,255,0.75)', text: 'Type it in instead' }),
@@ -357,9 +365,62 @@
 
     statusEl = h('div', { style: 'margin-top:8px;font-size:10px;color:rgba(255,200,150,0.85)' });
 
+    // ---- plugins panel (site adapters + accessibility output) -----------
+    const pluginListEl = h('div', { style: 'margin-top:6px;' });
+    function renderPluginList() {
+      while (pluginListEl.firstChild) pluginListEl.removeChild(pluginListEl.firstChild);
+      if (!pluginRecords.length) {
+        pluginListEl.appendChild(h('div', { style: 'font-size:10px;color:rgba(255,255,255,0.5);', text: 'no plugins loaded' }));
+        return;
+      }
+      pluginRecords.forEach((r) => {
+        const removeBtn = h('button', { style: 'padding:2px 8px;font-size:10px;border-radius:20px;border:1px solid rgba(255,255,255,0.18);background:rgba(239,68,68,0.25);color:#fff;cursor:pointer;', text: 'remove' });
+        removeBtn.addEventListener('click', () => { removePlugin(r.id); renderPluginList(); status(`plugin "${r.name}" removed`); });
+        pluginListEl.appendChild(h('div', { style: 'display:flex;align-items:center;justify-content:space-between;gap:6px;font-size:11px;margin-top:4px;' }, [
+          h('span', { text: `${r.name} (${r.type})${r.version ? ' v' + r.version : ''}` }),
+          removeBtn,
+        ]));
+      });
+    }
+
+    const pluginSourceInput = h('textarea', { rows: '4', placeholder: 'Paste a plugin object literal here…', style: GLASS_INPUT + 'resize:vertical;font-family:monospace;font-size:11px;' });
+    const pluginErrorEl = h('div', { style: 'font-size:10px;color:#f87171;margin-top:4px;white-space:pre-wrap;' });
+    const pluginLoadBtn = h('button', { style: GLASS_BTN, text: 'Load plugin' });
+    pluginLoadBtn.addEventListener('click', () => {
+      const source = pluginSourceInput.value.trim();
+      if (!source) { pluginErrorEl.textContent = 'paste a plugin object literal first'; return; }
+      const result = addPlugin(source);
+      if (result.ok) {
+        pluginErrorEl.textContent = '';
+        pluginSourceInput.value = '';
+        renderPluginList();
+        status(`plugin "${result.plugin.name || result.plugin.id}" loaded`);
+      } else {
+        pluginErrorEl.textContent = result.error;
+      }
+    });
+
+    const pluginsSection = h('details', { style: 'margin-top:8px;font-size:10px;color:rgba(255,255,255,0.8);border-top:1px solid rgba(255,255,255,0.15);padding-top:8px;' }, [
+      h('summary', { style: 'cursor:pointer', text: 'Plugins ♿ (site adapters & accessibility)' }),
+      h('div', { style: 'font-size:10px;color:rgba(255,255,255,0.6);margin-top:4px;' }, [document.createTextNode('Plugins run with full page access, same as anything pasted into devtools — only load code you wrote or trust. The advisor only ever reads the documented fields back from a plugin; it never calls anything else a plugin exposes, and plugins are never wired up to click buttons or set bet fields.')]),
+      pluginListEl,
+      pluginSourceInput,
+      pluginLoadBtn,
+      pluginErrorEl,
+      h('details', { style: 'margin-top:6px;' }, [
+        h('summary', { style: 'cursor:pointer;font-size:10px;color:rgba(255,255,255,0.6);', text: 'Example: site adapter' }),
+        h('pre', { style: 'white-space:pre-wrap;font-size:10px;background:rgba(0,0,0,0.25);padding:6px;border-radius:8px;overflow-x:auto;margin-top:4px;' }, [document.createTextNode(EXAMPLE_SITE_ADAPTER)]),
+      ]),
+      h('details', { style: 'margin-top:6px;' }, [
+        h('summary', { style: 'cursor:pointer;font-size:10px;color:rgba(255,255,255,0.6);', text: 'Example: accessibility output' }),
+        h('pre', { style: 'white-space:pre-wrap;font-size:10px;background:rgba(0,0,0,0.25);padding:6px;border-radius:8px;overflow-x:auto;margin-top:4px;' }, [document.createTextNode(EXAMPLE_A11Y_OUTPUT)]),
+      ]),
+    ]);
+    renderPluginList();
+
     panel = h('div', {
       style: `${GLASS_PANEL}display:none;position:fixed;bottom:calc(env(safe-area-inset-bottom, 0px) + 84px);right:12px;z-index:2147483647;width:min(240px, calc(100vw - 24px));max-height:70vh;overflow-y:auto;padding:14px;font:14px/1.4 -apple-system,system-ui,sans-serif;color:#fff`,
-    }, [badgeEl, readoutEl, moveEl, whyEl, insuranceEl, betEl, countEl, manualBox, betConfig, btnReset, statusEl]);
+    }, [badgeEl, readoutEl, moveEl, whyEl, insuranceEl, betEl, countEl, manualBox, betConfig, pluginsSection, btnReset, statusEl]);
     document.documentElement.appendChild(panel);
   }
 
@@ -407,6 +468,34 @@
   const CARD_SELECTOR = '[class*="card" i], [data-rank], [data-card], img[src*="card" i], img[alt*="card" i], svg use, [class*="playing-card" i]';
 
   function readTable() {
+    const hostname = window.location.hostname;
+    const adapter = pluginRegistry.siteAdapters.find((p) => {
+      try { return typeof p.matches !== 'function' || p.matches(hostname); }
+      catch (e) { return false; }
+    });
+    if (adapter) {
+      try {
+        const res = adapter.readTable(pluginCtx());
+        if (res && Array.isArray(res.dealer) && Array.isArray(res.player)) {
+          return {
+            dealer: res.dealer,
+            player: res.player,
+            dealerEls: Array.isArray(res.dealerEls) ? res.dealerEls : [],
+            playerEls: Array.isArray(res.playerEls) ? res.playerEls : [],
+            split: !!res.split,
+            handCount: res.handCount || 1,
+            activeHandIdx: res.activeHandIdx || 0,
+          };
+        }
+        console.error(`[blackjack-advisor] site-adapter "${adapter.id}" returned an invalid shape, falling back to generic reader`);
+      } catch (e) {
+        console.error(`[blackjack-advisor] site-adapter "${adapter.id}" threw, falling back to generic reader:`, e);
+      }
+    }
+    return genericReadTable();
+  }
+
+  function genericReadTable() {
     const cardEls = deepQueryAll(CARD_SELECTOR)
       .filter((n) => n.getBoundingClientRect().width > 0);
     const dealerEls = cardEls.filter((n) => /dealer/i.test(classStr(n) + classStr(n.closest('[class*="dealer"]') || document.createElement('div'))));
@@ -470,10 +559,135 @@
     });
   }
 
+  // ---- PLUGIN SYSTEM -----------------------------------------------------
+  // Two plugin kinds, both plain object literals the user pastes into the
+  // "Plugins" panel below (see EXAMPLE_SITE_ADAPTER / EXAMPLE_A11Y_OUTPUT):
+  //
+  //   site-adapter  { id, type:'site-adapter', name?, version?, matches(hostname), readTable(ctx) }
+  //     readTable(ctx) must return { dealer:[ranks], player:[ranks], dealerEls?:[nodes], playerEls?:[nodes] }
+  //     ctx = { deepQueryAll, textRank, classStr, rankFromString, document }
+  //     Omitting dealerEls/playerEls is fine but means those cards won't
+  //     feed the Hi-Lo counter (no elements to dedupe against).
+  //
+  //   a11y-output   { id, type:'a11y-output', name?, version?, onUpdate(ctx) }
+  //     ctx = { move, why, insurance, bet, betProblems, tc, cardsSeen,
+  //             playerHand, dealerUp, split, handCount, badge, status }
+  //     Called only when the advisor's state actually changes (deduped).
+  //
+  // Plugins run as ordinary page scripts — same privileges as anything typed
+  // into devtools on this page. They are NOT sandboxed. Only load code you
+  // wrote or trust. In the other direction: the advisor itself only ever
+  // reads the documented fields back from a plugin's return value — it never
+  // calls anything else a plugin exposes, and plugins are never wired up to
+  // click buttons or set bet fields.
+  const PLUGINS_KEY = 'blackjackAdvisor_plugins_v1';
+  const pluginRegistry = { siteAdapters: [], a11yOutputs: [] };
+  let pluginRecords = []; // [{ id, type, name, version, source }] — successfully loaded plugins only
+
+  const EXAMPLE_SITE_ADAPTER = `{
+  id: 'my-site-adapter',
+  type: 'site-adapter',
+  name: 'My Site',
+  matches: (hostname) => hostname.includes('example.com'),
+  readTable: (ctx) => {
+    const cards = ctx.deepQueryAll('.my-card');
+    const dealerEls = cards.filter(n => n.closest('.dealer-area'));
+    const playerEls = cards.filter(n => !n.closest('.dealer-area'));
+    return {
+      dealer: dealerEls.map(ctx.textRank).filter(Boolean),
+      player: playerEls.map(ctx.textRank).filter(Boolean),
+      dealerEls, playerEls,
+    };
+  },
+}`;
+
+  const EXAMPLE_A11Y_OUTPUT = `{
+  id: 'speech-announcer',
+  type: 'a11y-output',
+  name: 'Speech announcer',
+  onUpdate: (ctx) => {
+    if (!ctx.move) return;
+    const msg = ctx.move + (ctx.why ? ', ' + ctx.why : '');
+    speechSynthesis.cancel();
+    speechSynthesis.speak(new SpeechSynthesisUtterance(msg));
+  },
+}`;
+
+  function loadStoredPluginSources() {
+    try {
+      const raw = safeStorage.get(PLUGINS_KEY);
+      return raw ? JSON.parse(raw) : [];
+    } catch (e) { return []; }
+  }
+  function savePluginSources() {
+    safeStorage.set(PLUGINS_KEY, JSON.stringify(pluginRecords.map((r) => r.source)));
+  }
+
+  function evalPlugin(source) {
+    let obj;
+    try {
+      obj = Function('"use strict"; return (' + source + ');')();
+    } catch (e) {
+      return { ok: false, error: 'parse error: ' + e.message };
+    }
+    if (!obj || typeof obj !== 'object') return { ok: false, error: 'plugin must evaluate to an object literal' };
+    if (!obj.id || typeof obj.id !== 'string') return { ok: false, error: 'plugin needs a string "id"' };
+    if (obj.type === 'site-adapter') {
+      if (typeof obj.readTable !== 'function') return { ok: false, error: 'site-adapter plugin needs a readTable(ctx) function' };
+    } else if (obj.type === 'a11y-output') {
+      if (typeof obj.onUpdate !== 'function') return { ok: false, error: 'a11y-output plugin needs an onUpdate(ctx) function' };
+    } else {
+      return { ok: false, error: 'plugin "type" must be "site-adapter" or "a11y-output"' };
+    }
+    return { ok: true, plugin: obj };
+  }
+
+  function addPlugin(source, persist) {
+    const result = evalPlugin(source);
+    if (!result.ok) return result;
+    const { plugin } = result;
+    pluginRegistry.siteAdapters = pluginRegistry.siteAdapters.filter((p) => p.id !== plugin.id);
+    pluginRegistry.a11yOutputs = pluginRegistry.a11yOutputs.filter((p) => p.id !== plugin.id);
+    (plugin.type === 'site-adapter' ? pluginRegistry.siteAdapters : pluginRegistry.a11yOutputs).push(plugin);
+    pluginRecords = pluginRecords.filter((r) => r.id !== plugin.id);
+    pluginRecords.push({ id: plugin.id, type: plugin.type, name: plugin.name || plugin.id, version: plugin.version || '', source });
+    if (persist !== false) savePluginSources();
+    return result;
+  }
+
+  function removePlugin(id) {
+    pluginRegistry.siteAdapters = pluginRegistry.siteAdapters.filter((p) => p.id !== id);
+    pluginRegistry.a11yOutputs = pluginRegistry.a11yOutputs.filter((p) => p.id !== id);
+    pluginRecords = pluginRecords.filter((r) => r.id !== id);
+    savePluginSources();
+  }
+
+  function initPlugins() {
+    loadStoredPluginSources().forEach((source) => {
+      const result = addPlugin(source, false);
+      if (!result.ok) console.error('[blackjack-advisor] stored plugin failed to load:', result.error);
+    });
+  }
+
+  function pluginCtx() {
+    return { deepQueryAll, textRank, classStr, rankFromString, document };
+  }
+
+  let lastA11ySignature = null;
+  function notifyA11yPlugins(state) {
+    const signature = JSON.stringify([state.move, state.why, state.insurance, state.bet, state.badge, state.status]);
+    if (signature === lastA11ySignature) return;
+    lastA11ySignature = signature;
+    for (const p of pluginRegistry.a11yOutputs) {
+      try { p.onUpdate(state); }
+      catch (e) { console.error(`[blackjack-advisor] a11y plugin "${p.id}" threw:`, e); }
+    }
+  }
+
   // ---- main loop (advisory only — never clicks or fills anything) -----------
   function tick() {
     checkReshuffle();
-    const { dealer, player, dealerEls, playerEls } = readTable();
+    const { dealer, player, dealerEls, playerEls, split, handCount } = readTable();
     countNewCards(dealerEls);
     countNewCards(playerEls);
     const tc = tcHiLo();
@@ -499,6 +713,11 @@
         if (!shuffleUnconfirmed) setBadge('WATCHING');
       }
       countEl.textContent = `TC ${tc.toFixed(1)} (${cardsSeen} seen)`;
+      notifyA11yPlugins({
+        move: null, why: '', insurance: '', bet: null, betProblems: problems, tc, cardsSeen,
+        playerHand: [], dealerUp: null, split: false, handCount: 1,
+        badge: currentBadgeMode, status: currentStatus,
+      });
       return;
     }
     emptyCardTicks = 0;
@@ -511,10 +730,16 @@
     whyEl.textContent = res.why || '';
     insuranceEl.textContent = res.insurance || '';
     countEl.textContent = `TC ${tc.toFixed(1)} (${cardsSeen} seen)`;
+    notifyA11yPlugins({
+      move: res.move, why: res.why || '', insurance: res.insurance || '', bet, betProblems: problems, tc, cardsSeen,
+      playerHand: player, dealerUp: dealer[0], split: !!split, handCount: handCount || 1,
+      badge: currentBadgeMode, status: currentStatus,
+    });
   }
 
   // ---- start / init -----------------------------------------------------
   function startAdvisor() {
+    initPlugins();
     buildPanel();
     setInterval(tick, POLL_MS);
     let mutTimer = null;
