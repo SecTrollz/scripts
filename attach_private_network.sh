@@ -1,17 +1,18 @@
 #!/bin/bash
 # attach_private_network.sh
 #
-# Watches for a target PLMN (private/test network) over a modem's AT
-# command port and attaches to it the moment it becomes visible.
-# Every step verifies the modem's actual response before moving on,
-# and the whole scan/attach cycle retries with backoff until
-# registration is confirmed — it does not give up on a single failed
-# attempt.
+# Watches for any of a list of authorized PLMNs (private/test
+# networks you operate) over a modem's AT command port and attaches
+# to whichever one becomes visible first. Every step verifies the
+# modem's actual response before moving on, and the whole scan/attach
+# cycle retries with backoff until registration is confirmed — it
+# does not give up on a single failed attempt.
 #
 # Usage:
-#   ./attach_private_network.sh [PLMN] [AT_PORT] [MAX_ATTEMPTS]
+#   ./attach_private_network.sh [PLMN_LIST] [AT_PORT] [MAX_ATTEMPTS]
 #
-#   PLMN         - target PLMN id passed to AT+COPS (default: 103824)
+#   PLMN_LIST    - comma-separated PLMN ids you're authorized to use,
+#                  tried in order each scan cycle (default: 103824)
 #   AT_PORT      - modem AT command tty (default: /dev/pts/1)
 #   MAX_ATTEMPTS - give up after N scan/attach cycles (default: 0 = never)
 
@@ -23,11 +24,13 @@ if [ "$(id -u)" -ne 0 ]; then
   exec su -c "$0 $*"
 fi
 
-PLMN="${1:-103824}"
+PLMN_LIST="${1:-103824}"
 AT_PORT="${2:-/dev/pts/1}"
 MAX_ATTEMPTS="${3:-0}"
 AT_TIMEOUT=5
 MAX_BACKOFF=30
+
+IFS=',' read -ra PLMNS <<< "$PLMN_LIST"
 
 if [ ! -c "$AT_PORT" ] && [ ! -p "$AT_PORT" ]; then
   echo "AT port not found: $AT_PORT" >&2
@@ -67,7 +70,7 @@ log "Disabling auto-registration..."
 at_cmd "AT+CREG=0" >/dev/null
 at_cmd "AT+CGREG=0" >/dev/null
 
-log "Watching for PLMN $PLMN on $AT_PORT..."
+log "Watching for authorized PLMNs (${PLMNS[*]}) on $AT_PORT..."
 attempt=0
 backoff=2
 
@@ -82,15 +85,23 @@ while true; do
   log "Attempt $attempt: scanning for available networks..."
   scan=$(at_cmd "AT+COPS=?")
 
-  if [[ "$scan" != *"$PLMN"* ]]; then
-    log "PLMN $PLMN not visible yet. Rescanning in ${backoff}s..."
+  target=""
+  for plmn in "${PLMNS[@]}"; do
+    if [[ "$scan" == *"$plmn"* ]]; then
+      target="$plmn"
+      break
+    fi
+  done
+
+  if [[ -z "$target" ]]; then
+    log "No authorized PLMN visible yet. Rescanning in ${backoff}s..."
     sleep "$backoff"
     backoff=$(( backoff < MAX_BACKOFF ? backoff * 2 : MAX_BACKOFF ))
     continue
   fi
 
-  log "PLMN $PLMN visible. Forcing attach..."
-  at_cmd "AT+COPS=1,2,\"$PLMN\"" >/dev/null
+  log "PLMN $target visible. Forcing attach..."
+  at_cmd "AT+COPS=1,2,\"$target\"" >/dev/null
   sleep 3
 
   creg=$(at_cmd "AT+CREG?")
@@ -102,11 +113,11 @@ while true; do
   log "Signal: ${csq//$'\n'/ }"
 
   if is_registered "$creg" || is_registered "$cgreg"; then
-    log "Registered on PLMN $PLMN. Attach successful."
+    log "Registered on PLMN $target. Attach successful."
     exit 0
   fi
 
-  log "Attach not confirmed yet. Retrying in ${backoff}s..."
+  log "Attach on $target not confirmed. Retrying in ${backoff}s..."
   sleep "$backoff"
   backoff=$(( backoff < MAX_BACKOFF ? backoff * 2 : MAX_BACKOFF ))
 done
