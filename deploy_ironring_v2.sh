@@ -1,6 +1,6 @@
 #!/bin/bash
 # ==============================================================================
-#  deploy_ironring.sh  —  IronRing OCI Multi-Compartment Deploy
+#  deploy_ironring_v2.sh  —  IronRing OCI Multi-Compartment Deploy
 #  Region: us-phoenix-1  |  Shape: A1.Flex (Always Free) w/ fallback
 #  Instances: n8n-Docker (Traefik+n8n), ubuntu-Node, netstack-Docker (WireGuard)
 #  Ubuntu 24.04 LTS  |  Docker via cloud-init  |  Dual NSG (public/private)
@@ -1048,7 +1048,7 @@ cat <<'NOTES'
   [ ] SSH IP rotation: If your public IP changes, update:
         - NoMercy-Sec security list (OCI Console → Networking → VCN)
         - StreetPatrol-NSG ingress rule for port 22
-      Or run: ./deploy_ironring.sh again (idempotent for config blocks)
+      Or run: ./deploy_ironring_v2.sh again (idempotent for config blocks)
 
   [ ] Monitoring: Enable VCN Flow Logs:
         OCI Console → Observability → Logging → Log Groups → Enable Flow Logs on VCN
