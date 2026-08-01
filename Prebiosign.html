@@ -1,0 +1,1445 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <title>BCBS 2050 — Pre‑Biosign Intelligence</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+  <style>
+    /* ── Tokens ─────────────────────────────────────────── */
+    :root {
+      --bg:          #080c12;
+      --surf-1:      #0d1420;
+      --surf-2:      #111926;
+      --surf-3:      #161f2e;
+      --border:      rgba(100,140,200,0.14);
+      --border-hi:   rgba(100,140,200,0.32);
+      --blue:        #4d9fff;
+      --blue-dim:    rgba(77,159,255,0.11);
+      --blue-mid:    rgba(77,159,255,0.22);
+      --green:       #22c55e;
+      --green-dim:   rgba(34,197,94,0.11);
+      --amber:       #f59e0b;
+      --amber-dim:   rgba(245,158,11,0.11);
+      --red:         #ef4444;
+      --red-dim:     rgba(239,68,68,0.11);
+      --red-bright:  #ff6b6b;
+      --text-1:      #e2e8f0;
+      --text-2:      #94a3b8;
+      --text-3:      #64748b;
+      --r-sm:        0.4rem;
+      --r:           0.75rem;
+      --r-lg:        1rem;
+      --font:        'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+      --shadow:      0 4px 16px rgba(0,0,0,0.5);
+      --shadow-lg:   0 8px 32px rgba(0,0,0,0.65);
+    }
+
+    /* ── Reset ──────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+    body {
+      background: var(--bg);
+      color: var(--text-1);
+      font-family: var(--font);
+      font-size: 0.9375rem;
+      line-height: 1.6;
+      min-height: 100vh;
+    }
+
+    /* ── Layout ─────────────────────────────────────────── */
+    .app {
+      max-width: 1280px;
+      margin: 0 auto;
+      padding: 1rem 1.25rem 6rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1.5rem;
+    }
+
+    /* ── Panel ──────────────────────────────────────────── */
+    .panel {
+      background: var(--surf-1);
+      border: 1px solid var(--border);
+      border-radius: var(--r-lg);
+      box-shadow: var(--shadow);
+    }
+    .panel__body     { padding: 1.25rem 1.5rem; }
+    .panel__body--sm { padding: 0.875rem 1.25rem; }
+    .panel--alert {
+      background: rgba(239,68,68,0.04);
+      border-color: rgba(239,68,68,0.32);
+      border-width: 1.5px;
+    }
+
+    /* ── Header ─────────────────────────────────────────── */
+    .site-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 0.75rem;
+    }
+    .site-header__brand {}
+    .site-header__eyebrow {
+      font-size: 0.6875rem;
+      font-weight: 600;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: var(--blue);
+      margin-bottom: 0.2rem;
+    }
+    .site-header__title {
+      font-size: 1.65rem;
+      font-weight: 700;
+      letter-spacing: -0.015em;
+      color: var(--text-1);
+    }
+    .site-header__actions { display: flex; align-items: center; gap: 0.75rem; }
+    .live-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.375rem;
+      font-size: 0.6875rem;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      color: var(--green);
+    }
+    .live-pill__dot {
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: var(--green);
+      animation: blink 2s ease-in-out infinite;
+    }
+    @keyframes blink { 0%,100%{opacity:1;transform:scale(1)} 50%{opacity:0.45;transform:scale(0.75)} }
+
+    /* ── Buttons ─────────────────────────────────────────── */
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.375rem;
+      padding: 0.5rem 1.1rem;
+      border-radius: var(--r-sm);
+      font-size: 0.8125rem;
+      font-weight: 500;
+      font-family: inherit;
+      cursor: pointer;
+      border: 1px solid transparent;
+      transition: background 0.14s, border-color 0.14s, color 0.14s, box-shadow 0.14s;
+      white-space: nowrap;
+      line-height: 1;
+      text-decoration: none;
+    }
+    .btn:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+    .btn--primary  { background: var(--blue); color: #000; border-color: var(--blue); }
+    .btn--primary:hover { background: #6eadff; border-color: #6eadff; }
+    .btn--ghost    { background: var(--blue-dim); color: var(--blue); border-color: rgba(77,159,255,0.28); }
+    .btn--ghost:hover { background: var(--blue-mid); }
+    .btn--neutral  { background: var(--surf-2); color: var(--text-2); border-color: var(--border); }
+    .btn--neutral:hover { background: var(--surf-3); color: var(--text-1); border-color: var(--border-hi); }
+    .btn--danger   { background: var(--red-dim); color: var(--red); border-color: rgba(239,68,68,0.28); }
+    .btn--danger:hover { background: rgba(239,68,68,0.18); }
+    .btn--sm { padding: 0.3125rem 0.75rem; font-size: 0.75rem; }
+    .btn--icon {
+      padding: 0.375rem;
+      background: transparent;
+      border-color: transparent;
+      color: var(--text-2);
+      border-radius: var(--r-sm);
+    }
+    .btn--icon:hover { background: var(--surf-3); color: var(--text-1); }
+
+    /* ── Form ────────────────────────────────────────────── */
+    .form-group { display: flex; flex-direction: column; gap: 0.3rem; }
+    .form-label { font-size: 0.75rem; font-weight: 500; color: var(--text-2); }
+    .input {
+      background: var(--surf-2);
+      border: 1px solid var(--border);
+      border-radius: var(--r-sm);
+      padding: 0.5625rem 0.875rem;
+      color: var(--text-1);
+      font-size: 0.875rem;
+      font-family: inherit;
+      width: 100%;
+      transition: border-color 0.14s, box-shadow 0.14s;
+      -webkit-appearance: none;
+    }
+    .input:focus { outline: none; border-color: var(--blue); box-shadow: 0 0 0 3px rgba(77,159,255,0.14); }
+    .input::placeholder { color: var(--text-3); }
+    select.input { cursor: pointer; }
+
+    /* ── Status badge ────────────────────────────────────── */
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.3rem;
+      font-size: 0.6875rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      padding: 0.1875rem 0.5rem;
+      border-radius: 2rem;
+      white-space: nowrap;
+    }
+    .badge__dot { width: 6px; height: 6px; border-radius: 50%; flex-shrink: 0; }
+    .badge--ok   { background: var(--green-dim); color: var(--green); }
+    .badge--ok   .badge__dot { background: var(--green); }
+    .badge--warn { background: var(--amber-dim); color: var(--amber); }
+    .badge--warn .badge__dot { background: var(--amber); }
+    .badge--crit { background: var(--red-dim); color: var(--red); }
+    .badge--crit .badge__dot { background: var(--red); }
+
+    /* ── Section heading ─────────────────────────────────── */
+    .section-head {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      font-size: 0.8125rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.07em;
+      color: var(--blue);
+      margin-bottom: 0.75rem;
+    }
+
+    /* ── Explainer ───────────────────────────────────────── */
+    .explainer-body {
+      background: var(--blue-dim);
+      border: 1px solid rgba(77,159,255,0.18);
+      border-radius: var(--r);
+      padding: 1rem 1.25rem;
+      margin-top: 0.875rem;
+    }
+    .explainer-body p { font-size: 0.875rem; color: var(--text-2); }
+    .explainer-body p + p { margin-top: 0.5rem; }
+    .explainer-body strong { color: var(--text-1); }
+    .explainer-toggle {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      width: 100%;
+      background: none;
+      border: none;
+      font-family: inherit;
+      font-size: 0.9375rem;
+      font-weight: 600;
+      color: var(--blue);
+      cursor: pointer;
+      padding: 0;
+      text-align: left;
+      gap: 0.5rem;
+    }
+    .explainer-toggle:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+    .explainer-toggle__chevron { color: var(--text-3); transition: transform 0.22s; flex-shrink: 0; margin-left: auto; }
+    .explainer-toggle.open .explainer-toggle__chevron { transform: rotate(180deg); }
+
+    /* ── System grid ─────────────────────────────────────── */
+    .system-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(195px, 1fr));
+      gap: 0.75rem;
+    }
+    .system-card {
+      background: var(--surf-1);
+      border: 1px solid var(--border);
+      border-radius: var(--r);
+      padding: 1rem;
+      cursor: pointer;
+      display: flex;
+      flex-direction: column;
+      gap: 0.375rem;
+      text-align: left;
+      font-family: inherit;
+      transition: border-color 0.16s, background 0.16s, box-shadow 0.16s;
+    }
+    .system-card:hover      { border-color: var(--border-hi); background: var(--surf-2); box-shadow: var(--shadow); }
+    .system-card:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+    .system-card.is-active  { border-color: var(--blue); background: var(--blue-dim); }
+    .system-card.is-warn    { border-color: rgba(245,158,11,0.4); }
+    .system-card.is-crit    { border-color: rgba(239,68,68,0.48); }
+    .system-card__name      { display: flex; align-items: center; gap: 0.5rem; font-weight: 600; font-size: 0.9375rem; }
+    .system-card__tagline   { font-size: 0.75rem; color: var(--text-3); line-height: 1.4; }
+    .system-card__status    { margin-top: 0.25rem; }
+
+    /* ── Search ──────────────────────────────────────────── */
+    .search-wrap   { position: relative; }
+    .search-field  { position: relative; }
+    .search-icon   { position: absolute; left: 0.875rem; top: 50%; transform: translateY(-50%); color: var(--text-3); pointer-events: none; }
+    .search-field .input { padding-left: 2.5rem; }
+    .search-dropdown {
+      position: absolute;
+      top: calc(100% + 0.375rem);
+      left: 0; right: 0;
+      background: var(--surf-2);
+      border: 1px solid var(--border-hi);
+      border-radius: var(--r);
+      box-shadow: var(--shadow-lg);
+      max-height: 280px;
+      overflow-y: auto;
+      z-index: 300;
+      display: none;
+    }
+    .search-dropdown.open { display: block; }
+    .search-result {
+      padding: 0.625rem 1rem;
+      cursor: pointer;
+      font-size: 0.8125rem;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 1rem;
+      transition: background 0.12s;
+    }
+    .search-result:last-child { border-bottom: none; }
+    .search-result:hover, .search-result:focus { background: var(--surf-3); outline: none; }
+    .search-result__tag { font-size: 0.6875rem; color: var(--text-3); white-space: nowrap; flex-shrink: 0; }
+
+    /* ── Tabs ────────────────────────────────────────────── */
+    .tab-bar {
+      display: flex;
+      gap: 0.375rem;
+      overflow-x: auto;
+      padding-bottom: 0.25rem;
+      margin-bottom: 1.25rem;
+      scrollbar-width: none;
+    }
+    .tab-bar::-webkit-scrollbar { display: none; }
+    .tab {
+      flex-shrink: 0;
+      padding: 0.4375rem 0.875rem;
+      border-radius: var(--r-sm);
+      font-size: 0.8125rem;
+      font-weight: 500;
+      font-family: inherit;
+      cursor: pointer;
+      border: 1px solid var(--border);
+      background: var(--surf-2);
+      color: var(--text-2);
+      transition: all 0.14s;
+      white-space: nowrap;
+    }
+    .tab:hover { background: var(--surf-3); color: var(--text-1); border-color: var(--border-hi); }
+    .tab.is-active { background: var(--blue); color: #000; border-color: var(--blue); font-weight: 600; }
+    .tab:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+
+    /* ── System detail ───────────────────────────────────── */
+    .sys-header { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 0.75rem; margin-bottom: 1.25rem; }
+    .sys-title  { display: flex; align-items: center; gap: 0.625rem; font-size: 1.05rem; font-weight: 700; }
+    .sys-sub    { font-size: 0.8rem; color: var(--text-3); font-weight: 400; margin-top: 0.15rem; }
+
+    details.disc { margin-top: 0.875rem; }
+    details.disc summary {
+      cursor: pointer;
+      font-size: 0.875rem;
+      font-weight: 600;
+      padding: 0.5rem 0;
+      list-style: none;
+      display: flex;
+      align-items: center;
+      gap: 0.375rem;
+      color: var(--text-1);
+      user-select: none;
+      border-top: 1px solid var(--border);
+    }
+    details.disc summary::-webkit-details-marker { display: none; }
+    details.disc summary .chev { margin-left: auto; color: var(--text-3); transition: transform 0.22s; }
+    details.disc[open] summary .chev { transform: rotate(180deg); }
+    details.disc .disc-body { padding: 0.625rem 0 0.375rem; }
+
+    .stage-list { display: flex; flex-direction: column; gap: 0.5rem; }
+    .stage-card { border-left: 3px solid; padding: 0.75rem 1rem; border-radius: 0 var(--r-sm) var(--r-sm) 0; background: var(--surf-2); }
+    .stage-card--0 { border-color: var(--green); }
+    .stage-card--1 { border-color: var(--amber); }
+    .stage-card--2 { border-color: #f97316; }
+    .stage-card--3 { border-color: var(--red); }
+    .stage-card__title { font-weight: 600; font-size: 0.875rem; margin-bottom: 0.375rem; }
+    .stage-card__items { list-style: disc inside; color: var(--text-2); font-size: 0.8125rem; display: flex; flex-direction: column; gap: 0.15rem; }
+
+    .rf-list, .demand-list, .counter-list { list-style: none; display: flex; flex-direction: column; gap: 0.3rem; }
+    .rf-list li, .demand-list li, .counter-list li { font-size: 0.8125rem; color: var(--text-2); display: flex; align-items: flex-start; gap: 0.5rem; }
+    .rf-list li::before     { content:''; width:6px; height:6px; border-radius:50%; background:var(--red); flex-shrink:0; margin-top:0.45rem; }
+    .demand-list li::before { content:'→'; color:var(--blue); flex-shrink:0; }
+    .counter-list li::before{ content:'✓'; color:var(--green); flex-shrink:0; }
+
+    /* ── Biomarker tracker ───────────────────────────────── */
+    .bm-input-row { display: flex; flex-wrap: wrap; gap: 0.875rem; margin-bottom: 1.25rem; align-items: flex-end; }
+    .bm-input-row .form-group { flex: 1; min-width: 140px; }
+
+    .param-bar { display: flex; flex-wrap: wrap; gap: 0.375rem; margin-bottom: 0.75rem; }
+    .param-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.25rem;
+      padding: 0.25rem 0.625rem;
+      border-radius: 2rem;
+      font-size: 0.75rem;
+      font-weight: 500;
+      cursor: pointer;
+      border: 1px solid var(--border);
+      background: var(--surf-2);
+      color: var(--text-2);
+      font-family: inherit;
+      transition: all 0.14s;
+    }
+    .param-chip:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+    .param-chip.is-on { background: var(--blue-dim); border-color: rgba(77,159,255,0.38); color: var(--blue); }
+
+    .chart-wrap { position: relative; width: 100%; height: 240px; margin: 0.75rem 0; }
+
+    .history-list { max-height: 190px; overflow-y: auto; display: flex; flex-direction: column; gap: 0.375rem; margin: 0.5rem 0; }
+    .history-row {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      padding: 0.5rem 0.75rem;
+      background: var(--surf-2);
+      border-radius: var(--r-sm);
+      font-size: 0.8125rem;
+    }
+    .history-row__date   { color: var(--text-3); white-space: nowrap; flex-shrink: 0; }
+    .history-row__vals   { color: var(--text-1); flex: 1; }
+    .history-row__del    { margin-left: auto; opacity: 0; transition: opacity 0.14s; flex-shrink: 0; }
+    .history-row:hover .history-row__del,
+    .history-row:focus-within .history-row__del { opacity: 1; }
+
+    .action-row { display: flex; gap: 0.625rem; flex-wrap: wrap; align-items: center; margin-top: 0.75rem; }
+
+    /* ── Journal ─────────────────────────────────────────── */
+    .journal-form {
+      display: grid;
+      grid-template-columns: 145px 1fr 1fr 130px auto;
+      gap: 0.75rem;
+      align-items: end;
+      margin-bottom: 0.875rem;
+    }
+    .journal-list  { max-height: 280px; overflow-y: auto; display: flex; flex-direction: column; gap: 0.375rem; margin: 0.5rem 0; }
+    .journal-entry {
+      display: grid;
+      grid-template-columns: 90px 1fr 1fr auto auto;
+      gap: 0.625rem;
+      align-items: center;
+      padding: 0.5rem 0.75rem;
+      background: var(--surf-2);
+      border-radius: var(--r-sm);
+      font-size: 0.8125rem;
+      animation: fadeUp 0.2s ease both;
+    }
+    .je__date     { color: var(--text-3); white-space: nowrap; }
+    .je__symptom  { font-weight: 500; }
+    .je__location { color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .je__sev      { font-size: 0.6875rem; font-weight: 600; padding: 0.1875rem 0.5rem; border-radius: 2rem; white-space: nowrap; }
+    .je__sev--mild { background: var(--green-dim); color: var(--green); }
+    .je__sev--moderate { background: var(--amber-dim); color: var(--amber); }
+    .je__sev--severe   { background: var(--red-dim); color: var(--red); }
+
+    /* ── Cheat sheet ─────────────────────────────────────── */
+    .script-cards { display: flex; flex-direction: column; gap: 0.75rem; }
+    .script-card  { background: var(--surf-2); border: 1px solid var(--border); border-radius: var(--r-sm); padding: 0.875rem 1rem; }
+    .script-card__title { font-size: 0.8125rem; font-weight: 600; color: var(--blue); margin-bottom: 0.375rem; }
+    .script-card__text  { font-size: 0.8125rem; color: var(--text-2); font-style: italic; line-height: 1.65; }
+
+    /* ── Emergency ───────────────────────────────────────── */
+    .emergency-heading { display: flex; align-items: center; gap: 0.5rem; font-size: 1rem; font-weight: 700; color: var(--red-bright); margin-bottom: 0.875rem; }
+    .emergency-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(210px, 1fr)); gap: 0.625rem; }
+    .emergency-item {
+      display: flex;
+      align-items: flex-start;
+      gap: 0.625rem;
+      padding: 0.625rem 0.75rem;
+      background: rgba(239,68,68,0.05);
+      border: 1px solid rgba(239,68,68,0.14);
+      border-radius: var(--r-sm);
+      font-size: 0.8125rem;
+      color: var(--text-2);
+      line-height: 1.55;
+    }
+    .emergency-item__icon { font-size: 1rem; line-height: 1; flex-shrink: 0; margin-top: 0.1rem; }
+    .hotline-bar { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 0.75rem; padding-top: 0.875rem; border-top: 1px solid rgba(239,68,68,0.18); margin-top: 0.875rem; }
+    .hotline { font-size: 0.9rem; font-weight: 700; color: var(--red-bright); }
+    .hotline a { color: inherit; text-decoration: none; }
+    .hotline a:hover { text-decoration: underline; }
+
+    /* ── Tour ────────────────────────────────────────────── */
+    .tour-backdrop {
+      position: fixed; inset: 0;
+      background: rgba(0,0,0,0);
+      z-index: 1000;
+      pointer-events: none;
+      transition: background 0.3s;
+    }
+    .tour-backdrop.active { background: rgba(0,0,0,0.68); pointer-events: auto; }
+    .tour-highlight {
+      position: fixed;
+      pointer-events: none;
+      border: 2px solid var(--blue);
+      border-radius: var(--r-sm);
+      box-shadow: 0 0 0 9999px rgba(0,0,0,0.45), 0 0 22px rgba(77,159,255,0.45);
+      z-index: 1001;
+      transition: top 0.28s, left 0.28s, width 0.28s, height 0.28s;
+      display: none;
+    }
+    .tour-tooltip {
+      position: fixed;
+      z-index: 1002;
+      background: var(--surf-2);
+      border: 1px solid var(--border-hi);
+      border-radius: var(--r-lg);
+      padding: 1.25rem;
+      width: 300px;
+      box-shadow: var(--shadow-lg);
+      display: none;
+    }
+    .tour-backdrop.active ~ .tour-highlight,
+    .tour-backdrop.active ~ .tour-tooltip { display: block; }
+    .tour-tooltip__title { font-size: 0.9375rem; font-weight: 700; color: var(--blue); margin-bottom: 0.5rem; }
+    .tour-tooltip__desc  { font-size: 0.8125rem; color: var(--text-2); line-height: 1.65; }
+    .tour-tooltip__foot  { display: flex; justify-content: space-between; align-items: center; margin-top: 1rem; gap: 0.5rem; }
+    .tour-tooltip__prog  { font-size: 0.75rem; color: var(--text-3); }
+    .tour-tooltip__btns  { display: flex; gap: 0.375rem; }
+
+    /* ── Help FAB ────────────────────────────────────────── */
+    .help-fab {
+      position: fixed;
+      bottom: 1.5rem; right: 1.5rem;
+      z-index: 900;
+      width: 3rem; height: 3rem;
+      border-radius: 50%;
+      background: var(--blue); color: #000;
+      font-size: 1.2rem; font-weight: 700; font-family: inherit;
+      display: flex; align-items: center; justify-content: center;
+      cursor: pointer; border: none;
+      box-shadow: 0 4px 20px rgba(77,159,255,0.4);
+      transition: transform 0.14s, box-shadow 0.14s;
+    }
+    .help-fab:hover { transform: scale(1.08); box-shadow: 0 6px 28px rgba(77,159,255,0.55); }
+    .help-fab:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+
+    /* ── Utils ───────────────────────────────────────────── */
+    .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; }
+    .empty   { text-align: center; padding: 2rem; color: var(--text-3); font-size: 0.875rem; }
+    .body-sm { font-size: 0.8125rem; color: var(--text-2); }
+    .divider { border: none; border-top: 1px solid var(--border); margin: 1rem 0; }
+    @keyframes fadeUp { from{opacity:0;transform:translateY(6px)} to{opacity:1;transform:translateY(0)} }
+
+    ::-webkit-scrollbar { width: 6px; height: 6px; }
+    ::-webkit-scrollbar-track { background: var(--surf-1); }
+    ::-webkit-scrollbar-thumb { background: var(--surf-3); border-radius: 3px; }
+    ::-webkit-scrollbar-thumb:hover { background: var(--text-3); }
+
+    /* ── Responsive ──────────────────────────────────────── */
+    @media (max-width: 768px) {
+      .app { padding: 0.75rem 0.75rem 6rem; gap: 1.25rem; }
+      .panel__body { padding: 1rem; }
+      .journal-form {
+        grid-template-columns: 1fr 1fr;
+        grid-template-rows: auto auto auto;
+      }
+      .journal-form .fg--date { grid-column: 1 / -1; }
+      .journal-form .fg--btn  { grid-column: 1 / -1; display: flex; justify-content: flex-end; }
+      .journal-entry { grid-template-columns: 80px 1fr auto auto; }
+      .je__location { display: none; }
+    }
+    @media (max-width: 480px) {
+      .site-header__title { font-size: 1.3rem; }
+      .system-grid { grid-template-columns: 1fr 1fr; }
+      .bm-input-row .form-group { min-width: 110px; }
+      .journal-form { grid-template-columns: 1fr; }
+      .journal-form .fg--date,
+      .journal-form .fg--btn  { grid-column: auto; }
+    }
+
+    /* ── Print ───────────────────────────────────────────── */
+    @media print {
+      body { background: #fff; color: #111; }
+      .help-fab, .tour-backdrop, .tour-highlight, .tour-tooltip,
+      .tab-bar, .action-row, .bm-input-row, .param-bar, .chart-wrap,
+      .journal-form, .search-wrap, .btn--neutral, .btn--ghost,
+      .btn--primary, .btn--danger { display: none !important; }
+      .app { padding: 0; gap: 1.25rem; }
+      .panel { background: #fff; border: 1px solid #ccc; box-shadow: none; break-inside: avoid; }
+      .surf-2, .stage-card { background: #f8f8f8; }
+      .site-header__eyebrow, .section-head, .blue { color: #1a4fa0; }
+      .site-header__title, .text-1 { color: #111; }
+      .emergency-item { background: #fff3f3; border-color: #fca5a5; }
+      .hotline { color: #b91c1c; }
+    }
+  </style>
+</head>
+<body>
+
+<div class="app" id="app">
+
+  <!-- Header -->
+  <header class="panel panel__body site-header" role="banner" style="padding:1rem 1.5rem;">
+    <div class="site-header__brand">
+      <p class="site-header__eyebrow" aria-hidden="true">BCBS 2050 · Systemic Early Warning</p>
+      <h1 class="site-header__title">Pre‑Biosign Intelligence</h1>
+    </div>
+    <div class="site-header__actions">
+      <button class="btn btn--neutral btn--sm" id="printBtn" aria-label="Print report">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9V2h12v7"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><rect x="6" y="14" width="12" height="8"/></svg>
+        Export Report
+      </button>
+      <div class="live-pill" role="status" aria-label="System live">
+        <span class="live-pill__dot" aria-hidden="true"></span>
+        LIVE
+      </div>
+    </div>
+  </header>
+
+  <!-- Explainer -->
+  <section>
+    <div class="panel panel__body--sm">
+      <button class="explainer-toggle" id="explainerToggle" aria-expanded="true" aria-controls="explainerBody">
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 8v4m0 4h.01"/></svg>
+        What are "Pre‑Biosigns"?
+        <svg class="explainer-toggle__chevron" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+      </button>
+      <div id="explainerBody" role="region" aria-labelledby="explainerToggle">
+        <div class="explainer-body">
+          <p><strong>Pre‑biosigns</strong> (pre‑biological signals) are measurable changes in your body that appear <em>before</em> you feel sick — a slight drop in white blood cells, a tiny rise in liver enzymes, a change in nerve protein levels. They're not symptoms; they're data.</p>
+          <p>This tool tracks these signals across six organ systems, helps you spot dangerous patterns, and generates doctor‑ready scripts — so you can act before a crisis.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- System status grid -->
+  <section aria-labelledby="statusLabel">
+    <h2 class="sr-only" id="statusLabel">Organ System Status</h2>
+    <div class="system-grid" id="systemGrid" role="list"></div>
+  </section>
+
+  <!-- Search -->
+  <div class="search-wrap" role="search">
+    <label for="searchInput" class="sr-only">Search symptoms, biomarkers, red flags</label>
+    <div class="search-field">
+      <svg class="search-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="11" cy="11" r="8"/><path d="m21 21-4.35-4.35"/></svg>
+      <input type="search" class="input" id="searchInput" placeholder="Search symptoms, biomarkers, red flags…" autocomplete="off" aria-autocomplete="list" aria-haspopup="listbox" aria-controls="searchDropdown" />
+    </div>
+    <div id="searchDropdown" class="search-dropdown" role="listbox" aria-label="Search suggestions"></div>
+  </div>
+
+  <!-- System detail -->
+  <section class="panel" id="detailPanel" aria-labelledby="detailLabel">
+    <div class="panel__body">
+      <h2 class="sr-only" id="detailLabel">System detail</h2>
+      <div class="tab-bar" id="tabBar" role="tablist" aria-label="Organ systems"></div>
+      <div id="systemContent" role="tabpanel"></div>
+    </div>
+  </section>
+
+  <!-- Biomarker tracker -->
+  <section class="panel" id="bioSection" aria-labelledby="bioLabel">
+    <div class="panel__body">
+      <h2 class="section-head" id="bioLabel">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 3v18h18"/><path d="m19 9-5 5-4-4-3 3"/></svg>
+        Biomarker Tracker
+      </h2>
+      <p class="body-sm" style="margin-bottom:1rem;">Log blood test values over time. Select parameters to plot on the chart.</p>
+      <div class="bm-input-row" id="bmInputs"></div>
+      <div style="display:flex;align-items:center;gap:0.75rem;flex-wrap:wrap;margin-bottom:0.875rem;">
+        <button class="btn btn--primary btn--sm" id="logReadingBtn">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+          Log Reading
+        </button>
+        <button class="btn btn--neutral btn--sm" id="clearChartBtn">Clear chart</button>
+      </div>
+      <div class="param-bar" id="paramBar" role="group" aria-label="Chart parameters"></div>
+      <div class="chart-wrap">
+        <canvas id="trendChart" role="img" aria-label="Biomarker trend chart"></canvas>
+      </div>
+      <div class="history-list" id="bmHistory" aria-live="polite" aria-label="Logged readings"></div>
+      <div class="action-row">
+        <button class="btn btn--neutral btn--sm" id="exportBmBtn">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Export CSV
+        </button>
+        <button class="btn btn--neutral btn--sm" id="importBmBtn">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+          Import CSV
+        </button>
+        <input type="file" id="importBmFile" accept=".csv" class="sr-only" aria-label="Import biomarker CSV" />
+      </div>
+    </div>
+  </section>
+
+  <!-- Journal -->
+  <section class="panel" id="journalSection" aria-labelledby="journalLabel">
+    <div class="panel__body">
+      <h2 class="section-head" id="journalLabel">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"/><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"/></svg>
+        Environment &amp; Symptom Journal
+      </h2>
+      <p class="body-sm" style="margin-bottom:1rem;">Track when and where symptoms occur. Patterns (worse at home, better away) are diagnostically crucial.</p>
+      <div class="journal-form" role="group" aria-label="Log symptom entry">
+        <div class="form-group fg--date">
+          <label class="form-label" for="jDate">Date</label>
+          <input type="date" class="input" id="jDate" />
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="jSymptom">Symptom</label>
+          <input type="text" class="input" id="jSymptom" placeholder="e.g. Fatigue, nausea" />
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="jLocation">Location / Exposure</label>
+          <input type="text" class="input" id="jLocation" placeholder="e.g. Home, office, restaurant" />
+        </div>
+        <div class="form-group">
+          <label class="form-label" for="jSeverity">Severity</label>
+          <select class="input" id="jSeverity">
+            <option value="Mild">Mild</option>
+            <option value="Moderate">Moderate</option>
+            <option value="Severe">Severe</option>
+          </select>
+        </div>
+        <div class="form-group fg--btn">
+          <span class="form-label" aria-hidden="true">&nbsp;</span>
+          <button class="btn btn--primary btn--sm" id="logJournalBtn">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true"><path d="M12 5v14M5 12h14"/></svg>
+            Log
+          </button>
+        </div>
+      </div>
+      <div class="journal-list" id="journalList" aria-live="polite" aria-label="Journal entries"></div>
+      <div class="action-row">
+        <button class="btn btn--neutral btn--sm" id="exportJournalBtn">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          Export CSV
+        </button>
+        <button class="btn btn--danger btn--sm" id="clearJournalBtn">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6M14 11v6"/></svg>
+          Clear All
+        </button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Doctor scripts -->
+  <section class="panel" id="scriptsSection" aria-labelledby="scriptsLabel">
+    <div class="panel__body">
+      <h2 class="section-head" id="scriptsLabel">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+        Doctor Visit Scripts
+      </h2>
+      <p class="body-sm" style="margin-bottom:1rem;">Exact phrases to request tests and convey urgency to your physician.</p>
+      <div class="script-cards" id="scriptCards"></div>
+    </div>
+  </section>
+
+  <!-- Emergency protocols -->
+  <section class="panel panel--alert" id="emergencySection" aria-labelledby="emergencyLabel">
+    <div class="panel__body">
+      <h2 class="emergency-heading" id="emergencyLabel">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
+        Toxicology &amp; Emergency Protocols
+      </h2>
+      <div class="emergency-grid" role="list">
+        <div class="emergency-item" role="listitem">
+          <span class="emergency-item__icon" aria-hidden="true">⚡</span>
+          <span><strong>Anaphylaxis:</strong> Epinephrine 0.3 mg IM → Dexamethasone 40 mg IV</span>
+        </div>
+        <div class="emergency-item" role="listitem">
+          <span class="emergency-item__icon" aria-hidden="true">🫁</span>
+          <span><strong>Aspiration:</strong> Thickened liquids, upright positioning</span>
+        </div>
+        <div class="emergency-item" role="listitem">
+          <span class="emergency-item__icon" aria-hidden="true">🔬</span>
+          <span><strong>Heavy metals:</strong> NAC, selenium, magnesium — never self-chelate</span>
+        </div>
+        <div class="emergency-item" role="listitem">
+          <span class="emergency-item__icon" aria-hidden="true">💊</span>
+          <span><strong>QT drugs:</strong> Avoid macrolides + fluoroquinolones concurrently</span>
+        </div>
+        <div class="emergency-item" role="listitem">
+          <span class="emergency-item__icon" aria-hidden="true">🩸</span>
+          <span><strong>Cd/As exposure:</strong> Sources — tobacco, rice, contaminated water</span>
+        </div>
+        <div class="emergency-item" role="listitem">
+          <span class="emergency-item__icon" aria-hidden="true">🧠</span>
+          <span><strong>B-vitamin neuropathy:</strong> Check serum B1, B6, B12 levels urgently</span>
+        </div>
+      </div>
+      <div class="hotline-bar">
+        <span class="hotline">🆘 Poison Control: <a href="tel:18002221222">1-800-222-1222</a></span>
+        <span class="hotline">🚑 Emergency: <a href="tel:911">911</a></span>
+      </div>
+    </div>
+  </section>
+
+</div><!-- /app -->
+
+<!-- Help FAB -->
+<button class="help-fab" id="helpFab" aria-label="Restart guided tour">?</button>
+
+<!-- Tour -->
+<div class="tour-backdrop" id="tourBackdrop" role="dialog" aria-modal="true" aria-labelledby="tourTitle" aria-hidden="true"></div>
+<div class="tour-highlight" id="tourHighlight" aria-hidden="true"></div>
+<div class="tour-tooltip" id="tourTooltip" aria-hidden="true">
+  <h3 class="tour-tooltip__title" id="tourTitle"></h3>
+  <p class="tour-tooltip__desc" id="tourDesc"></p>
+  <div class="tour-tooltip__foot">
+    <span class="tour-tooltip__prog" id="tourProg" aria-live="polite"></span>
+    <div class="tour-tooltip__btns">
+      <button class="btn btn--neutral btn--sm" id="tourPrev">← Back</button>
+      <button class="btn btn--primary btn--sm" id="tourNext">Next →</button>
+      <button class="btn btn--danger btn--sm" id="tourSkip">Skip</button>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  'use strict';
+
+  /* ─────────────────── DATA ─────────────────────────────── */
+  const SYSTEMS = [
+    {
+      id:'cardiac', name:'Cardiac', icon:'❤️',
+      tagline:'Troponin rises before symptoms.',
+      stages:[
+        {label:'Stage 0 — Subclinical', items:['hs-Troponin trending up (still <14 ng/L)','BNP 35–100 pg/mL','QTc 440–460 ms','Mild exertional intolerance','Occasional palpitations']},
+        {label:'Stage 1 — Early dysfunction', items:['hs-Troponin 14–40 ng/L','BNP 100–300 pg/mL','Resting HR >85 bpm','Exertional dyspnea','BP lability']},
+        {label:'Stage 2 — Moderate', items:['hs-Troponin >40 ng/L','BNP >300 pg/mL','QTc >470 ms','Chest discomfort','Ankle edema']},
+        {label:'Stage 3 — Severe', items:['Troponin spike','BNP >900 pg/mL','Pulmonary edema','Syncope','Hemodynamic instability']}
+      ],
+      redflags:['Troponin rise without exertion or known cause','QTc >500 ms on any reading','New LBBB pattern on ECG','BNP doubling in under 4 weeks'],
+      demand:['hs-Troponin I & T (serial × 3 at 0/3/6h)','BNP or NT-proBNP','12-lead ECG with QTc trending','Echocardiogram if BNP >200','Holter monitor for palpitations'],
+      counter:['Omega-3 fatty acids 2–4 g/day','Magnesium glycinate 400 mg/day','Aerobic exercise ≥150 min/week','Daily blood pressure monitoring','Review and eliminate QT-prolonging medications']
+    },
+    {
+      id:'respiratory', name:'Respiratory', icon:'🫁',
+      tagline:'Capacity drops before dyspnea.',
+      stages:[
+        {label:'Stage 0 — Subclinical', items:['DLCO 70–80% predicted','FVC borderline low','SpO₂ 95–96% at rest','Mild exertional breathlessness','Occasional dry cough']},
+        {label:'Stage 1 — Mild restriction', items:['DLCO 60–70%','FVC <80% predicted','SpO₂ drops ≥4% on exertion','Morning cough','Reduced exercise capacity']},
+        {label:'Stage 2 — Moderate', items:['DLCO <60%','FVC <65%','SpO₂ 91–94% at rest','Dyspnea at light activity','Digital clubbing possible']},
+        {label:'Stage 3 — Severe', items:['SpO₂ <90% at rest','FVC <50%','Cyanosis','CO₂ retention','Impending respiratory failure']}
+      ],
+      redflags:['DLCO drop >15% over 6 months','Hemoptysis (any amount)','SpO₂ <94% at rest','Bilateral infiltrates on chest X-ray'],
+      demand:['Full spirometry (FVC, FEV1, ratio, BD response)','DLCO (diffusion capacity)','SpO₂ at rest + 6-minute walk test','HRCT chest if DLCO low or unexplained','ABG if SpO₂ <94% or CO₂ retention suspected'],
+      counter:['N-acetylcysteine 600 mg twice daily','Avoid known sensitizers and irritants','Annual PFTs if occupationally exposed','Pneumococcal + influenza vaccination','HEPA air purifier in sleeping area']
+    },
+    {
+      id:'neuro', name:'Neurological', icon:'🧠',
+      tagline:'NfL detects axon damage early.',
+      stages:[
+        {label:'Stage 0 — Subclinical', items:['Serum NfL >20 pg/mL trending up','Subtle cognitive slowing','Sensory changes in fingertips/toes','Anosmia (early)','Sleep architecture disruption']},
+        {label:'Stage 1 — Mild', items:['Stocking-glove peripheral neuropathy','Balance difficulties on tandem walk','Word-finding impairment','Reduced grip strength bilaterally']},
+        {label:'Stage 2 — Moderate', items:['Gait ataxia','Cognitive impairment (MoCA <24)','Autonomic symptoms (orthostasis, sweating)','Resting tremor or fasciculations']},
+        {label:'Stage 3 — Severe', items:['Severe dysphagia','Non-ambulatory','Confusion and delirium','Autonomic instability']}
+      ],
+      redflags:['Peripheral neuropathy without diabetes or nutritional cause','Rapid cognitive decline under age 60','Anosmia appearing before motor symptoms','Geographic clustering of symptoms (location-dependent)'],
+      demand:['Serum neurofilament light chain (NfL)','Comprehensive heavy metals — urine + hair (incl. thallium, arsenic speciation)','Formal neuropsychological testing','Nerve conduction study + EMG','MRI brain with and without contrast','B12, MMA, homocysteine, methylfolate'],
+      counter:['Alpha-lipoic acid 600–1200 mg/day','Methylcobalamin + methylfolate (active B vitamins)','DHA 1–2 g/day (omega-3)','Aerobic exercise (BDNF upregulation)','Annual hair heavy-metals panel']
+    },
+    {
+      id:'immune', name:'Immune/Onc', icon:'🔬',
+      tagline:'CBC trends reveal marrow stress.',
+      stages:[
+        {label:'Stage 0 — Cytopenia trend', items:['WBC downtrend (<4.5 K/µL)','Lymphocyte absolute count falling','Platelet count downtrending','Mild normocytic anemia','NK cell activity reduced']},
+        {label:'Stage 1 — Mild failure', items:['Frequent infections / UTIs','Slow wound healing','Drenching night sweats','Low-grade fever (>37.5°C) recurring']},
+        {label:'Stage 2 — Pancytopenia', items:['Pancytopenia (all lines low)','Petechiae or purpura','Persistent fever unresponsive to antibiotics','Lymphadenopathy (>1 cm, multiple nodes)']},
+        {label:'Stage 3 — Severe', items:['Febrile neutropenia (ANC <500)','Hemorrhage from multiple sites','Bone pain (marrow involvement)','Opportunistic infections']}
+      ],
+      redflags:['Pancytopenia with no nutritional or drug explanation','B symptoms (fevers/sweats/weight loss) + lymphadenopathy','Lymphocyte decline >30% over 3 months','Inappropriately low reticulocyte count with anemia'],
+      demand:['CBC with differential (serial over weeks–months)','Reticulocyte count + reticulocyte production index','Ferritin, B12, folate, copper','Lymphocyte subset panel (CD4/CD8/NK)','Bone marrow biopsy if pancytopenia unexplained after 4–6 weeks'],
+      counter:['Zinc 15–30 mg/day','Vitamin D 2000–4000 IU/day','Selenium 200 µg/day','Consistent 7–9 hours sleep','Reduce cumulative xenobiotic exposures']
+    },
+    {
+      id:'liver', name:'Liver', icon:'🫀',
+      tagline:'No pain receptors — 70% loss before failure.',
+      stages:[
+        {label:'Stage 0 — Enzyme rise', items:['ALT/AST 2–3× ULN','GGT elevated (toxin-sensitive, rises early)','ALP elevated','Bilirubin still normal','PT/INR still normal']},
+        {label:'Stage 1 — Mild dysfunction', items:['Deep unexplained fatigue','Nausea with fatty or large meals','Early satiety','Dull RUQ ache','Pruritus without visible rash']},
+        {label:'Stage 2 — Moderate', items:['Jaundice / scleral icterus','Dark urine (bilirubinuria)','Easy bruising','Bilateral ankle swelling']},
+        {label:'Stage 3 — Advanced', items:['Ascites','Hepatic encephalopathy','Coagulopathy (INR >1.5)','Variceal hemorrhage']}
+      ],
+      redflags:['GGT elevation without alcohol use or obesity explanation','Rapid simultaneous rise in all enzymes + bilirubin','Pruritus onset before jaundice appears','INR >1.5 in absence of anticoagulation'],
+      demand:['Comprehensive LFTs + GGT (not just AST/ALT)','PT/INR','Liver ultrasound + FibroScan / elastography','Hepatitis B surface antigen + HCV antibody','ANA / ASMA / anti-LKM (autoimmune hepatitis screen)'],
+      counter:['N-acetylcysteine 600–1200 mg/day','Silymarin (milk thistle) 420–600 mg/day','Zero alcohol','Limit acetaminophen to <2 g/day','Review all OTC supplements for hepatotoxins']
+    },
+    {
+      id:'renal', name:'Renal', icon:'🫘',
+      tagline:'Creatinine rises after 50% function lost.',
+      stages:[
+        {label:'Stage 0 — Tubular injury', items:['KIM-1 elevated in urine (tubular injury marker)','NGAL elevated (urine or serum)','Cystatin C rising','Microalbuminuria','NAG (N-acetyl-β-glucosaminidase) elevated']},
+        {label:'Stage 1 — Mild proteinuria', items:['Foamy / frothy urine','Periorbital puffiness on waking','Bilateral ankle edema','New-onset hypertension','Nocturia (>2× per night)']},
+        {label:'Stage 2 — Moderate eGFR decline', items:['Fatigue, metallic taste','Decreased urine output','Muscle cramps (especially nocturnal)','Anemia of CKD (low EPO)']},
+        {label:'Stage 3 — Severe', items:['Severe generalized edema','Oliguria / anuria','Persistent nausea and vomiting','Uremic encephalopathy (confusion)']}
+      ],
+      redflags:['Acute creatinine rise without dehydration or nephrotoxin exposure','Proteinuria in the absence of diabetes or hypertension','Hypertension + edema + proteinuria triad','Unexplained microscopic hematuria'],
+      demand:['Cystatin C-based eGFR (not creatinine-only)','Microalbumin-to-creatinine ratio (spot urine)','Urinalysis with full microscopy','Renal ultrasound (size, echogenicity)','24-hour urine protein','Urine protein electrophoresis if proteinuria heavy'],
+      counter:['Hydration 2.5–3.5 L/day (adjust for climate)','Magnesium glycinate 400 mg/day','Avoid NSAIDs if eGFR <60','Monthly urine dipstick self-monitoring','Low-sodium diet (<2 g Na/day)']
+    }
+  ];
+
+  const BM_FIELDS = {
+    cardiac:     ['hs-Troponin (ng/L)','BNP (pg/mL)','QTc (ms)'],
+    respiratory: ['DLCO (%)','FVC (L)','SpO₂ (%)'],
+    neuro:       ['NfL (pg/mL)','B12 (pg/mL)','Heavy metal score (0–3)'],
+    immune:      ['WBC (K/µL)','Lymphocytes (K/µL)','Platelets (K/µL)'],
+    liver:       ['ALT (U/L)','GGT (U/L)','Bilirubin (mg/dL)'],
+    renal:       ['Cystatin C (mg/L)','Creatinine (mg/dL)','eGFR (mL/min)']
+  };
+
+  const THRESHOLDS = {
+    'hs-Troponin (ng/L)': {warn:14,  crit:40,  dir:'up'},
+    'BNP (pg/mL)':        {warn:100, crit:300, dir:'up'},
+    'QTc (ms)':           {warn:440, crit:470, dir:'up'},
+    'DLCO (%)':           {warn:70,  crit:60,  dir:'dn'},
+    'SpO₂ (%)':           {warn:95,  crit:91,  dir:'dn'},
+    'NfL (pg/mL)':        {warn:20,  crit:50,  dir:'up'},
+    'WBC (K/µL)':         {warn:4.5, crit:3.5, dir:'dn'},
+    'Lymphocytes (K/µL)': {warn:1.5, crit:1.0, dir:'dn'},
+    'Platelets (K/µL)':   {warn:150, crit:100, dir:'dn'},
+    'ALT (U/L)':          {warn:56,  crit:100, dir:'up'},
+    'GGT (U/L)':          {warn:50,  crit:70,  dir:'up'},
+    'Cystatin C (mg/L)':  {warn:1.0, crit:1.2, dir:'up'},
+    'Creatinine (mg/dL)': {warn:1.1, crit:1.5, dir:'up'},
+    'eGFR (mL/min)':      {warn:60,  crit:30,  dir:'dn'}
+  };
+
+  const SCRIPTS = {
+    cardiac:     [{title:'Requesting cardiac biomarkers', text:'"I need serial high-sensitivity troponin (hs-TnI or hs-TnT) measured at 0, 3, and 6 hours, plus BNP or NT-proBNP, and a 12-lead ECG with QTc measurement. I am concerned about early subclinical myocardial injury that would not appear on standard troponin assays."'}],
+    respiratory: [{title:'Requesting pulmonary function tests', text:'"Please order full spirometry with bronchodilator response and DLCO (diffusion capacity for carbon monoxide). If the DLCO is reduced, I would like an HRCT chest. I want to trend my respiratory reserve over time to detect early restriction before I am symptomatic."'}],
+    neuro:       [{title:'Requesting neurological workup', text:'"I would like serum neurofilament light chain (NfL), a comprehensive heavy-metals panel on 24-hour urine and hair including thallium and arsenic with speciation, and B12 with methylmalonic acid. I am monitoring for early neurological injury. Please do not substitute standard B12 alone — I need MMA to detect functional deficiency."'}],
+    immune:      [{title:'Requesting immune and marrow panel', text:'"Please order a CBC with differential as a serial trend (not a one-time result), plus reticulocyte count, lymphocyte subset panel (CD4/CD8/NK), and ferritin/B12/folate. I want to detect any marrow-suppression pattern early. A single normal value is not reassuring — I need trend data."'}],
+    liver:       [{title:'Requesting hepatic panel with GGT', text:'"I need a comprehensive liver panel that specifically includes GGT — a standard LFT panel often omits it. I also want PT/INR and a liver ultrasound with elastography if enzymes are elevated more than 2× ULN. GGT is my preferred early toxin-exposure marker."'}],
+    renal:       [{title:'Requesting early kidney markers', text:'"Please order cystatin C-based eGFR (not creatinine-only, which misses 50% of function loss), plus a spot microalbumin-to-creatinine ratio and urinalysis with microscopy. I want to trend cystatin C every 3 months. Standard creatinine-based eGFR is not sensitive enough for early detection."'}]
+  };
+
+  const CHART_COLORS = ['#4d9fff','#22c55e','#f59e0b','#ef4444','#a78bfa','#1abc9c'];
+
+  /* ─────────────────── STATE ────────────────────────────── */
+  let activeSys   = 'cardiac';
+  let readings    = safeJSON('bcbs_readings', []);
+  let journal     = safeJSON('bcbs_journal', []);
+  let chartInst   = null;
+  let chartParams = new Set();
+
+  function safeJSON(key, fallback) {
+    try { return JSON.parse(localStorage.getItem(key) || 'null') || fallback; }
+    catch (e) { return fallback; }
+  }
+  function save(key, val) { try { localStorage.setItem(key, JSON.stringify(val)); } catch(e) {} }
+  function saveReadings() { save('bcbs_readings', readings); }
+  function saveJournal()  { save('bcbs_journal', journal); }
+  function g(id) { return document.getElementById(id); }
+
+  /* ─────────────────── STATUS LOGIC ────────────────────── */
+  function sysStatus(sysId) {
+    const fields = BM_FIELDS[sysId] || [];
+    const sysR   = readings.filter(r => r.system === sysId);
+    if (!sysR.length) return 'ok';
+    const last = sysR[sysR.length - 1].values;
+    let status = 'ok';
+    for (const f of fields) {
+      const v  = parseFloat(last[f]);
+      const th = THRESHOLDS[f];
+      if (isNaN(v) || !th) continue;
+      const isCrit = th.dir === 'up' ? v > th.crit : v < th.crit;
+      const isWarn = th.dir === 'up' ? v > th.warn : v < th.warn;
+      if (isCrit) return 'crit';
+      if (isWarn) status = 'warn';
+    }
+    return status;
+  }
+
+  function badgeHTML(status) {
+    const map = { ok:['ok','Normal'], warn:['warn','Warning'], crit:['crit','Critical'] };
+    const [cls, label] = map[status] || ['ok','Normal'];
+    return `<span class="badge badge--${cls}" role="status" aria-label="${label}"><span class="badge__dot" aria-hidden="true"></span>${label}</span>`;
+  }
+
+  /* ─────────────────── SYSTEM GRID ─────────────────────── */
+  function renderGrid() {
+    g('systemGrid').innerHTML = SYSTEMS.map(sys => {
+      const st   = sysStatus(sys.id);
+      const mod  = st === 'crit' ? 'is-crit' : st === 'warn' ? 'is-warn' : '';
+      const act  = sys.id === activeSys ? 'is-active' : '';
+      const label = st === 'crit' ? 'Critical' : st === 'warn' ? 'Warning' : 'Normal';
+      return `<button
+        class="system-card ${mod} ${act}"
+        role="listitem"
+        aria-pressed="${sys.id === activeSys}"
+        aria-label="${sys.name}: ${label}"
+        data-sys="${sys.id}"
+      >
+        <div class="system-card__name">
+          <span aria-hidden="true">${sys.icon}</span>${sys.name}
+        </div>
+        <div class="system-card__tagline">${sys.tagline}</div>
+        <div class="system-card__status">${badgeHTML(st)}</div>
+      </button>`;
+    }).join('');
+    g('systemGrid').querySelectorAll('[data-sys]').forEach(b => {
+      b.addEventListener('click', () => switchSys(b.dataset.sys));
+    });
+  }
+
+  /* ─────────────────── TAB BAR ──────────────────────────── */
+  function renderTabs() {
+    g('tabBar').innerHTML = SYSTEMS.map(sys => `
+      <button
+        class="tab ${sys.id === activeSys ? 'is-active' : ''}"
+        role="tab"
+        aria-selected="${sys.id === activeSys}"
+        data-sys="${sys.id}"
+      >${sys.icon} ${sys.name}</button>`).join('');
+    g('tabBar').querySelectorAll('[data-sys]').forEach(t => {
+      t.addEventListener('click', () => switchSys(t.dataset.sys));
+    });
+  }
+
+  /* ─────────────────── SYSTEM CONTENT ──────────────────── */
+  function renderSysContent() {
+    const sys = SYSTEMS.find(s => s.id === activeSys);
+    const st  = sysStatus(activeSys);
+    g('systemContent').innerHTML = `
+      <div class="sys-header">
+        <div>
+          <div class="sys-title"><span aria-hidden="true">${sys.icon}</span>${sys.name} System</div>
+          <div class="sys-sub">${sys.tagline}</div>
+        </div>
+        ${badgeHTML(st)}
+      </div>
+
+      <details class="disc" open>
+        <summary>
+          <span style="color:var(--amber)" aria-hidden="true">⚠</span> Warning Stages
+          <svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+        </summary>
+        <div class="disc-body">
+          <div class="stage-list">
+            ${sys.stages.map((s,i) => `
+              <div class="stage-card stage-card--${i}">
+                <div class="stage-card__title">${s.label}</div>
+                <ul class="stage-card__items">${s.items.map(it=>`<li>${it}</li>`).join('')}</ul>
+              </div>`).join('')}
+          </div>
+        </div>
+      </details>
+
+      <details class="disc">
+        <summary>
+          <span style="color:var(--red)" aria-hidden="true">🚩</span> Red Flags
+          <svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+        </summary>
+        <div class="disc-body"><ul class="rf-list">${sys.redflags.map(r=>`<li>${r}</li>`).join('')}</ul></div>
+      </details>
+
+      <details class="disc">
+        <summary>
+          <span style="color:var(--blue)" aria-hidden="true">📋</span> Demand These Tests
+          <svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+        </summary>
+        <div class="disc-body"><ul class="demand-list">${sys.demand.map(d=>`<li>${d}</li>`).join('')}</ul></div>
+      </details>
+
+      <details class="disc">
+        <summary>
+          <span style="color:var(--green)" aria-hidden="true">✓</span> Countermeasures
+          <svg class="chev" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+        </summary>
+        <div class="disc-body"><ul class="counter-list">${sys.counter.map(c=>`<li>${c}</li>`).join('')}</ul></div>
+      </details>
+    `;
+  }
+
+  function switchSys(id) {
+    activeSys = id;
+    renderGrid();
+    renderTabs();
+    renderSysContent();
+    renderBmInputs();
+    renderParamBar();
+    renderBmHistory();
+    updateChart();
+    renderScripts();
+    g('detailPanel').scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
+
+  /* ─────────────────── BIOMARKER INPUTS ────────────────── */
+  function renderBmInputs() {
+    const fields = BM_FIELDS[activeSys] || [];
+    g('bmInputs').innerHTML = fields.map(f => `
+      <div class="form-group">
+        <label class="form-label" for="bm_${CSS.escape(f)}">${f}</label>
+        <input type="number" step="any" class="input" id="bm_${CSS.escape(f)}" data-field="${f}" placeholder="—" />
+      </div>`).join('');
+  }
+
+  function logReading() {
+    const fields = BM_FIELDS[activeSys] || [];
+    const values = {};
+    let hasAny = false;
+    for (const f of fields) {
+      const inp = document.querySelector(`[data-field="${f}"]`);
+      if (inp && inp.value !== '') { values[f] = inp.value; hasAny = true; }
+    }
+    if (!hasAny) { alert('Enter at least one value before logging.'); return; }
+    readings.push({ date: new Date().toISOString(), system: activeSys, values });
+    saveReadings();
+    document.querySelectorAll('[data-field]').forEach(i => { i.value = ''; });
+    renderGrid();
+    renderSysContent();
+    renderBmHistory();
+    updateChart();
+  }
+
+  /* ─────────────────── PARAM BAR / CHART ───────────────── */
+  function renderParamBar() {
+    const fields = BM_FIELDS[activeSys] || [];
+    g('paramBar').innerHTML = fields.map(f => `
+      <button class="param-chip ${chartParams.has(f) ? 'is-on' : ''}" data-param="${f}" aria-pressed="${chartParams.has(f)}">${f}</button>`).join('');
+    g('paramBar').querySelectorAll('[data-param]').forEach(c => {
+      c.addEventListener('click', () => {
+        const p = c.dataset.param;
+        chartParams.has(p) ? chartParams.delete(p) : chartParams.add(p);
+        renderParamBar();
+        updateChart();
+      });
+    });
+  }
+
+  function updateChart() {
+    const canvas  = g('trendChart');
+    const sysR    = readings.filter(r => r.system === activeSys);
+    const active  = [...chartParams];
+    if (chartInst) { chartInst.destroy(); chartInst = null; }
+    if (!active.length || !sysR.length) return;
+
+    const datasets = active.map((param, i) => ({
+      label: param,
+      data: sysR.filter(r => r.values[param] !== undefined).map(r => ({ x: r.date.slice(0,10), y: parseFloat(r.values[param]) })),
+      borderColor: CHART_COLORS[i % CHART_COLORS.length],
+      backgroundColor: CHART_COLORS[i % CHART_COLORS.length] + '22',
+      borderWidth: 2, pointRadius: 4, pointHoverRadius: 6, tension: 0.3, fill: false
+    }));
+
+    chartInst = new Chart(canvas, {
+      type: 'line',
+      data: { datasets },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        scales: {
+          x: { type: 'category', ticks: { color: '#64748b', maxTicksLimit: 8 }, grid: { color: 'rgba(100,140,200,0.1)' } },
+          y: { ticks: { color: '#64748b' }, grid: { color: 'rgba(100,140,200,0.1)' } }
+        },
+        plugins: {
+          legend: { labels: { color: '#94a3b8', font: { size: 11 } } },
+          tooltip: { backgroundColor: '#111926', borderColor: 'rgba(100,140,200,0.28)', borderWidth: 1, titleColor: '#e2e8f0', bodyColor: '#94a3b8' }
+        }
+      }
+    });
+  }
+
+  /* ─────────────────── BM HISTORY ──────────────────────── */
+  function renderBmHistory() {
+    const sysR = readings.map((r,i)=>({...r,_i:i})).filter(r=>r.system===activeSys).reverse();
+    const c = g('bmHistory');
+    if (!sysR.length) { c.innerHTML = '<div class="empty">No readings logged yet for this system.</div>'; return; }
+    c.innerHTML = sysR.map(r => {
+      const vals = Object.entries(r.values).map(([k,v])=>`${k}: ${v}`).join(' · ');
+      return `<div class="history-row">
+        <span class="history-row__date">${r.date.slice(0,10)}</span>
+        <span class="history-row__vals">${vals}</span>
+        <button class="btn btn--icon history-row__del" aria-label="Delete reading from ${r.date.slice(0,10)}" data-idx="${r._i}">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
+      </div>`;
+    }).join('');
+    c.querySelectorAll('[data-idx]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        readings.splice(parseInt(btn.dataset.idx), 1);
+        saveReadings();
+        renderGrid();
+        renderSysContent();
+        renderBmHistory();
+        updateChart();
+      });
+    });
+  }
+
+  /* ─────────────────── CSV ──────────────────────────────── */
+  function dlBlob(content, name, mime) {
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(new Blob([content], {type:mime}));
+    a.download = name; a.click();
+    setTimeout(()=>URL.revokeObjectURL(a.href), 1000);
+  }
+
+  function exportBmCSV() {
+    const sysR = readings.filter(r => r.system === activeSys);
+    if (!sysR.length) { alert('No readings to export for this system.'); return; }
+    const fields = BM_FIELDS[activeSys] || [];
+    const header = ['Date',...fields].join(',');
+    const rows   = sysR.map(r => [r.date.slice(0,10),...fields.map(f=>r.values[f]||'')].join(','));
+    dlBlob([header,...rows].join('\n'), `bcbs_${activeSys}.csv`, 'text/csv');
+  }
+
+  function importBmCSV(file) {
+    const reader = new FileReader();
+    reader.onload = e => {
+      const lines = e.target.result.trim().split('\n');
+      const headers = lines[0].split(',');
+      const dIdx = headers.indexOf('Date');
+      if (dIdx < 0) { alert('CSV must have a Date column.'); return; }
+      let n = 0;
+      for (let i = 1; i < lines.length; i++) {
+        const cols = lines[i].split(',');
+        const date = cols[dIdx]; if (!date) continue;
+        const vals = {};
+        headers.forEach((h,idx) => { if (idx !== dIdx && cols[idx]) vals[h] = cols[idx]; });
+        readings.push({ date: new Date(date).toISOString(), system: activeSys, values: vals });
+        n++;
+      }
+      saveReadings(); renderGrid(); renderBmHistory(); updateChart();
+      alert(`Imported ${n} reading${n !== 1 ? 's' : ''}.`);
+    };
+    reader.readAsText(file);
+  }
+
+  /* ─────────────────── JOURNAL ──────────────────────────── */
+  function logJournal() {
+    const date = g('jDate').value, symptom = g('jSymptom').value.trim();
+    const loc  = g('jLocation').value.trim(), sev = g('jSeverity').value;
+    if (!date)    { alert('Please select a date.'); return; }
+    if (!symptom) { alert('Please enter a symptom.'); return; }
+    journal.unshift({ date, symptom, location: loc, severity: sev });
+    saveJournal();
+    g('jSymptom').value = ''; g('jLocation').value = '';
+    renderJournal();
+  }
+
+  function renderJournal() {
+    const c = g('journalList');
+    if (!journal.length) { c.innerHTML = '<div class="empty">No entries yet. Log your first symptom above.</div>'; return; }
+    c.innerHTML = journal.map((e,idx) => {
+      const sc = e.severity === 'Severe' ? 'je__sev--severe' : e.severity === 'Moderate' ? 'je__sev--moderate' : 'je__sev--mild';
+      return `<div class="journal-entry">
+        <span class="je__date">${e.date}</span>
+        <span class="je__symptom">${escHTML(e.symptom)}</span>
+        <span class="je__location">${escHTML(e.location || '—')}</span>
+        <span class="je__sev ${sc}">${e.severity}</span>
+        <button class="btn btn--icon" aria-label="Delete ${escHTML(e.symptom)} entry from ${e.date}" data-jidx="${idx}">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M18 6 6 18M6 6l12 12"/></svg>
+        </button>
+      </div>`;
+    }).join('');
+    c.querySelectorAll('[data-jidx]').forEach(btn => {
+      btn.addEventListener('click', () => {
+        journal.splice(parseInt(btn.dataset.jidx), 1);
+        saveJournal(); renderJournal();
+      });
+    });
+  }
+
+  function clearJournal() {
+    if (!journal.length) return;
+    if (!confirm(`Permanently delete all ${journal.length} journal entries? This cannot be undone.`)) return;
+    journal = []; saveJournal(); renderJournal();
+  }
+
+  function exportJournal() {
+    if (!journal.length) { alert('No journal entries to export.'); return; }
+    const rows = [['Date','Symptom','Location','Severity'], ...journal.map(e=>[e.date, e.symptom, e.location, e.severity])];
+    dlBlob(rows.map(r=>r.map(c=>`"${String(c).replace(/"/g,'""')}"`).join(',')).join('\n'), 'bcbs_journal.csv', 'text/csv');
+  }
+
+  function escHTML(s) { return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+  /* ─────────────────── SCRIPTS ──────────────────────────── */
+  function renderScripts() {
+    const scripts = SCRIPTS[activeSys] || [];
+    g('scriptCards').innerHTML = scripts.length
+      ? scripts.map(s => `
+          <div class="script-card">
+            <div class="script-card__title">${escHTML(s.title)}</div>
+            <p class="script-card__text">${escHTML(s.text)}</p>
+          </div>`).join('')
+      : '<p class="body-sm" style="color:var(--text-3)">No scripts available for this system yet.</p>';
+  }
+
+  /* ─────────────────── SEARCH ───────────────────────────── */
+  const SEARCH_IDX = (() => {
+    const idx = [];
+    for (const sys of SYSTEMS) {
+      sys.stages.forEach(st => st.items.forEach(it => idx.push({text:it, tag:`${sys.name} · Stage`, sys:sys.id})));
+      sys.redflags.forEach(r => idx.push({text:r, tag:`${sys.name} · Red Flag`, sys:sys.id}));
+      sys.demand.forEach(d   => idx.push({text:d, tag:`${sys.name} · Test`, sys:sys.id}));
+      sys.counter.forEach(c  => idx.push({text:c, tag:`${sys.name} · Countermeasure`, sys:sys.id}));
+    }
+    return idx;
+  })();
+
+  function handleSearch(e) {
+    const q = e.target.value.trim().toLowerCase();
+    const dd = g('searchDropdown');
+    if (!q) { dd.classList.remove('open'); dd.innerHTML = ''; return; }
+    const hits = SEARCH_IDX.filter(item => item.text.toLowerCase().includes(q)).slice(0, 12);
+    if (!hits.length) { dd.classList.remove('open'); return; }
+    dd.innerHTML = hits.map((h,i) => `
+      <div class="search-result" role="option" tabindex="0" data-sys="${h.sys}">
+        <span>${escHTML(h.text)}</span>
+        <span class="search-result__tag">${escHTML(h.tag)}</span>
+      </div>`).join('');
+    dd.classList.add('open');
+    dd.querySelectorAll('[data-sys]').forEach(r => {
+      const activate = () => {
+        switchSys(r.dataset.sys);
+        g('searchInput').value = '';
+        dd.classList.remove('open');
+      };
+      r.addEventListener('click', activate);
+      r.addEventListener('keydown', e => { if (e.key==='Enter'||e.key===' '){e.preventDefault();activate();} });
+    });
+  }
+
+  /* ─────────────────── EXPLAINER ────────────────────────── */
+  function initExplainer() {
+    const btn  = g('explainerToggle');
+    const body = g('explainerBody');
+    btn.addEventListener('click', () => {
+      const open = body.style.display !== 'none' && body.style.display !== '';
+      if (open) { body.style.display = 'none'; btn.setAttribute('aria-expanded','false'); btn.classList.remove('open'); }
+      else      { body.style.display = '';      btn.setAttribute('aria-expanded','true');  btn.classList.add('open'); }
+    });
+    btn.classList.add('open'); // starts open
+  }
+
+  /* ─────────────────── TOUR ─────────────────────────────── */
+  const TOUR = [
+    {sel:'#systemGrid',    title:'System Status',        desc:'Six organ systems tracked in real time. Click any card to drill in — green is normal, yellow needs watching, red needs action.'},
+    {sel:'#searchInput',   title:'Global Search',         desc:'Search any symptom, biomarker, or red flag across all six systems at once.'},
+    {sel:'#detailPanel',   title:'System Detail',         desc:'Expand the Warning Stages, Red Flags, test demands, and countermeasures for whichever system is active.'},
+    {sel:'#bioSection',    title:'Biomarker Tracker',     desc:'Log blood test values over time. Select which parameters appear on the trend chart.'},
+    {sel:'#journalSection',title:'Symptom Journal',       desc:'Log symptoms with date and location. Patterns — like feeling worse at home — are diagnostically important.'},
+    {sel:'#scriptsSection',title:'Doctor Visit Scripts',  desc:'Exact phrases to hand your physician. They specify which test to order and why a general panel is not sufficient.'},
+    {sel:'#emergencySection',title:'Emergency Protocols', desc:'Toxicology protocols and hotlines. Print this section before any urgent medical visit.'},
+    {sel:'#helpFab',       title:'Restart Tour',          desc:'Tap ? anytime to replay this walkthrough.'}
+  ];
+  let tourStep = 0;
+  let tourActive = false;
+
+  function showTourStep() {
+    const step = TOUR[tourStep];
+    const target = document.querySelector(step.sel);
+    const backdrop  = g('tourBackdrop');
+    const highlight = g('tourHighlight');
+    const tooltip   = g('tourTooltip');
+
+    g('tourTitle').textContent = step.title;
+    g('tourDesc').textContent  = step.desc;
+    g('tourProg').textContent  = `${tourStep + 1} / ${TOUR.length}`;
+    g('tourPrev').style.display = tourStep > 0 ? '' : 'none';
+    g('tourNext').textContent   = tourStep === TOUR.length - 1 ? 'Finish ✓' : 'Next →';
+
+    backdrop.classList.add('active');
+    backdrop.setAttribute('aria-hidden','false');
+    tooltip.style.display  = 'block';
+    highlight.style.display = 'block';
+    tourActive = true;
+
+    if (target) {
+      target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      setTimeout(() => {
+        const rect = target.getBoundingClientRect();
+        const pad  = 5;
+        highlight.style.top    = (rect.top  - pad) + 'px';
+        highlight.style.left   = (rect.left - pad) + 'px';
+        highlight.style.width  = (rect.width  + pad * 2) + 'px';
+        highlight.style.height = (rect.height + pad * 2) + 'px';
+
+        const ttW = 300, margin = 14;
+        const vw = window.innerWidth, vh = window.innerHeight;
+        let top  = rect.top;
+        let left = rect.right + margin;
+        if (left + ttW > vw - 8) left = rect.left - ttW - margin;
+        if (left < 8)            left = Math.max(8, (vw - ttW) / 2);
+        const ttH = tooltip.offsetHeight || 180;
+        if (top + ttH > vh - 8) top = vh - ttH - 8;
+        if (top < 8)            top = 8;
+        tooltip.style.top  = top  + 'px';
+        tooltip.style.left = left + 'px';
+        tooltip.style.transform = 'none';
+      }, 340);
+    }
+  }
+
+  function endTour() {
+    g('tourBackdrop').classList.remove('active');
+    g('tourBackdrop').setAttribute('aria-hidden','true');
+    g('tourHighlight').style.display = 'none';
+    g('tourTooltip').style.display   = 'none';
+    tourActive = false;
+    localStorage.setItem('bcbs_tour_done','1');
+  }
+
+  function initTour() {
+    g('tourNext').addEventListener('click', () => {
+      if (tourStep < TOUR.length - 1) { tourStep++; showTourStep(); } else endTour();
+    });
+    g('tourPrev').addEventListener('click', () => {
+      if (tourStep > 0) { tourStep--; showTourStep(); }
+    });
+    g('tourSkip').addEventListener('click', endTour);
+    g('helpFab').addEventListener('click', () => { tourStep = 0; showTourStep(); });
+    document.addEventListener('keydown', e => { if (e.key === 'Escape' && tourActive) endTour(); });
+    window.addEventListener('resize', () => { if (tourActive) showTourStep(); });
+    if (!localStorage.getItem('bcbs_tour_done')) setTimeout(() => { tourStep = 0; showTourStep(); }, 700);
+  }
+
+  /* ─────────────────── INIT ─────────────────────────────── */
+  function init() {
+    g('jDate').value = new Date().toISOString().slice(0,10);
+
+    renderGrid();
+    renderTabs();
+    renderSysContent();
+    renderBmInputs();
+    renderParamBar();
+    renderBmHistory();
+    updateChart();
+    renderJournal();
+    renderScripts();
+    initExplainer();
+    initTour();
+
+    g('logReadingBtn').addEventListener('click', logReading);
+    g('clearChartBtn').addEventListener('click', () => { chartParams.clear(); renderParamBar(); updateChart(); });
+    g('exportBmBtn').addEventListener('click', exportBmCSV);
+    g('importBmBtn').addEventListener('click', () => g('importBmFile').click());
+    g('importBmFile').addEventListener('change', e => { if (e.target.files[0]) { importBmCSV(e.target.files[0]); e.target.value = ''; } });
+    g('logJournalBtn').addEventListener('click', logJournal);
+    g('clearJournalBtn').addEventListener('click', clearJournal);
+    g('exportJournalBtn').addEventListener('click', exportJournal);
+    g('searchInput').addEventListener('input', handleSearch);
+    g('printBtn').addEventListener('click', () => window.print());
+
+    // Close search on outside click
+    document.addEventListener('click', e => {
+      if (!g('searchDropdown').contains(e.target) && e.target !== g('searchInput')) {
+        g('searchDropdown').classList.remove('open');
+      }
+    });
+
+    // Journal keyboard submit
+    g('jSymptom').addEventListener('keydown',  e => { if (e.key === 'Enter') logJournal(); });
+    g('jLocation').addEventListener('keydown', e => { if (e.key === 'Enter') logJournal(); });
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init);
+  } else {
+    init();
+  }
+
+})();
+</script>
+</body>
+</html>
