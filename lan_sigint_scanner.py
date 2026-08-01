@@ -36,7 +36,7 @@ SETUP (Termux)
     # ALSO install the "Termux:API" app from F-Droid — the pkg above is only
     # the CLI shim; without the APK the commands hang and return nothing.
     # Then: Android Settings > Apps > Termux > Permissions > Location: Allow
-    python sigint.py
+    python lan_sigint_scanner.py
     termux-open http://localhost:8747
 
 The web UI runs a preflight that distinguishes "binary missing" from

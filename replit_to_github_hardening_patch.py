@@ -5,6 +5,7 @@ Addresses security, robustness, and usability gaps.
 """
 
 import os
+import re
 import sys
 import subprocess
 import tempfile
