@@ -371,6 +371,9 @@ class FastbootUSB:
     def oem(self, sub, timeout=20000):
         return self.command(f"oem {sub}", timeout)
 
+    def flashing(self, sub, timeout=20000):
+        return self.command(f"flashing {sub}", timeout)
+
     def get_unlock_data(self):
         r = self.oem("get_unlock_data")
         # Moto returns the blob across INFO lines like "(bootloader) <chunk>"
@@ -457,6 +460,8 @@ def worker_main(fd):
             out.update(ok=True, blob=blob, raw=raw)
         elif op == "oem":
             out["resp"] = fb.oem(action["arg"]); out["ok"] = True
+        elif op == "flashing":
+            out["resp"] = fb.flashing(action["arg"]); out["ok"] = True
         elif op == "erase":
             out["resp"] = fb.erase(action["partition"]); out["ok"] = True
         elif op == "flash":
@@ -583,6 +588,11 @@ class Fastboot:
         if self.system:
             return {"raw": (self._sys(["oem", arg]).stderr)}
         return self._invoke({"op": "oem", "arg": arg})["resp"]
+
+    def flashing(self, arg):
+        if self.system:
+            return {"raw": (self._sys(["flashing", arg]).stderr)}
+        return self._invoke({"op": "flashing", "arg": arg})["resp"]
 
     def erase(self, partition):
         if self.system:
@@ -767,7 +777,8 @@ def cmd_unlock(args):
     print(json.dumps(r, indent=2)[:1500])
     # newer devices use `flashing unlock` instead of `oem unlock`
     info("If that FAILED, trying `flashing unlock` ...")
-    r2 = fb.oem("unlock")  # harmless if unsupported; many take the key form above
+    r2 = fb.flashing("unlock")
+    print(json.dumps(r2, indent=2)[:1500])
     good("If the device rebooted and shows an 'unlocked' warning, you're done. "
          "Re-run `detect` to confirm.")
 
