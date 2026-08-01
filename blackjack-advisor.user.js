@@ -768,7 +768,8 @@
   function genericReadTable() {
     let cardEls = deepQueryAll(CARD_SELECTOR)
       .filter((n) => n.getBoundingClientRect().width > 0 && !isFaceDown(n));
-    if (!cardEls.length) cardEls = fallbackTextScan();
+    let usedFallback = false;
+    if (!cardEls.length) { cardEls = fallbackTextScan(); usedFallback = true; }
     const dealerEls = cardEls.filter((n) => /dealer/i.test(classStr(n) + classStr(n.closest('[class*="dealer"]') || document.createElement('div'))));
     const playerEls = cardEls.filter((n) => !dealerEls.includes(n));
 
@@ -776,13 +777,18 @@
       .filter((n) => n.getBoundingClientRect().width > 0 && !/dealer/i.test(classStr(n)));
     let hands = null, activeHandIdx = 0;
     if (handContainers.length > 1) {
-      hands = handContainers.map((c) => playerEls.filter((el) => c.contains(el)).map(textRank).filter(Boolean))
-        .filter((ranks) => ranks.length > 0);
-      if (hands.length > 1) {
-        const activeIdx = handContainers.findIndex((n) => /active|current|selected|focused?/i.test(classStr(n)));
-        activeHandIdx = activeIdx !== -1 ? activeIdx : hands.length - 1;
-      } else {
-        hands = null;
+      // Keep each container paired with its ranks while filtering out empty
+      // hands, so the "active" index (found by re-scanning class names) is
+      // resolved against the same filtered list it will be used to index —
+      // filtering handContainers and hands separately would drift the index
+      // whenever an earlier hand slot happened to be empty.
+      const paired = handContainers
+        .map((c) => ({ container: c, ranks: playerEls.filter((el) => c.contains(el)).map(textRank).filter(Boolean) }))
+        .filter((p) => p.ranks.length > 0);
+      if (paired.length > 1) {
+        const activeIdx = paired.findIndex((p) => /active|current|selected|focused?/i.test(classStr(p.container)));
+        activeHandIdx = activeIdx !== -1 ? activeIdx : paired.length - 1;
+        hands = paired.map((p) => p.ranks);
       }
     }
 
@@ -793,6 +799,7 @@
       split: !!hands,
       handCount: hands ? hands.length : 1,
       activeHandIdx,
+      ambiguousFallback: usedFallback && cardEls.length > 0 && dealerEls.length === 0,
     };
   }
 
@@ -815,6 +822,11 @@
       if (countedRegions.get(key) === c.rank) continue;
       logCard(c.rank);
       countedRegions.set(key, c.rank);
+      // Canvas classification only ever identifies rank (see classifyRegion) —
+      // suit isn't part of the calibrated template — so these entries always
+      // carry an unknown suit. Still logged, so the provably-fair hand
+      // history isn't silently empty for canvas-only tables.
+      dealHistory.push({ code: c.rank + '?', rank: c.rank, suit: null, t: Date.now() });
     }
   }
 
@@ -1129,7 +1141,14 @@
 
   let lastA11ySignature = null;
   function notifyA11yPlugins(state) {
-    const signature = JSON.stringify([state.move, state.why, state.insurance, state.bet, state.badge, state.status]);
+    // Includes the hand itself, not just the recommendation text — two
+    // consecutive hits both saying "HIT, basic strategy" must still both
+    // reach an accessibility consumer, since the card that changed is the
+    // whole reason a second announcement is needed.
+    const signature = JSON.stringify([
+      state.move, state.why, state.insurance, state.bet, state.badge, state.status,
+      state.playerHand, state.dealerUp, state.handCount,
+    ]);
     if (signature === lastA11ySignature) return;
     lastA11ySignature = signature;
     for (const p of pluginRegistry.a11yOutputs) {
@@ -1141,7 +1160,7 @@
   // ---- main loop (advisory only — never clicks or fills anything) -----------
   function tick() {
     checkReshuffle();
-    const { dealer, player, dealerEls, playerEls, split, handCount, canvasClassified } = readTable();
+    const { dealer, player, dealerEls, playerEls, split, handCount, canvasClassified, ambiguousFallback } = readTable();
     if (canvasClassified) {
       countNewRegions(canvasClassified.dealer);
       countNewRegions(canvasClassified.player);
@@ -1159,10 +1178,13 @@
 
     if (!dealer.length || player.length < 2) {
       emptyCardTicks++;
-      if (emptyCardTicks > 6 && hasLargeCanvas() && !manualBox.hasAttribute('open')) {
+      const shouldOpenManual = ambiguousFallback || (emptyCardTicks > 6 && hasLargeCanvas());
+      if (shouldOpenManual && !manualBox.hasAttribute('open')) {
         manualBox.setAttribute('open', 'open');
         if (!everSeenHand) { everSeenHand = true; panel.style.display = 'block'; }
-        status('no readable DOM cards + canvas table found — manual entry opened below');
+        status(ambiguousFallback
+          ? 'found card-like text on the page but couldn\'t tell dealer from player apart — try manual entry, or write a site-adapter plugin'
+          : 'no readable DOM cards + canvas table found — manual entry opened below');
       }
       if (everSeenHand) {
         readoutEl.textContent = 'watching...';
