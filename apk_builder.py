@@ -860,10 +860,11 @@ def gen_gradle_properties(aapt2_path: str | None = None) -> str:
 # ── gradle/wrapper/gradle-wrapper.properties ──────────────────────
 
 def gen_wrapper_properties() -> str:
+    escaped_dist_url = GRADLE_DIST_URL.replace(":", "\\:")
     return f"""\
 distributionBase=GRADLE_USER_HOME
 distributionPath=wrapper/dists
-distributionUrl={GRADLE_DIST_URL.replace(":", "\\:")}
+distributionUrl={escaped_dist_url}
 networkTimeout=10000
 validateDistributionUrl=true
 zipStoreBase=GRADLE_USER_HOME
