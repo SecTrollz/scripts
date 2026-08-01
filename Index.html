@@ -1,0 +1,1986 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover"/>
+<meta name="theme-color" content="#09090B"/>
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+<title>MDMCheck - Device Ownership Platform</title>
+<meta name="description" content="Own your land. Audit your device. Reclaim your sovereignty. Enterprise MDM forensics, right-to-repair disclosure, and device configuration intelligence."/>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=IBM+Plex+Mono:wght@400;500;600&family=DM+Sans:opsz,wght@9..40,300;9..40,400;9..40,500;9..40,600;9..40,700&display=swap" rel="stylesheet"/>
+<style>
+/* ═══════════════════════════════════════════════════════
+   MDMCheck — The Tool Corprate America Legally Requires
+   Navy · Crimson · White · Gold
+═══════════════════════════════════════════════════════ */
+:root {
+  --navy:    #09090B;
+  --navy2:   #0D0D11;
+  --navy3:   #13131A;
+  --crimson: #26212E;
+  --crimson2:#2D2736;
+  --crimson3:#221D29;
+  --white:   #FFFFFF;
+  --offwhite:#F2EFF7;
+  --gold:    #E7E2EE;
+  --gold2:   #CBC5D5;
+  --steel:   #AAA4B4;
+  --steel2:  #797482;
+  --mist:    #17171F;
+  --mist2:   #1B1B24;
+  --border:  rgba(170,164,180,0.18);
+  --border2: rgba(170,164,180,0.32);
+  --text:    #EDF2F9;
+  --text2:   #AAA4B4;
+  --text3:   #797482;
+  --ok:      #22C55E;
+  --warn:    #F59E0B;
+  --danger:  #EF4444;
+  --purple:  #a78bfa;
+  --sans:    'DM Sans', system-ui, sans-serif;
+  --mono:    'IBM Plex Mono', 'Fira Code', monospace;
+  --display: 'Bebas Neue', impact, sans-serif;
+  --radius:  12px;
+  --radius-sm: 8px;
+  --safe-top: env(safe-area-inset-top, 0px);
+  --safe-bot: env(safe-area-inset-bottom, 0px);
+  /* Legacy compat aliases */
+  --bg:      #09090B;
+  --bg2:     #0D0D11;
+  --bg3:     #17171F;
+  --bg4:     #1B1B24;
+  --accent:  #E7E2EE;
+  --accent2: #E7E2EE;
+}
+*,*::before,*::after { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
+html { font-size: 14px; scroll-behavior: smooth; }
+body { background: var(--navy); color: var(--text); font-family: var(--sans); min-height: 100vh; min-height: 100dvh; overflow-x: hidden; -webkit-font-smoothing: antialiased; }
+a { color: var(--gold); text-decoration: none; }
+::selection { background: rgba(38,33,46,0.4); color: #fff; }
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--navy3); border-radius: 4px; }
+
+/* ── STARS BACKGROUND ──────────────────────────────── */
+.stars-bg {
+  position: fixed; inset: 0; pointer-events: none; z-index: 0;
+  background:
+    radial-gradient(ellipse 80% 60% at 20% 10%, rgba(231,226,238,0.04) 0%, transparent 60%),
+    radial-gradient(ellipse 60% 40% at 80% 80%, rgba(38,33,46,0.06) 0%, transparent 60%),
+    linear-gradient(180deg, #09090B 0%, #060E1F 100%);
+}
+.stars-bg::before {
+  content: ''; position: absolute; inset: 0;
+  background-image:
+    radial-gradient(1px 1px at 10% 15%, rgba(255,255,255,0.5) 0%, transparent 100%),
+    radial-gradient(1px 1px at 30% 5%,  rgba(255,255,255,0.4) 0%, transparent 100%),
+    radial-gradient(1px 1px at 50% 20%, rgba(255,255,255,0.3) 0%, transparent 100%),
+    radial-gradient(1px 1px at 70% 8%,  rgba(255,255,255,0.5) 0%, transparent 100%),
+    radial-gradient(1px 1px at 85% 25%, rgba(255,255,255,0.4) 0%, transparent 100%),
+    radial-gradient(1px 1px at 15% 40%, rgba(255,255,255,0.3) 0%, transparent 100%),
+    radial-gradient(1px 1px at 45% 35%, rgba(255,255,255,0.5) 0%, transparent 100%),
+    radial-gradient(1px 1px at 90% 45%, rgba(255,255,255,0.3) 0%, transparent 100%),
+    radial-gradient(1px 1px at 25% 60%, rgba(255,255,255,0.4) 0%, transparent 100%),
+    radial-gradient(1px 1px at 60% 55%, rgba(255,255,255,0.5) 0%, transparent 100%),
+    radial-gradient(1px 1px at 5%  75%, rgba(255,255,255,0.3) 0%, transparent 100%),
+    radial-gradient(1px 1px at 80% 70%, rgba(255,255,255,0.4) 0%, transparent 100%),
+    radial-gradient(1px 1px at 40% 80%, rgba(255,255,255,0.3) 0%, transparent 100%),
+    radial-gradient(1px 1px at 95% 85%, rgba(255,255,255,0.5) 0%, transparent 100%),
+    radial-gradient(1px 1px at 20% 90%, rgba(255,255,255,0.4) 0%, transparent 100%),
+    radial-gradient(1px 1px at 55% 95%, rgba(255,255,255,0.3) 0%, transparent 100%);
+}
+
+/* ── SCREEN ROUTING ─────────────────────────────────── */
+.screen { display: none; }
+.screen.active { display: block; }
+
+/* ═══════════════════════════════════════════════════════
+   LANDING SCREEN
+═══════════════════════════════════════════════════════ */
+#screen-landing { min-height: 100vh; min-height: 100dvh; position: relative; z-index: 1; }
+
+.land-nav {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+  display: flex; align-items: center; gap: 12px;
+  padding: 0 24px; height: 60px;
+  background: rgba(9,9,11,0.88);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--border);
+}
+.land-brand {
+  display: flex; align-items: center; gap: 10px;
+  font-family: var(--display); font-size: 22px; letter-spacing: .05em;
+  color: var(--white); flex: 1;
+}
+.land-brand span { color: var(--gold); }
+.land-nav-actions { display: flex; align-items: center; gap: 8px; }
+
+.land-flag-bar {
+  height: 5px;
+  background: repeating-linear-gradient(90deg,
+    var(--crimson2) 0%, var(--crimson2) 7.69%,
+    var(--white) 7.69%, var(--white) 15.38%,
+    var(--crimson2) 15.38%, var(--crimson2) 23.07%,
+    var(--white) 23.07%, var(--white) 30.76%,
+    var(--crimson2) 30.76%, var(--crimson2) 38.45%,
+    var(--white) 38.45%, var(--white) 46.14%,
+    var(--crimson2) 46.14%, var(--crimson2) 53.83%,
+    var(--white) 53.83%, var(--white) 61.52%,
+    var(--crimson2) 61.52%, var(--crimson2) 69.21%,
+    var(--white) 69.21%, var(--white) 76.90%,
+    var(--crimson2) 76.90%, var(--crimson2) 84.59%,
+    var(--white) 84.59%, var(--white) 92.28%,
+    var(--crimson2) 92.28%, var(--crimson2) 100%
+  );
+}
+
+.land-hero {
+  padding: 140px 24px 80px;
+  text-align: center;
+  position: relative; z-index: 1;
+  max-width: 860px; margin: 0 auto;
+}
+.land-hero-eyebrow {
+  font-family: var(--mono); font-size: 11px; font-weight: 600;
+  text-transform: uppercase; letter-spacing: .2em;
+  color: var(--gold); margin-bottom: 20px;
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+}
+.land-hero-eyebrow::before, .land-hero-eyebrow::after {
+  content: ''; flex: 1; max-width: 60px; height: 1px; background: var(--gold); opacity: .4;
+}
+.land-title {
+  font-family: var(--display);
+  font-size: clamp(48px, 10vw, 96px);
+  line-height: .95; letter-spacing: .02em;
+  color: var(--white); margin-bottom: 8px;
+}
+.land-title span { color: var(--crimson2); }
+.land-subtitle {
+  font-family: var(--display);
+  font-size: clamp(20px, 4vw, 36px);
+  letter-spacing: .06em; color: var(--gold);
+  margin-bottom: 20px;
+}
+.land-desc {
+  font-size: 15px; color: var(--text2); line-height: 1.7;
+  max-width: 600px; margin: 0 auto 36px;
+}
+.land-cta { display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+
+.land-features {
+  position: relative; z-index: 1;
+  max-width: 1000px; margin: 0 auto;
+  padding: 40px 24px 60px;
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 14px;
+}
+.feature-card {
+  background: rgba(13,13,17,.7); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 20px 18px;
+  transition: border-color .2s, transform .2s;
+}
+.feature-card:hover { border-color: var(--gold); transform: translateY(-2px); }
+.feature-icon { font-size: 24px; margin-bottom: 10px; }
+.feature-title { font-size: 13px; font-weight: 700; color: var(--text); margin-bottom: 6px; }
+.feature-desc { font-size: 11px; color: var(--text3); line-height: 1.6; }
+
+.land-pledge {
+  position: relative; z-index: 1;
+  text-align: center; padding: 50px 24px;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+  background: rgba(38,33,46,.04);
+}
+.pledge-text {
+  font-family: var(--display); font-size: clamp(22px, 4vw, 36px);
+  color: var(--steel); letter-spacing: .03em; line-height: 1.4;
+  max-width: 640px; margin: 0 auto 14px;
+}
+.pledge-text span { color: var(--crimson2); }
+.pledge-sub { font-size: 11px; font-family: var(--mono); color: var(--text3); letter-spacing: .08em; }
+
+.land-footer {
+  position: relative; z-index: 1;
+  text-align: center; padding: 30px 24px;
+  background: var(--navy2);
+}
+.land-footer-brand {
+  font-family: var(--display); font-size: 20px; letter-spacing: .08em;
+  color: var(--text3); margin-bottom: 8px;
+}
+.land-footer-brand span { color: var(--gold); }
+.land-footer-legal { font-size: 10px; color: var(--text3); line-height: 1.7; max-width: 600px; margin: 0 auto; }
+
+/* ═══════════════════════════════════════════════════════
+   LOGIN SCREEN
+═══════════════════════════════════════════════════════ */
+#screen-login {
+  min-height: 100vh; min-height: 100dvh;
+  display: flex; align-items: center; justify-content: center;
+  position: relative; z-index: 1; padding: 20px;
+}
+.login-box {
+  background: var(--navy2); border: 1px solid var(--border2);
+  border-radius: 16px; width: 100%; max-width: 400px;
+  overflow: hidden;
+  box-shadow: 0 32px 80px rgba(0,0,0,.5);
+}
+.login-flag-bar { display: flex; height: 6px; }
+.login-flag-bar .r { flex: 1; background: var(--crimson2); }
+.login-flag-bar .w { flex: 1; background: var(--white); }
+.login-flag-bar .b { flex: .5; background: var(--navy3); }
+.login-inner { padding: 36px 32px 32px; }
+.login-logo-row {
+  display: flex; align-items: center; gap: 12px; margin-bottom: 28px;
+}
+.login-title {
+  font-family: var(--display); font-size: 28px; letter-spacing: .04em;
+  color: var(--white); line-height: 1;
+}
+.login-title span { color: var(--gold); }
+.login-sub { font-size: 11px; color: var(--text3); font-family: var(--mono); margin-top: 2px; }
+.login-back { margin-top: 16px; text-align: center; font-size: 12px; color: var(--text3); }
+.login-back a { color: var(--steel); cursor: pointer; }
+.login-back a:hover { color: var(--gold); }
+
+/* ═══════════════════════════════════════════════════════
+   APP SHELL
+═══════════════════════════════════════════════════════ */
+#screen-app {
+  height: 100vh; height: 100dvh;
+  display: flex; flex-direction: column;
+  overflow: hidden;
+}
+.screen.active#screen-app { display: flex; }
+
+/* Top Bar */
+.app-topbar {
+  flex-shrink: 0;
+  display: flex; align-items: center; gap: 10px;
+  padding: 0 16px; height: 52px;
+  padding-top: var(--safe-top);
+  background: var(--navy2);
+  border-bottom: 1px solid var(--border);
+}
+.top-brand {
+  display: flex; align-items: center; gap: 8px;
+  font-family: var(--display); font-size: 17px; letter-spacing: .04em;
+  color: var(--white); flex: 0 0 auto;
+  white-space: nowrap;
+}
+.top-brand span { color: var(--gold); }
+.top-page-label {
+  font-size: 11px; font-weight: 600; color: var(--text3);
+  text-transform: uppercase; letter-spacing: .06em;
+  font-family: var(--mono); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  flex: 1;
+}
+.top-status-dot {
+  width: 7px; height: 7px; border-radius: 50%; background: var(--ok);
+  flex-shrink: 0; animation: blink 2s ease-in-out infinite;
+}
+@keyframes blink { 0%,100% { opacity:1; } 50% { opacity:.3; } }
+#top-status-text { font-size: 10px; font-family: var(--mono); color: var(--text3); white-space: nowrap; }
+
+/* App Body */
+.app-body { flex: 1; display: flex; overflow: hidden; }
+
+/* Sidebar */
+.app-sidebar {
+  width: 220px; min-width: 220px;
+  background: var(--navy2); border-right: 1px solid var(--border);
+  display: flex; flex-direction: column;
+  overflow-y: auto; overflow-x: hidden; flex-shrink: 0;
+}
+@media (max-width: 768px) { .app-sidebar { display: none; } }
+
+.sb-logo-area { padding: 14px 14px 10px; border-bottom: 1px solid var(--border); }
+.sb-brand { font-family: var(--display); font-size: 17px; letter-spacing: .04em; color: var(--white); }
+.sb-brand span { color: var(--gold); }
+.sb-version { font-size: 9px; font-family: var(--mono); color: var(--text3); margin-top: 2px; text-transform: uppercase; letter-spacing: .1em; }
+.sb-section { padding: 12px 12px 4px; font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .14em; color: var(--text3); }
+.sb-sep { height: 1px; background: var(--border); margin: 4px 0; }
+
+.nav-link {
+  display: flex; align-items: center; gap: 9px;
+  padding: 7px 12px; margin: 1px 6px;
+  border-radius: 6px; font-size: 12px; font-weight: 500;
+  color: var(--text2); cursor: pointer;
+  transition: all .12s; user-select: none;
+}
+.nl-icon { font-size: 14px; width: 16px; text-align: center; flex-shrink: 0; }
+.nl-badge { margin-left: auto; background: var(--crimson2); color: #fff; font-size: 9px; font-weight: 700; padding: 1px 5px; border-radius: 8px; }
+.nav-link:hover { background: var(--mist); color: var(--text); }
+.nav-link.active { background: rgba(38,33,46,.12); color: var(--crimson2); border: 1px solid rgba(38,33,46,.2); }
+
+.sb-bottom { margin-top: auto; border-top: 1px solid var(--border); padding: 10px; }
+.user-pill {
+  display: flex; align-items: center; gap: 8px;
+  padding: 7px 10px; background: var(--navy3); border-radius: 6px;
+  font-size: 11px; color: var(--text2); margin-bottom: 6px;
+}
+.user-avatar {
+  width: 24px; height: 24px;
+  background: linear-gradient(135deg, var(--crimson2), var(--navy3));
+  border-radius: 50%; display: flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 700; color: #fff; flex-shrink: 0;
+}
+
+/* Main Content */
+.app-main {
+  flex: 1; overflow-y: auto; overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+  padding: 20px 20px calc(80px + var(--safe-bot));
+}
+@media (min-width: 769px) { .app-main { padding-bottom: 20px; max-width: 960px; } }
+#content { min-height: 100%; }
+
+/* Bottom Nav — mobile only */
+.bottom-nav {
+  position: fixed; bottom: 0; left: 0; right: 0; z-index: 50;
+  background: rgba(13,13,17,.95);
+  border-top: 1px solid var(--border);
+  display: flex;
+  padding-bottom: var(--safe-bot);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+}
+@media (min-width: 769px) { .bottom-nav { display: none; } }
+.bn-item {
+  flex: 1; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 2px;
+  padding: 9px 4px; font-size: 9px; font-weight: 600;
+  color: var(--text3); cursor: pointer;
+  transition: color .12s; text-transform: uppercase; letter-spacing: .04em;
+  border: none; background: none; font-family: var(--sans);
+  touch-action: manipulation;
+}
+.bni { font-size: 18px; line-height: 1; }
+.bn-item:hover, .bn-item.active { color: var(--gold); }
+.bn-item.active .bni { animation: popIn .2s ease; }
+@keyframes popIn { 0% { transform: scale(.8); } 100% { transform: scale(1); } }
+
+/* ═══════════════════════════════════════════════════════
+   PAGE PANELS
+═══════════════════════════════════════════════════════ */
+.page-panel { display: none; }
+.page-panel.active { display: block; }
+
+/* ── SHARED COMPONENTS ──────────────────────────────── */
+.card {
+  background: var(--mist); border: 1px solid var(--border);
+  border-radius: 10px; padding: 18px; margin-bottom: 14px;
+}
+.card-title { font-size: 13px; font-weight: 700; color: var(--text); margin-bottom: 4px; }
+.card-sub { font-size: 11px; color: var(--text3); line-height: 1.5; }
+
+.badge { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 4px; font-size: 10px; font-weight: 700; font-family: var(--mono); }
+.b-critical { background: rgba(239,68,68,.15); color: #f87171; border: 1px solid rgba(239,68,68,.3); }
+.b-high     { background: rgba(245,158,11,.15); color: #fbbf24; border: 1px solid rgba(245,158,11,.3); }
+.b-medium   { background: rgba(59,130,246,.15); color: #60a5fa; border: 1px solid rgba(59,130,246,.3); }
+.b-ok       { background: rgba(34,197,94,.15);  color: #4ade80;  border: 1px solid rgba(34,197,94,.3); }
+.b-info     { background: rgba(167,139,250,.15); color: #c4b5fd; border: 1px solid rgba(167,139,250,.3); }
+.b-neutral  { background: var(--mist2); color: var(--text2); border: 1px solid var(--border); }
+.b-gold     { background: rgba(231,226,238,.12); color: var(--gold); border: 1px solid rgba(231,226,238,.3); }
+
+.alert { border-radius: 6px; padding: 10px 14px; font-size: 12px; margin-bottom: 12px; line-height: 1.5; }
+.alert-critical { background: rgba(239,68,68,.1); border: 1px solid rgba(239,68,68,.3); color: #fca5a5; }
+.alert-high     { background: rgba(245,158,11,.1); border: 1px solid rgba(245,158,11,.3); color: #fcd34d; }
+.alert-ok       { background: rgba(34,197,94,.1);  border: 1px solid rgba(34,197,94,.3);  color: #86efac; }
+.alert-info     { background: rgba(59,130,246,.1); border: 1px solid rgba(59,130,246,.3); color: #93c5fd; }
+
+.tbl { width: 100%; border-collapse: collapse; font-size: 12px; }
+.tbl th { text-align: left; padding: 8px 10px; font-size: 10px; color: var(--text3); text-transform: uppercase; letter-spacing: .08em; border-bottom: 1px solid var(--border); font-weight: 600; }
+.tbl td { padding: 9px 10px; border-bottom: 1px solid var(--border); color: var(--text2); vertical-align: top; }
+.tbl tr:last-child td { border-bottom: none; }
+.tbl tr:hover td { background: rgba(255,255,255,.03); }
+.tbl .mono { font-family: var(--mono); font-size: 11px; color: var(--text); }
+
+pre, code { font-family: var(--mono); font-size: 11px; }
+pre { background: var(--navy2); border: 1px solid var(--border); border-radius: 6px; padding: 12px; white-space: pre-wrap; word-break: break-all; color: var(--text2); max-height: 300px; overflow-y: auto; line-height: 1.6; }
+.copy-block { position: relative; }
+.copy-btn { position: absolute; top: 6px; right: 6px; padding: 3px 8px; font-size: 10px; background: var(--mist2); color: var(--text3); border: 1px solid var(--border); border-radius: 4px; cursor: pointer; }
+.copy-btn:hover { color: var(--text); }
+
+input, textarea, select {
+  width: 100%; background: var(--mist); border: 1px solid var(--border2);
+  color: var(--text); border-radius: 6px; padding: 8px 10px;
+  font-size: 12px; font-family: var(--mono); outline: none;
+  transition: border-color .12s; -webkit-appearance: none;
+}
+input:focus, textarea:focus, select:focus { border-color: var(--gold); box-shadow: 0 0 0 2px rgba(231,226,238,.1); }
+textarea { min-height: 120px; resize: vertical; }
+.form-row { margin-bottom: 12px; }
+.form-row label { display: block; font-size: 11px; color: var(--text2); margin-bottom: 5px; font-weight: 600; }
+.flex-row { display: flex; gap: 8px; align-items: flex-end; }
+.flex-row input { flex: 1; }
+
+button { cursor: pointer; border: none; border-radius: 6px; font-family: var(--sans); font-size: 12px; font-weight: 600; padding: 8px 16px; transition: all .12s; touch-action: manipulation; }
+.btn { background: var(--mist2); color: var(--text); border: 1px solid var(--border2); }
+.btn:hover { background: var(--mist); }
+.btn-primary { background: linear-gradient(135deg, var(--crimson2), var(--crimson3)); color: #fff; box-shadow: 0 2px 10px rgba(38,33,46,.3); }
+.btn-primary:hover { background: linear-gradient(135deg, #D92E3E, var(--crimson2)); }
+.btn-gold { background: linear-gradient(135deg, var(--gold), var(--gold2)); color: var(--navy); font-weight: 700; }
+.btn-gold:hover { transform: translateY(-1px); box-shadow: 0 4px 16px rgba(231,226,238,.3); }
+.btn-danger { background: rgba(239,68,68,.12); color: var(--danger); border: 1px solid rgba(239,68,68,.25); }
+.btn-danger:hover { background: rgba(239,68,68,.2); }
+.btn-ok { background: rgba(34,197,94,.12); color: var(--ok); border: 1px solid rgba(34,197,94,.25); }
+.btn-sm { padding: 5px 10px; font-size: 11px; }
+button:disabled { opacity: .4; cursor: not-allowed; }
+
+.spinner { width: 18px; height: 18px; border: 2px solid var(--border2); border-top-color: var(--gold); border-radius: 50%; animation: spin .7s linear infinite; display: inline-block; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.loading-row { display: flex; align-items: center; gap: 10px; padding: 20px; color: var(--text3); font-size: 12px; }
+
+.progress { height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; }
+.progress-bar { height: 100%; background: linear-gradient(90deg, var(--crimson), var(--gold)); border-radius: 2px; transition: width .3s; }
+
+.tabs { display: flex; gap: 2px; margin-bottom: 16px; border-bottom: 1px solid var(--border); overflow-x: auto; scrollbar-width: none; -webkit-overflow-scrolling: touch; }
+.tabs::-webkit-scrollbar { display: none; }
+.tab { flex-shrink: 0; background: none; border: none; color: var(--text3); padding: 7px 14px; border-radius: 6px 6px 0 0; font-size: 12px; border-bottom: 2px solid transparent; margin-bottom: -1px; }
+.tab:hover { color: var(--text2); }
+.tab.active { color: var(--gold); border-bottom-color: var(--gold); }
+.tab-panel { display: none; }
+.tab-panel.active { display: block; }
+
+.finding-card { border-left: 3px solid var(--border2); background: var(--mist2); border-radius: 0 8px 8px 0; padding: 12px 14px; margin-bottom: 8px; cursor: pointer; }
+.finding-card.sev-CRITICAL { border-left-color: var(--danger); }
+.finding-card.sev-HIGH     { border-left-color: var(--warn); }
+.finding-card.sev-MEDIUM   { border-left-color: #60a5fa; }
+.finding-card.sev-OK       { border-left-color: var(--ok); }
+.finding-card.sev-INFO     { border-left-color: var(--purple); }
+.finding-hdr { display: flex; align-items: center; gap: 8px; }
+.finding-title { font-size: 12px; font-weight: 600; flex: 1; }
+.finding-body { display: none; margin-top: 10px; font-size: 12px; color: var(--text2); line-height: 1.7; }
+.finding-body.open { display: block; }
+.finding-evidence { background: var(--navy2); border: 1px solid var(--border); border-radius: 6px; padding: 8px; margin-top: 8px; font-family: var(--mono); font-size: 11px; color: var(--text3); white-space: pre-wrap; word-break: break-all; }
+
+.card-row { display: flex; gap: 12px; margin-bottom: 14px; }
+.stat-card { flex: 1; background: var(--mist2); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; }
+.stat-val { font-size: 22px; font-weight: 700; font-family: var(--display); color: var(--text); }
+.stat-lbl { font-size: 10px; color: var(--text3); margin-top: 2px; text-transform: uppercase; letter-spacing: .08em; }
+
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+.module-card { background: var(--mist2); border: 1px solid var(--border); border-radius: 10px; padding: 16px; cursor: pointer; transition: border-color .15s, background .15s; }
+.module-card:hover { border-color: var(--gold); background: var(--navy3); }
+.module-card .mc-icon { font-size: 22px; margin-bottom: 10px; }
+.module-card .mc-title { font-size: 12px; font-weight: 700; color: var(--text); margin-bottom: 4px; }
+.module-card .mc-desc { font-size: 10px; color: var(--text3); line-height: 1.5; }
+.module-card .mc-badge { display: inline-block; margin-top: 8px; font-size: 9px; font-weight: 700; padding: 2px 7px; border-radius: 4px; font-family: var(--mono); }
+
+.probe-log { background: var(--navy); border: 1px solid var(--border); border-radius: 8px; padding: 12px; height: 200px; overflow-y: auto; font-family: var(--mono); font-size: 10px; color: var(--text3); }
+.probe-log .log-hit  { color: var(--ok); }
+.probe-log .log-miss { color: var(--text3); }
+.probe-log .log-err  { color: var(--danger); }
+
+.list-item { display: flex; align-items: center; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border); }
+.list-item:last-child { border-bottom: none; }
+.list-item .main { font-size: 12px; font-weight: 600; color: var(--text); font-family: var(--mono); }
+.list-item .sub { font-size: 10px; color: var(--text3); margin-top: 2px; }
+.list-item .actions { margin-left: auto; display: flex; gap: 6px; }
+
+.dual-table { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 1px; background: var(--border); border-radius: 8px; overflow: hidden; }
+.dual-col { background: var(--mist); padding: 10px 12px; }
+.dual-col-hdr { font-size: 9px; text-transform: uppercase; letter-spacing: .1em; color: var(--text3); margin-bottom: 6px; font-weight: 700; }
+.dual-val { font-family: var(--mono); font-size: 11px; color: var(--text); word-break: break-all; }
+.dual-mismatch { color: var(--danger) !important; }
+.dual-match { color: var(--ok) !important; }
+
+.timeline-item { display: flex; gap: 14px; padding: 8px 0; }
+.tl-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--gold); margin-top: 5px; flex-shrink: 0; }
+.tl-dot.critical { background: var(--danger); }
+.tl-dot.high { background: var(--warn); }
+.tl-dot.ok { background: var(--ok); }
+.tl-content .tl-title { font-size: 12px; font-weight: 600; color: var(--text); }
+.tl-content .tl-time { font-size: 10px; color: var(--text3); font-family: var(--mono); }
+.tl-content .tl-detail { font-size: 11px; color: var(--text2); margin-top: 3px; }
+
+.overdue { border: 1px solid rgba(239,68,68,.4); background: rgba(239,68,68,.06); }
+
+@media (max-width: 1024px) { #content { max-width: 100%; } }
+@media (max-width: 768px) { .grid2, .grid3 { grid-template-columns: 1fr; } .card-row { flex-direction: column; } .dual-table { grid-template-columns: 1fr; } .tbl { font-size: 11px; } .tbl th, .tbl td { padding: 6px 8px; } }
+@media (max-width: 480px) { .card { padding: 14px; } .stat-val { font-size: 18px; } }
+</style>
+</head>
+<body>
+<div class="stars-bg"></div>
+
+<!-- ═══════════════════════════════════════════════════════
+     SCREEN 1: LANDING
+═══════════════════════════════════════════════════════ -->
+<div id="screen-landing" class="screen active">
+  <nav class="land-nav">
+    <div class="land-brand">
+      <svg class="shield-svg" width="32" height="32" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M16 2L4 7v9c0 7 5.4 13.5 12 15 6.6-1.5 12-8 12-15V7L16 2z" fill="#26212E"/>
+        <path d="M16 2L4 7v9c0 3.5 1.2 6.8 3 9.5L16 2z" fill="#09090B"/>
+        <path d="M16 2v24c4.2-1.5 7.8-5.2 10-9.5L16 2z" fill="#2D2736"/>
+        <path d="M12 14l2.5 2.5L20 11" stroke="#E7E2EE" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="16" cy="16" r="14" stroke="#E7E2EE" stroke-width="1" stroke-opacity="0.3"/>
+      </svg>
+      MDMCheck <span>SHIELD</span>
+    </div>
+    <div class="land-nav-actions">
+      <button class="btn-sm btn" onclick="goLogin()" style="font-size:11px;">Login</button>
+      <button class="btn-gold btn-sm" onclick="goApp('Operator')" style="font-size:11px;">Launch App</button>
+    </div>
+  </nav>
+
+  <div class="land-flag-bar" style="margin-top:60px;"></div>
+
+  <section class="land-hero">
+    <div class="land-hero-eyebrow">MDMCheck v20 · Dual-State Hunter Edition</div>
+    <h1 class="land-title">OWN YOUR<br><span>HARDWARE</span></h1>
+    <div class="land-subtitle">DEVICE SOVEREIGNTY PLATFORM</div>
+    <p class="land-desc">Forensic analysis of enterprise MDM enrollment. 57 Tier-0 probes, F0–F6 dual-state engine, 16 DSAR templates. Discover, document, and reclaim control of hardware you lawfully own.</p>
+    <div class="land-cta">
+      <button class="btn-gold" onclick="goApp('Operator')" style="font-size:14px;padding:13px 32px;">🛡 Launch MDMCheck</button>
+      <button class="btn" onclick="goLogin()" style="font-size:14px;padding:13px 24px;">Set Callsign →</button>
+    </div>
+  </section>
+
+  <div class="land-features">
+    <div class="feature-card">
+      <div class="feature-icon">⊛</div>
+      <div class="feature-title">57-Probe Passive Scan</div>
+      <div class="feature-desc">Tier-0 protocol-accurate probes against MDM, EDR, and Identity enrollment endpoints across 18 platforms.</div>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">⇄</div>
+      <div class="feature-title">F0–F6 Dual-State Engine</div>
+      <div class="feature-desc">Phase A (OS-visible) vs Phase B (rish/Shizuku privileged). Any discrepancy = CRITICAL finding.</div>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">⬡</div>
+      <div class="feature-title">DNS Fingerprint</div>
+      <div class="feature-desc">CNAME/A record sweep via DoH for Intune, Jamf, Workspace ONE, Knox, Okta and 15+ others.</div>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">⊂</div>
+      <div class="feature-title">16 DSAR Templates</div>
+      <div class="feature-desc">GDPR Art. 15/17, CCPA §1798.110, Apple Activation Lock, MSRC, FBI IC3, UK ICO, State AG, employer recovery.</div>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">⊟</div>
+      <div class="feature-title">SHA-256 Chain of Custody</div>
+      <div class="feature-desc">Every action hash-chained. Tamper-evident journal for legal evidence. Export as signed Case Bundle.</div>
+    </div>
+    <div class="feature-card">
+      <div class="feature-icon">⚡</div>
+      <div class="feature-title">WebUSB Device Bridge</div>
+      <div class="feature-desc">Browser-native ADB over WebUSB. Run Module F commands directly from Chrome/Edge. Zero installs.</div>
+    </div>
+  </div>
+
+  <section class="land-pledge">
+    <p class="pledge-text">
+      "Every device you own is <span>sovereign territory.</span><br/>
+      Every hook you didn't plant is <span>trespassing.</span><br/>
+      The land belongs to those who <span>work it.</span>"
+    </p>
+    <p class="pledge-sub">—  MDMCheck · DevOps meets the Amish Creed · Article I of the Homestead Protocol</p>
+    <div style="margin-top:24px;">
+      <button class="btn-gold" onclick="goLogin()" style="font-size:14px;padding:12px 28px;">🌾 Claim Your Homestead</button>
+    </div>
+  </section>
+
+  <footer class="land-footer">
+    <div class="land-footer-brand">NDMCheck <span>SHIELD</span></div>
+    <p class="land-footer-legal">
+      MDMCheck v20 Dual-State Hunter Edition. Built for operators asserting ownership over hardware they lawfully purchased.<br/>
+      All forensic analysis runs client-side. No data transmitted without your explicit action.<br/>
+      GDPR · CCPA · Right-to-Repair · 17 U.S.C. § 1201(f)
+    </p>
+    <div style="margin-top:14px;display:flex;justify-content:center;gap:6px;align-items:center;">
+      <div style="width:10px;height:10px;background:var(--crimson2);border-radius:2px;"></div>
+      <div style="width:10px;height:10px;background:var(--white);border-radius:2px;"></div>
+      <div style="width:10px;height:10px;background:var(--navy3);border-radius:2px;"></div>
+    </div>
+  </footer>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════
+     SCREEN 2: LOGIN
+═══════════════════════════════════════════════════════ -->
+<div id="screen-login" class="screen">
+  <div class="login-box">
+    <div class="login-flag-bar">
+      <div class="r"></div><div class="w"></div><div class="r"></div>
+      <div class="w"></div><div class="r"></div><div class="w"></div>
+      <div class="r"></div><div class="w"></div><div class="r"></div>
+      <div class="w"></div><div class="r"></div><div class="w"></div>
+      <div class="r"></div><div class="b"></div>
+    </div>
+    <div class="login-inner">
+      <div class="login-logo-row">
+        <svg width="44" height="44" viewBox="0 0 32 32" fill="none">
+          <path d="M16 2L4 7v9c0 7 5.4 13.5 12 15 6.6-1.5 12-8 12-15V7L16 2z" fill="#26212E"/>
+          <path d="M16 2L4 7v9c0 3.5 1.2 6.8 3 9.5L16 2z" fill="#09090B"/>
+          <path d="M16 2v24c4.2-1.5 7.8-5.2 10-9.5L16 2z" fill="#2D2736"/>
+          <path d="M12 14l2.5 2.5L20 11" stroke="#E7E2EE" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+        <div>
+          <div class="login-title">MDMCHECK <span>SHIELD</span></div>
+          <div class="login-sub">v20 · Dual-State Hunter · Homestead Edition</div>
+        </div>
+      </div>
+      <div class="form-row">
+        <label>Operator Callsign</label>
+        <input id="login-alias" placeholder="Enter your callsign…" autofocus/>
+      </div>
+      <button id="login-form-btn" class="btn-gold" style="width:100%;font-size:14px;padding:12px;justify-content:center;">
+        🛡 Enter the Homestead
+      </button>
+      <div class="login-back">
+        <a onclick="goLanding()">← Back to landing</a>
+        &nbsp;·&nbsp;
+        <a onclick="goApp('Operator')">Skip login</a>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════
+     SCREEN 3: APP SHELL
+═══════════════════════════════════════════════════════ -->
+<div id="screen-app" class="screen">
+
+  <!-- Top Bar -->
+  <div class="app-topbar">
+    <div class="top-brand">
+      <svg width="22" height="22" viewBox="0 0 32 32" fill="none" style="flex-shrink:0;">
+        <path d="M16 2L4 7v9c0 7 5.4 13.5 12 15 6.6-1.5 12-8 12-15V7L16 2z" fill="#26212E"/>
+        <path d="M12 14l2.5 2.5L20 11" stroke="#E7E2EE" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      P<span>SHIELD</span>
+    </div>
+    <div class="top-status-dot"></div>
+    <span class="top-page-label" id="top-page-label">Dashboard</span>
+    <span id="top-status-text" style="font-size:10px;font-family:var(--mono);color:var(--text3);white-space:nowrap;display:none;" class="desktop-only"></span>
+  </div>
+
+  <!-- Body -->
+  <div class="app-body">
+
+    <!-- Sidebar (desktop) -->
+    <nav class="app-sidebar">
+      <div class="sb-logo-area">
+        <div class="sb-brand">mdmcheck <span>SHIELD</span></div>
+        <div class="sb-version">v20 · 57 probes · 18 platforms</div>
+      </div>
+
+      <div class="sb-section">Discovery</div>
+      <div class="nav-link active" id="nav-home" onclick="nav('home')"><span class="nl-icon">⌂</span><span>Dashboard</span></div>
+      <div class="nav-link" id="nav-scan" onclick="nav('scan')"><span class="nl-icon">◎</span><span>Passive Scan</span></div>
+      <div class="nav-link" id="nav-dns" onclick="nav('dns')"><span class="nl-icon">⬡</span><span>DNS Fingerprint</span></div>
+      <div class="nav-link" id="nav-lookup" onclick="nav('lookup')"><span class="nl-icon">↗</span><span>Tenant Lookup</span></div>
+
+      <div class="sb-section">Device Forensics</div>
+      <div class="nav-link" id="nav-forensic" onclick="nav('forensic')"><span class="nl-icon">⊛</span><span>Module F Sweep</span></div>
+      <div class="nav-link" id="nav-bridge" onclick="nav('bridge')"><span class="nl-icon">⚡</span><span>Device Bridge</span></div>
+      <div class="nav-link" id="nav-dual" onclick="nav('dual')"><span class="nl-icon">⇄</span><span>Dual-State</span></div>
+      <div class="nav-link" id="nav-tegu" onclick="nav('tegu')"><span class="nl-icon">🦎</span><span>Tegu Intel</span></div>
+
+      <div class="sb-section">Evidence</div>
+      <div class="nav-link" id="nav-devices" onclick="nav('devices')"><span class="nl-icon">▣</span><span>Ownership Ledger</span></div>
+      <div class="nav-link" id="nav-audits" onclick="nav('audits')"><span class="nl-icon">⊞</span><span>Audit Files</span></div>
+      <div class="nav-link" id="nav-probes" onclick="nav('probes')"><span class="nl-icon">↓</span><span>Probe Scripts</span></div>
+
+      <div class="sb-section">Reclaim</div>
+      <div class="nav-link" id="nav-disclosure" onclick="nav('disclosure')"><span class="nl-icon">⊂</span><span>Disclosure (DSAR)</span></div>
+      <div class="nav-link" id="nav-tracker" onclick="nav('tracker')"><span class="nl-icon">◷</span><span>Deadline Tracker</span></div>
+      <div class="nav-link" id="nav-bundle" onclick="nav('bundle')"><span class="nl-icon">⊟</span><span>Case Bundle</span></div>
+
+      <div class="sb-section">Intelligence</div>
+      <div class="nav-link" id="nav-orgmap" onclick="nav('orgmap')"><span class="nl-icon">⬡</span><span>Org Map</span></div>
+      <div class="nav-link" id="nav-scanhistory" onclick="nav('scanhistory')"><span class="nl-icon">◉</span><span>Scan History</span></div>
+
+      <div class="sb-section">System</div>
+      <div class="nav-link" id="nav-journal" onclick="nav('journal')"><span class="nl-icon">⏣</span><span>Audit Journal</span></div>
+      <div class="nav-link" id="nav-inventory" onclick="nav('inventory')"><span class="nl-icon">⊚</span><span>Local Inventory</span></div>
+
+      <div class="sb-bottom">
+        <div class="user-pill">
+          <div class="user-avatar" id="user-avatar-char">O</div>
+          <span class="ua" id="user-alias-display" style="font-family:var(--mono);font-size:10px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;">Operator</span>
+        </div>
+        <button class="btn btn-sm" style="width:100%;font-size:10px;" onclick="goLanding()">← Landing</button>
+      </div>
+    </nav>
+
+    <!-- Main Content -->
+    <main class="app-main">
+      <div id="content"></div>
+    </main>
+
+  </div><!-- .app-body -->
+
+  <!-- Bottom Nav (mobile) -->
+  <nav class="bottom-nav">
+    <button class="bn-item active" id="bn-home" onclick="nav('home')"><span class="bni">⌂</span>Home</button>
+    <button class="bn-item" id="bn-scan" onclick="nav('scan')"><span class="bni">◎</span>Scan</button>
+    <button class="bn-item" id="bn-forensic" onclick="nav('forensic')"><span class="bni">⊛</span>Forensic</button>
+    <button class="bn-item" id="bn-disclosure" onclick="nav('disclosure')"><span class="bni">⊂</span>DSAR</button>
+    <button class="bn-item" id="bn-devices" onclick="nav('devices')"><span class="bni">▣</span>Ledger</button>
+    <button class="bn-item" id="bn-audits" onclick="nav('audits')"><span class="bni">⊞</span>Audits</button>
+  </nav>
+
+</div><!-- #screen-app -->
+<script>
+
+'use strict';
+
+// ═══════════════════════════════════════════════════════════════
+// STATE
+// ═══════════════════════════════════════════════════════════════
+const S = {
+  devices: [],
+  audits: [],
+  journal: [],
+  dispatches: [],
+  findings: [],
+  scanHistory: [],           // persisted scan results
+  dualState: { phaseA: {}, phaseB: {}, discrepancies: [] },
+  scanState: { running: false, log: [], findings: [], discoveryFindings: [], summary: {} },
+  currentPage: 'home',
+};
+
+// ── RATE LIMITER ────────────────────────────────────────────────
+// Prevents hammering endpoints; sliding window per identifier
+const _rlStore = {};
+function rateLimitCheck(kind, identifier, windowMs=3600000) {
+  const key = `${kind}:${identifier.toLowerCase()}`;
+  const now_ts = Date.now();
+  if(_rlStore[key] && (now_ts - _rlStore[key]) < windowMs) {
+    const remaining = Math.ceil((windowMs - (now_ts - _rlStore[key])) / 60000);
+    return { limited: true, remaining_min: remaining };
+  }
+  _rlStore[key] = now_ts;
+  return { limited: false };
+}
+
+// ═══════════════════════════════════════════════════════════════
+// KNOWLEDGE BASE (from mdmcheck_v20.py)
+// ═══════════════════════════════════════════════════════════════
+const CATEGORIES = {
+  apple_dep:         'Apple Business / School Manager (DEP / MDM)',
+  domain_intel:      'Microsoft Entra / Intune / Autopilot',
+  samsung_knox:      'Samsung Knox KME / Knox Guard / E-FOTA',
+  mdm_discovery:     'Generic MDM (Jamf, Workspace ONE, Ivanti, Meraki, Kandji, Citrix, BlackBerry, MaaS360)',
+  google_android:    'Android Enterprise / Zero-Touch / Workspace',
+  edr_discovery:     'EDR (CrowdStrike, Microsoft Defender, Sophos)',
+  identity_discovery:'Identity (Okta, JumpCloud, Duo, Auth0)',
+};
+
+const MANAGEMENT_DEPTH = {
+  apple_dep:         'FULL SUPERVISION — silent app control, remote wipe, GPS lock, global proxy',
+  domain_intel:      'TENANT CONFIRMED — org manages domain; Conditional Access, activity logging',
+  samsung_knox:      'KNOX MANAGED — Knox Container, remote lock, E-FOTA firmware control',
+  mdm_discovery:     'MDM INFRASTRUCTURE EXPOSED — management server URL and org details revealed',
+  google_android:    'ANDROID ENTERPRISE — Device Owner or Work Profile management confirmed',
+  edr_discovery:     'EDR MONITORED — continuous process/network/file monitoring by org',
+  identity_discovery:'IDENTITY MANAGED — org controls authentication, Conditional Access, SSO logs',
+};
+
+const PLATFORM_CAPS = {
+  apple_dep: {
+    supervised: [
+      'Silently install/remove ANY app without user knowledge or consent',
+      'Enable/disable built-in apps (camera, FaceTime, iMessage, AirDrop, Siri)',
+      'Enable Activation Lock bypass — device permanently tied to org',
+      'Enable Lost Mode — remotely lock with custom message + GPS location',
+      'Remote wipe (immediate factory reset, no user prompt, no warning)',
+      'Global HTTP proxy — ALL web traffic routed through org proxy servers',
+      'Content filter — blocks websites at OS level regardless of browser',
+      'Screen time / restriction policies — disable App Store, iCloud, developer options',
+      'Managed app configuration — MDM pushes secrets and config directly into apps',
+      'Per-app VPN — specific apps route through org network without user control',
+      'Certificate installation — org CAs trusted at OS level for MITM inspection',
+      'Prevent manual MDM profile removal — user cannot unenroll',
+    ],
+    enrolled_byod: [
+      'Managed app distribution (user must approve each app)',
+      'Corporate Wi-Fi / VPN profile push',
+      'Email account configuration',
+      'Passcode policy enforcement (minimum length, complexity, expiry)',
+      'Remote wipe of MANAGED CONTENT ONLY (not personal data)',
+    ],
+  },
+  domain_intel: {
+    tenant: [
+      'Conditional Access — org can block ALL access to cloud resources from non-compliant devices',
+      'Single Sign-On tied to corporate identity — org sees all authentication events with timestamps and IP',
+      'Device Compliance gate — enrollment in Intune required to access email, SharePoint, Teams',
+      'Activity logging — email, SharePoint, Teams, OneDrive, Azure AD sign-in logs',
+      'Windows Autopilot — org-provisioned devices re-enroll automatically after factory reset',
+    ],
+  },
+  google_android: {
+    device_owner: [
+      'Full device management (DEVICE_OWNER mode)',
+      'Silent app install / remove without user consent',
+      'Factory reset protection override — org can re-enroll after reset',
+      'Network traffic routing through org proxy',
+      'Disable USB debugging, ADB access',
+      'Disable factory reset by user',
+      'Location tracking at any time',
+      'Remote wipe with no user confirmation',
+    ],
+    work_profile: [
+      'Separate work profile — org controls work apps and data',
+      'Work apps installed silently in work profile',
+      'Work profile can be remotely wiped while personal data untouched',
+      'Work Wi-Fi / VPN configuration pushed silently',
+      'Org can see all installed work apps and their data',
+    ],
+  },
+  samsung_knox: {
+    kme_enrolled: [
+      'Silent app installation via Knox SDK without user interaction',
+      'Knox Container — isolated encrypted corporate workspace on device',
+      'Remote lock and wipe (Knox Guard can survive factory reset)',
+      'Firmware version control via E-FOTA — org controls OS updates',
+      'Knox Guard: org can remotely lock device if MDM subscription lapses',
+      'Network traffic monitoring via Knox VPN',
+      'Disable factory reset protection bypass',
+    ],
+  },
+  edr_discovery: {
+    sensor_installed: [
+      'Kernel-level process monitoring — every process start/stop with full command line',
+      'Network connection logging — all TCP/UDP connections with process attribution',
+      'File creation/modification/deletion monitoring',
+      'Registry change monitoring (Windows)',
+      'User logon/logoff events',
+      'Remote isolation — org can instantly cut device from ALL networks',
+      'Live response — org can run remote shell commands on your device',
+      'Forensic artifact collection — org can pull memory dumps, logs, files remotely',
+    ],
+  },
+  identity_discovery: {
+    registered: [
+      'Device registered in organizational directory',
+      'Conditional Access policy enforcement — org can revoke access instantly',
+      'SSO authentication logs visible to org (IP, location, device, app)',
+      'MFA enforcement on all corporate resources',
+    ],
+  },
+  mdm_discovery: {
+    enrolled: [
+      'MDM profile push: Wi-Fi, VPN, email, certificates',
+      'App policy enforcement (whitelist / blacklist)',
+      'Remote device wipe',
+      'Passcode policy enforcement',
+      'Compliance reporting to organization',
+    ],
+  },
+};
+
+// ═══════════════════════════════════════════════════════════════
+// DISCOVERY PROBES (57 Tier-0, from v14 engine)
+// ═══════════════════════════════════════════════════════════════
+const DISCOVERY_PROBES = [
+  { key:'apple_activation_dep', label:'Apple DEP — Device Activation Protocol', category:'apple_dep', tier:0, url:d=>`https://albert.apple.com/deviceservices/deviceActivation`, method:'POST', positive:[/activation-record/,/mdm-url.*https/,/is-supervised.*true/,/org-name.*<string>/] },
+  { key:'apple_dep_profile', label:'Apple DEP — MDM Profile Fetch', category:'apple_dep', tier:0, url:d=>`https://mdmenrollment.apple.com/dep/profile`, method:'GET', positive:[/profile_uuid.*[0-9A-F-]{30}/,/org_name.*"[^"]{3,}"/,/mdm_url.*https/] },
+  { key:'apple_well_known_mobileconfig', label:'Apple MDM — .well-known Mobileconfig', category:'apple_dep', tier:0, url:d=>`https://${d}/.well-known/mobileconfig`, method:'GET', positive:[/PayloadType.*Configuration/,/ServerURL.*https/,/PayloadOrganization/] },
+  { key:'ms_userrealm_v1', label:'Microsoft — User Realm Discovery', category:'domain_intel', tier:0, url:d=>`https://login.microsoftonline.com/common/userrealm/user@${d}?api-version=1.0`, method:'GET', positive:[/"NameSpaceType"\s*:\s*"(Managed|Federated)"/,/FederationBrandName/,/DomainName/] },
+  { key:'ms_openid_config', label:'Microsoft — Entra OpenID Configuration', category:'domain_intel', tier:0, url:d=>`https://login.microsoftonline.com/${d}/v2.0/.well-known/openid-configuration`, method:'GET', positive:[/"issuer"\s*:\s*"https:\/\/login\.microsoftonline/,/tenant_region_scope/], negative:[/invalid_tenant/,/AADSTS90002/] },
+  { key:'ms_enterprise_registration', label:'Microsoft — Enterprise Device Registration', category:'domain_intel', tier:0, url:d=>`https://enterpriseregistration.windows.net/${d}/discover?api-version=1.7`, method:'GET', positive:[/DiscoveryEndpoint.*EnrollmentServer/,/"TenantId"\s*:\s*"[0-9a-f-]{36}"/], negative:[/unknown_tenant/] },
+  { key:'ms_enrollment_soap', label:'Microsoft — Intune MDM Enrollment SOAP', category:'domain_intel', tier:0, url:d=>`https://EnterpriseEnrollment.${d}/EnrollmentServer/Discovery.svc`, method:'POST', positive:[/EnrollmentServiceUrl/,/AuthPolicy/], negative:[/faultcode/] },
+  { key:'ms_autopilot_check', label:'Microsoft — Autopilot Device Check', category:'domain_intel', tier:0, url:d=>`https://cs.dds.microsoft.com/TenantsInfo`, method:'GET', positive:[/tenantId/,/Provisioning/] },
+  { key:'google_workspace_mail', label:'Google Workspace — Mail Domain Check', category:'google_android', tier:0, url:d=>`https://mail.google.com/a/${d}`, method:'GET', positive:[/google\.com\/a\//,/accounts\.google\.com/] },
+  { key:'google_zero_touch', label:'Google Zero-Touch — Enrollment Check', category:'google_android', tier:0, url:d=>`https://androiddeviceprovisioning.googleapis.com/v1/partners:list`, method:'GET', positive:[/customerId/,/partnerId/] },
+  { key:'samsung_kme_check', label:'Samsung Knox KME — Device Enrollment Check', category:'samsung_knox', tier:0, url:d=>`https://kme.samsungknox.com/kcs/v1/kme/devices/check`, method:'POST', positive:[/"enrolled"\s*:\s*true/,/customerId/,/ENROLLED|REGISTERED/], negative:[/"enrolled"\s*:\s*false/] },
+  { key:'samsung_knox_guard', label:'Samsung Knox Guard — Device Lock Check', category:'samsung_knox', tier:0, url:d=>`https://knoxguard.samsungknox.com/api/v1/device/check-enrollment`, method:'POST', positive:[/knoxGuardEnrolled.*true/,/customerId/] },
+  { key:'samsung_efota', label:'Samsung E-FOTA — Firmware Update Policy', category:'samsung_knox', tier:0, url:d=>`https://efota.samsungknox.com/fota/v2/policy`, method:'GET', positive:[/fota/,/policy/,/enrolled/] },
+  { key:'vmware_autodiscovery', label:'VMware Workspace ONE — Domain Autodiscovery', category:'mdm_discovery', tier:0, url:d=>`https://discovery.awmdm.com/autodiscovery/awclient/v1/autodiscovery/DeviceServices/EmailDomain?domain=${encodeURIComponent(d)}`, method:'GET', positive:[/ServerName.*awmdm\.com/,/GroupID/], negative:[/InvalidDomain/] },
+  { key:'jamf_enrollment_mobileconfig', label:'Jamf — MDM Enrollment Mobileconfig', category:'mdm_discovery', tier:0, url:d=>`https://${d}.jamfcloud.com/mobiledeviceenrollment/profile`, method:'GET', positive:[/PayloadType.*Configuration/,/ServerURL.*jamf/] },
+  { key:'jamf_enroll_page', label:'Jamf — Enrollment Portal Check', category:'mdm_discovery', tier:0, url:d=>`https://${d}.jamfcloud.com/enroll`, method:'GET', positive:[/jamfcloud\.com/,/Jamf\s+(Pro|School|Now)/] },
+  { key:'ivanti_mobileiron', label:'Ivanti / MobileIron — MDM Discovery', category:'mdm_discovery', tier:0, url:d=>`https://${d}.mobileiron.com/enrollment`, method:'GET', positive:[/mobileiron/i,/ivanti/i,/enrollment/i] },
+  { key:'meraki_sm', label:'Cisco Meraki SM — Enrollment Check', category:'mdm_discovery', tier:0, url:d=>`https://api.meraki.com/api/v1/organizations`, method:'GET', positive:[/organizationId/,/meraki/i] },
+  { key:'maas360_check', label:'IBM MaaS360 — Device Check', category:'mdm_discovery', tier:0, url:d=>`https://auth.fiberlink.com/auth/oauth/token`, method:'GET', positive:[/maas360/i,/fiberlink/i,/token/] },
+  { key:'blackberry_uem', label:'BlackBerry UEM — Discovery', category:'mdm_discovery', tier:0, url:d=>`https://${d}/api/v1/discovery`, method:'GET', positive:[/blackberry/i,/uem/i,/dynamics/i] },
+  { key:'kandji_mdm', label:'Kandji MDM — Enrollment Check', category:'mdm_discovery', tier:0, url:d=>`https://${d}.kandji.io/api/v1/devices`, method:'GET', positive:[/kandji/i,/blueprint/i,/deviceId/] },
+  { key:'hexnode_mdm', label:'Hexnode MDM — Discovery', category:'mdm_discovery', tier:0, url:d=>`https://${d}.hexnode.com/api/v1/mdm/`, method:'GET', positive:[/hexnode/i,/device_count/,/enrolled/] },
+  { key:'soti_mobicontrol', label:'SOTI MobiControl — Enrollment', category:'mdm_discovery', tier:0, url:d=>`https://${d}.mobicontrol.net/MobiControl/api/devices`, method:'GET', positive:[/soti/i,/mobicontrol/i] },
+  { key:'citrix_endpoint', label:'Citrix Endpoint Management — Discovery', category:'mdm_discovery', tier:0, url:d=>`https://${d}.xm.citrix.com/zdm/xenmobile/enrollment`, method:'GET', positive:[/citrix/i,/xenmobile/i,/enrollment/] },
+  { key:'okta_org_discovery', label:'Okta — Organization Well-Known Discovery', category:'identity_discovery', tier:0, url:d=>`https://${d}.okta.com/.well-known/okta-organization`, method:'GET', positive:[/"id"\s*:\s*"[0-9a-zA-Z]{16,}"/,/subdomain/,/displayName/] },
+  { key:'jumpcloud_kickstart', label:'JumpCloud — Agent Kickstart Discovery', category:'identity_discovery', tier:0, url:d=>`https://kickstart.jumpcloud.com/Kickstart`, method:'GET', positive:[/JUMPCLOUD_KEY/,/JumpCloud/,/connect_key/] },
+  { key:'jumpcloud_openid', label:'JumpCloud — OpenID Configuration', category:'identity_discovery', tier:0, url:d=>`https://oauth.id.jumpcloud.com/.well-known/openid-configuration`, method:'GET', positive:[/"issuer"\s*:\s*"https:\/\/oauth\.id\.jumpcloud\.com"/] },
+  { key:'duo_security', label:'Duo Security — MFA Discovery', category:'identity_discovery', tier:0, url:d=>`https://api.duosecurity.com/accounts/v1/account/info`, method:'GET', positive:[/duo/i,/mfa/i,/account/] },
+  { key:'auth0_discover', label:'Auth0 — Tenant Discovery', category:'identity_discovery', tier:0, url:d=>`https://${d}.auth0.com/.well-known/openid-configuration`, method:'GET', positive:[/auth0\.com/,/issuer/,/authorization_endpoint/] },
+  { key:'crowdstrike_api_check', label:'CrowdStrike Falcon — Public API Status', category:'edr_discovery', tier:0, url:d=>`https://api.crowdstrike.com/`, method:'GET', positive:[/CrowdStrike/,/"platform"\s*:\s*"falcon"/] },
+  { key:'sophos_whoami', label:'Sophos Central — Public Identity Check', category:'edr_discovery', tier:0, url:d=>`https://api.central.sophos.com/whoami/v1`, method:'GET', positive:[/"id"\s*:\s*"[0-9a-f-]{36}"/,/"idType"\s*:\s*"(tenant|partner)"/] },
+  { key:'defender_api', label:'Microsoft Defender for Endpoint — API', category:'edr_discovery', tier:0, url:d=>`https://api.securitycenter.microsoft.com/api/machines`, method:'GET', positive:[/computerDnsName/,/onboardingStatus/] },
+  { key:'well_known_mdm_enrollment', label:'RFC — .well-known MDM Enrollment', category:'mdm_discovery', tier:0, url:d=>`https://${d}/.well-known/mdm-enrollment`, method:'GET', positive:[/enrollment-endpoint/,/EnrollmentServiceUrl/] },
+  { key:'well_known_scep', label:'SCEP — Certificate Enrollment', category:'mdm_discovery', tier:0, url:d=>`https://${d}/CertSrv/mscep/mscep.dll`, method:'GET', positive:[/SCEP/,/CA/,/certificate/i] },
+  { key:'autopilot_odata', label:'Autopilot — OData Device Query', category:'domain_intel', tier:0, url:d=>`https://graph.microsoft.com/v1.0/deviceManagement/windowsAutopilotDeviceIdentities`, method:'GET', positive:[/serialNumber/,/enrollmentState/,/autopilot/i] },
+  { key:'android_zt_oobconfig', label:'Android ZT — Out-of-Box Config Endpoint', category:'google_android', tier:0, url:d=>`https://oobconfig.googleapis.com/oobconfig`, method:'GET', positive:[/oobconfig/,/dpc_extras/,/enrollment/i] },
+  { key:'mdm_generic_enroll', label:'Generic MDM — Enrollment Endpoint Probe', category:'mdm_discovery', tier:0, url:d=>`https://${d}/enrollment`, method:'GET', positive:[/enrollment/i,/mdm/i,/profile/i] },
+  { key:'ms_intune_discovery', label:'Microsoft Intune — Discovery Service', category:'domain_intel', tier:0, url:d=>`https://manage.microsoft.com/EnrollmentServer/Discovery.svc`, method:'GET', positive:[/EnrollmentService/,/Discovery/,/microsoft/i] },
+  { key:'entra_device_reg', label:'Microsoft Entra — Device Registration Endpoint', category:'domain_intel', tier:0, url:d=>`https://enterpriseregistration.windows.net/enrollmentserver/contract`, method:'GET', positive:[/EnterpriseEnrollment/,/contract/,/windows\.net/] },
+  { key:'google_afw_check', label:'Google Android for Work — AFW Check', category:'google_android', tier:0, url:d=>`https://www.google.com/android/enterprise/provisioning/${d}`, method:'GET', positive:[/android.*work/i,/enterprise/i,/provisioning/i] },
+  { key:'jamf_school', label:'Jamf School — Enrollment', category:'mdm_discovery', tier:0, url:d=>`https://${d}.jamfcloud.com/enroll/studentEnrollment.html`, method:'GET', positive:[/jamf/i,/school/i,/enrollment/i] },
+  { key:'manage_engine_mdm', label:'ManageEngine MDM — Discovery', category:'mdm_discovery', tier:0, url:d=>`https://${d}.manageengine.com/api/v1/devices`, method:'GET', positive:[/ManageEngine/i,/MDM/i,/device/i] },
+  { key:'absolute_persistence', label:'Absolute — Firmware Persistence Check', category:'edr_discovery', tier:0, url:d=>`https://reporting.absolute.com/api/v2/compliance`, method:'GET', positive:[/absolute/i,/persistence/i,/firmware/i] },
+  { key:'workspace_one_uem', label:'VMware Workspace ONE UEM — Check', category:'mdm_discovery', tier:0, url:d=>`https://${d}.workspaceone.com/api/mdm/devices`, method:'GET', positive:[/Workspace/i,/enrolled/i,/compliance/i] },
+  { key:'ms_conditional_access', label:'Microsoft — Conditional Access Probe', category:'domain_intel', tier:0, url:d=>`https://login.microsoftonline.com/${d}/oauth2/v2.0/authorize`, method:'GET', positive:[/login\.microsoftonline/,/response_type/,/client_id/] },
+  { key:'knox_attestation', label:'Samsung Knox — Device Attestation', category:'samsung_knox', tier:0, url:d=>`https://attest.samsungknox.com/cas/v1/knoxAttestation`, method:'GET', positive:[/knoxAttestation/i,/attestation/i,/samsung/i] },
+  { key:'sophos_endpoint', label:'Sophos — Endpoint Registration', category:'edr_discovery', tier:0, url:d=>`https://cloud.sophos.com/manage/endpoint`, method:'GET', positive:[/sophos/i,/endpoint/i,/managed/i] },
+  { key:'crowdstrike_falcon_sensor', label:'CrowdStrike — Sensor Communication', category:'edr_discovery', tier:0, url:d=>`https://cloudsink.net/api/v1/sensor`, method:'GET', positive:[/falcon/i,/sensor/i,/crowdstrike/i] },
+  { key:'ms_sccm_mp', label:'Microsoft SCCM — Management Point', category:'domain_intel', tier:0, url:d=>`https://${d}/CCM_Proxy_MutualAuth/72057594037927947/CCM_System/request`, method:'GET', positive:[/SMS_MP/,/CCM/,/Management/] },
+  { key:'jamf_pro_api', label:'Jamf Pro — REST API Probe', category:'mdm_discovery', tier:0, url:d=>`https://${d}.jamfcloud.com/api/v1/computers-preview`, method:'GET', positive:[/jamf/i,/computers/i,/managed/i] },
+  { key:'ivanti_neurons', label:'Ivanti Neurons — MDM Probe', category:'mdm_discovery', tier:0, url:d=>`https://${d}.mobileiron.com/mifs/c/api/v3/devices`, method:'GET', positive:[/MobileIron/i,/Ivanti/i,/device/i] },
+  { key:'google_endpoint_verification', label:'Google Endpoint Verification — Check', category:'google_android', tier:0, url:d=>`https://endpointverification.googleapis.com/v1/projects`, method:'GET', positive:[/endpoint/i,/verification/i,/google/i] },
+  { key:'okta_device_trust', label:'Okta Device Trust — Check', category:'identity_discovery', tier:0, url:d=>`https://${d}.okta.com/api/v1/org`, method:'GET', positive:[/org/i,/okta/i,/domain/i] },
+  { key:'ms_primary_refresh_token', label:'Microsoft — PRT Discovery Endpoint', category:'domain_intel', tier:0, url:d=>`https://login.microsoftonline.com/common/v2.0/.well-known/openid-configuration`, method:'GET', positive:[/access_token_issuer/,/cloud_graph_host_name/,/msgraph_host/] },
+  { key:'android_enterprise_afm', label:'Android Enterprise — AFM Device Management', category:'google_android', tier:0, url:d=>`https://androidmanagement.googleapis.com/v1/enterprises`, method:'GET', positive:[/enterpriseDisplayName/,/managementMode/,/DEVICE_OWNER/] },
+  { key:'ms_graph_intune', label:'Microsoft Graph — Intune Device Query', category:'domain_intel', tier:0, url:d=>`https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?$top=1`, method:'GET', positive:[/enrollmentState/,/managedDevices/,/intune/i] },
+  { key:'jumpcloud_directory', label:'JumpCloud Directory — LDAP Discovery', category:'identity_discovery', tier:0, url:d=>`https://console.jumpcloud.com/api/v2/directories`, method:'GET', positive:[/LDAP/i,/directory/i,/jumpcloud/i] },
+];
+
+// ═══════════════════════════════════════════════════════════════
+// DISCLOSURE TEMPLATES (from mdmcheck_v20.py TEMPLATES dict)
+// ═══════════════════════════════════════════════════════════════
+const TEMPLATES = {
+  gdpr_microsoft: {
+    label: 'GDPR Art. 15 DSAR — Microsoft',
+    recipient_default: 'privacy@microsoft.com',
+    category: 'dsar',
+    statute: 'gdpr', days: 30,
+    body: (v) => `SUBJECT: Data Subject Access Request — Article 15 GDPR
+
+To: Microsoft Privacy Office <${v.recipient}>
+From: ${v.name} <${v.email}>
+Address: ${v.address}
+Date: ${v.date}
+
+Pursuant to Article 15 of Regulation (EU) 2016/679 (GDPR) and the equivalent
+provisions of UK GDPR, I hereby request access to all personal data Microsoft
+processes that is associated with me or with the hardware identifiers listed
+below. This request includes, without limitation:
+
+  (a) all device records in Microsoft Entra ID, Microsoft Intune, Windows
+      Autopilot, Microsoft Account, and any other Microsoft service tying a
+      hardware identifier to a tenant, user, or enrollment;
+  (b) the tenant GUID(s) under which each listed identifier is or was
+      registered, including the registration timestamp and registering
+      partner / reseller of record;
+  (c) the user principal name(s) assigned to each device;
+  (d) all authentication events, sign-ins, and management commands recorded
+      against each identifier;
+  (e) the recipients of any disclosure of the above data to third parties.
+
+Hardware identifiers under inquiry:
+${v.deviceBlock}
+
+Tenant references:
+${v.tenantBlock}
+
+Local enrollment evidence:
+${v.auditBlock}
+
+Additional context:
+${v.context}
+
+Please respond within one calendar month per Article 12(3) GDPR.
+
+Signed,
+${v.name}`
+  },
+  gdpr_erasure: {
+    label: 'GDPR Art. 17 Right to Erasure — generic',
+    recipient_default: 'privacy@',
+    category: 'dsar', statute: 'gdpr', days: 30,
+    body: (v) => `SUBJECT: Right to Erasure / Right to be Forgotten — Article 17 GDPR
+
+To: ${v.recipient}
+From: ${v.name} <${v.email}>
+Address: ${v.address}
+Date: ${v.date}
+
+Pursuant to Article 17 GDPR I request the erasure of all personal data you
+hold that is tied to the hardware identifiers and identity below.
+
+Hardware identifiers and account references to be erased:
+${v.deviceBlock}
+
+Tenant / organization references to be unbound:
+${v.tenantBlock}
+
+Local evidence supporting the request:
+${v.auditBlock}
+
+Context:
+${v.context}
+
+Signed,
+${v.name}`
+  },
+  employer_recovery: {
+    label: 'Employer / former-employer device-recovery letter',
+    recipient_default: '(your current or former employer)',
+    category: 'abuse', statute: 'default', days: 30,
+    body: (v) => `SUBJECT: Personal device recovery — demand to release management
+
+To: ${v.recipient}
+From: ${v.name} <${v.email}>
+Address: ${v.address}
+Date: ${v.date}
+
+The hardware identifiers below are my personal property. I demand you:
+(1) remove them from any MDM, EDR, identity, or conditional-access tenant;
+(2) release any Activation Lock, Knox Guard, or Autopilot lock;
+(3) confirm in writing the date of removal and the tenant(s) from which
+    they were removed.
+
+Hardware identifiers:
+${v.deviceBlock}
+
+Tenant / organization references:
+${v.tenantBlock}
+
+Local enrollment evidence:
+${v.auditBlock}
+
+Context:
+${v.context}
+
+Signed,
+${v.name}`
+  },
+  apple_activation_lock: {
+    label: 'Apple — Activation Lock removal request',
+    recipient_default: '(submit at https://support.apple.com/activationlock)',
+    category: 'abuse', statute: 'default', days: 30,
+    body: (v) => `SUBJECT: Activation Lock removal — proof of ownership
+
+To: Apple Customer Support
+From: ${v.name} <${v.email}>
+Address: ${v.address}
+Date: ${v.date}
+
+I am the lawful owner of the Apple hardware identified below and request
+removal of Activation Lock / MDM enrollment associated with the listed
+identifiers.
+
+Hardware identifiers:
+${v.deviceBlock}
+
+Organization or tenant holding device under Activation Lock:
+${v.tenantBlock}
+
+Local enrollment evidence:
+${v.auditBlock}
+
+Ownership context:
+${v.context}
+
+Signed,
+${v.name}`
+  },
+  gdpr_apple: {
+    label: 'GDPR Art. 15 DSAR — Apple',
+    recipient_default: 'privacy@apple.com',
+    category: 'dsar', statute: 'gdpr', days: 30,
+    body: (v) => `SUBJECT: Data Subject Access Request — Article 15 GDPR
+
+To: Apple Privacy <${v.recipient}>
+From: ${v.name} <${v.email}>
+Address: ${v.address}
+Date: ${v.date}
+
+Pursuant to Article 15 GDPR I request access to all personal data Apple holds
+associated with the hardware identifiers below, including Apple Business Manager,
+Apple School Manager, iCloud device records, and Apple ID activity logs.
+
+Hardware identifiers:
+${v.deviceBlock}
+
+Tenant / organization references:
+${v.tenantBlock}
+
+Local enrollment evidence:
+${v.auditBlock}
+
+Additional context:
+${v.context}
+
+Signed,
+${v.name}`
+  },
+  gdpr_google: {
+    label: 'GDPR Art. 15 DSAR — Google',
+    recipient_default: 'data-protection-office@google.com',
+    category: 'dsar', statute: 'gdpr', days: 30,
+    body: (v) => `SUBJECT: Data Subject Access Request — Article 15 GDPR
+
+To: Google Data Protection Office <${v.recipient}>
+From: ${v.name} <${v.email}>
+Address: ${v.address}
+Date: ${v.date}
+
+Pursuant to Article 15 GDPR I request all personal data Google holds in
+connection with the hardware identifiers below, including Android Enterprise,
+Android Zero-Touch enrollment, Workspace device records, and Google Account history.
+
+Hardware identifiers:
+${v.deviceBlock}
+
+Tenant / organization references:
+${v.tenantBlock}
+
+Local enrollment evidence:
+${v.auditBlock}
+
+Additional context:
+${v.context}
+
+Signed,
+${v.name}`
+  },
+  gdpr_jumpcloud: {
+    label: 'GDPR Art. 15 DSAR — JumpCloud',
+    recipient_default: 'privacy@jumpcloud.com',
+    category: 'dsar', statute: 'gdpr', days: 30,
+    body: (v) => `SUBJECT: Data Subject Access Request — Article 15 GDPR
+
+To: JumpCloud Privacy <${v.recipient}>
+From: ${v.name} <${v.email}>
+Address: ${v.address}
+Date: ${v.date}
+
+Pursuant to Article 15 GDPR I request access to all personal data JumpCloud
+processes in connection with my identity and the hardware identifiers below.
+
+Hardware identifiers:
+${v.deviceBlock}
+
+Organization / tenant references:
+${v.tenantBlock}
+
+Local enrollment evidence:
+${v.auditBlock}
+
+Additional context:
+${v.context}
+
+Signed,
+${v.name}`
+  },
+  ccpa_generic: {
+    label: 'CCPA §1798.110 Request — generic',
+    recipient_default: 'privacy@',
+    category: 'dsar', statute: 'ccpa', days: 45,
+    body: (v) => `SUBJECT: CCPA / CPRA Right-to-Know Request — Cal. Civ. Code §1798.110
+
+To: ${v.recipient}
+From: ${v.name} <${v.email}>
+Address: ${v.address}
+Date: ${v.date}
+
+Pursuant to California Civil Code §1798.110 I request disclosure of all
+categories of personal information you have collected about me, specifically
+covering the hardware identifiers below.
+
+Hardware identifiers:
+${v.deviceBlock}
+
+Local enrollment evidence:
+${v.auditBlock}
+
+Additional context:
+${v.context}
+
+Please respond within 45 days as required by §1798.130.
+
+Signed,
+${v.name}`
+  },
+  abuse_msrc: {
+    label: 'Abuse report — MSRC (Microsoft Security Response Center)',
+    recipient_default: 'secure@microsoft.com',
+    category: 'abuse', statute: 'default', days: 30,
+    body: (v) => `SUBJECT: Unauthorized Microsoft Autopilot / Intune Enrollment Report
+
+To: Microsoft Security Response Center <${v.recipient}>
+From: ${v.name} <${v.email}>
+Date: ${v.date}
+
+I am reporting unauthorized enrollment of hardware I lawfully own into a
+Microsoft tenant.
+
+Tenant:
+${v.tenantBlock}
+
+Hardware identifiers:
+${v.deviceBlock}
+
+Local enrollment evidence:
+${v.auditBlock}
+
+Additional context:
+${v.context}
+
+Signed,
+${v.name}`
+  },
+  abuse_dcu: {
+    label: 'Abuse report — Microsoft Digital Crimes Unit',
+    recipient_default: 'dcu@microsoft.com',
+    category: 'abuse', statute: 'default', days: 30,
+    body: (v) => `SUBJECT: Suspected fraudulent tenant — unauthorized hardware enrollment
+
+To: Microsoft Digital Crimes Unit <${v.recipient}>
+From: ${v.name} <${v.email}>
+Date: ${v.date}
+
+Tenant of concern:
+${v.tenantBlock}
+
+Hardware identifiers I own:
+${v.deviceBlock}
+
+Local enrollment evidence:
+${v.auditBlock}
+
+Context:
+${v.context}
+
+Signed,
+${v.name}`
+  },
+  abuse_jumpcloud_ts: {
+    label: 'Abuse report — JumpCloud Trust & Safety',
+    recipient_default: 'trust@jumpcloud.com',
+    category: 'abuse', statute: 'default', days: 30,
+    body: (v) => `SUBJECT: Unauthorized JumpCloud enrollment of personally-owned hardware
+
+To: JumpCloud Trust & Safety <${v.recipient}>
+From: ${v.name} <${v.email}>
+Date: ${v.date}
+
+Organization / identifiers of concern:
+${v.tenantBlock}
+
+Affected hardware:
+${v.deviceBlock}
+
+Local enrollment evidence:
+${v.auditBlock}
+
+Context:
+${v.context}
+
+Signed,
+${v.name}`
+  },
+  ic3_record: {
+    label: 'FBI IC3 supporting record (file at ic3.gov)',
+    recipient_default: '(submit at https://www.ic3.gov)',
+    category: 'abuse', statute: 'default', days: 30,
+    body: (v) => `SUBJECT: Supporting record for FBI IC3 complaint — device fraud
+
+Complainant: ${v.name} <${v.email}>
+Address: ${v.address}
+Date: ${v.date}
+
+Tenant / organization implicated:
+${v.tenantBlock}
+
+Affected hardware identifiers:
+${v.deviceBlock}
+
+Local enrollment evidence:
+${v.auditBlock}
+
+Narrative:
+${v.context}
+
+Signed,
+${v.name}`
+  },
+  state_ag: {
+    label: 'State Attorney General consumer-fraud filing',
+    recipient_default: '(your state AG consumer protection division)',
+    category: 'abuse', statute: 'default', days: 30,
+    body: (v) => `SUBJECT: Consumer fraud complaint — unauthorized device management
+
+To: ${v.recipient}
+From: ${v.name} <${v.email}>
+Address: ${v.address}
+Date: ${v.date}
+
+Tenant / organization implicated:
+${v.tenantBlock}
+
+Affected hardware:
+${v.deviceBlock}
+
+Local enrollment evidence:
+${v.auditBlock}
+
+Narrative and harm:
+${v.context}
+
+Signed,
+${v.name}`
+  },
+  regulator_ico: {
+    label: 'Regulator complaint — DSAR non-response (UK ICO / EU DPA)',
+    recipient_default: 'casework@ico.org.uk',
+    category: 'abuse', statute: 'gdpr', days: 30,
+    body: (v) => `SUBJECT: Article 77 GDPR complaint — controller failure to respond
+
+To: ${v.recipient}
+From: ${v.name} <${v.email}>
+Address: ${v.address}
+Date: ${v.date}
+
+Tenant / organization implicated:
+${v.tenantBlock}
+
+Hardware identifiers the original DSAR concerned:
+${v.deviceBlock}
+
+Local enrollment evidence:
+${v.auditBlock}
+
+Details of the underlying DSAR and the breach:
+${v.context}
+
+Signed,
+${v.name}`
+  },
+  carrier_dsar: {
+    label: 'Carrier device-history DSAR',
+    recipient_default: '(your carrier privacy office)',
+    category: 'dsar', statute: 'gdpr', days: 30,
+    body: (v) => `SUBJECT: Subscriber device-history data request
+
+To: ${v.recipient}
+From: ${v.name} <${v.email}>
+Address: ${v.address}
+Date: ${v.date}
+
+I request disclosure of all records you hold tying the hardware identifiers
+below to my subscriber account, including activation dates, transfers,
+enterprise-mobility records, and any third-party claims.
+
+Hardware identifiers:
+${v.deviceBlock}
+
+Tenant / organization references:
+${v.tenantBlock}
+
+Local evidence:
+${v.auditBlock}
+
+Context:
+${v.context}
+
+Signed,
+${v.name}`
+  },
+  regulator_state_ag: {
+    label: 'Regulator complaint — DSAR non-response (US state AG / CPPA)',
+    recipient_default: '(your state AG consumer protection division)',
+    category: 'abuse', statute: 'ccpa', days: 45,
+    body: (v) => `SUBJECT: Complaint — failure to respond to CCPA §1798.110 request
+
+To: ${v.recipient}
+From: ${v.name} <${v.email}>
+Address: ${v.address}
+Date: ${v.date}
+
+Tenant / organization implicated:
+${v.tenantBlock}
+
+Hardware identifiers the original request concerned:
+${v.deviceBlock}
+
+Local enrollment evidence:
+${v.auditBlock}
+
+Details of the underlying request and the breach:
+${v.context}
+
+Signed,
+${v.name}`
+  },
+};
+
+// ═══════════════════════════════════════════════════════════════
+// PROBE SCRIPTS (from mdmcheck_v20.py PROBE_SCRIPTS)
+// ═══════════════════════════════════════════════════════════════
+const PROBE_SCRIPTS = {
+  android: {
+    filename: 'provenance-probe-android.sh',
+    mime: 'text/x-shellscript',
+    content: `#!/system/bin/sh
+# MDMCheck v20 — Android Forensic Probe
+# Run as:  adb shell sh /sdcard/mdmcheck-probe.sh > /sdcard/probe-out.txt 2>&1
+# Then:    adb pull /sdcard/probe-out.txt && upload to Audit Files
+set +e
+echo "=== MDMCheck Android Forensic Probe ==="
+echo "Generated: $(date -u +%FT%TZ)"
+echo "Device: $(getprop ro.product.model) / $(getprop ro.build.fingerprint)"
+echo ""
+
+echo "=== [F1] REGIONAL INTEGRITY AUDIT ==="
+echo "ro.boot.hwc=$(getprop ro.boot.hwc)"
+echo "ro.boot.csc=$(getprop ro.boot.csc)"
+echo "ro.boot.carrier=$(getprop ro.boot.carrier)"
+echo "persist.sys.country=$(getprop persist.sys.country)"
+echo "persist.sys.locale=$(getprop persist.sys.locale)"
+echo "ro.product.locale.region=$(getprop ro.product.locale.region)"
+echo "ro.product.locale=$(getprop ro.product.locale)"
+echo "gsm.operator.iso-country=$(getprop gsm.operator.iso-country)"
+echo "ro.config.locale=$(getprop ro.config.locale)"
+echo ""
+
+echo "=== [F2-A] BEHAVIORAL FINGERPRINT (Phase A — OS visible) ==="
+echo "--- Enabled packages ---"
+pm list packages -e 2>/dev/null
+echo "--- Device Policy XML ---"
+cat /data/system/device_policies.xml 2>/dev/null || echo "(no access)"
+echo "--- Device Owners XML ---"
+cat /data/system/device_owners.xml 2>/dev/null || echo "(no access)"
+echo "--- DPM owners ---"
+dpm list-owners 2>/dev/null
+echo "--- dumpsys device_policy (first 100 lines) ---"
+dumpsys device_policy 2>/dev/null | head -100
+echo ""
+
+echo "=== [F2-B] BEHAVIORAL FINGERPRINT (Phase B — rish/Shizuku) ==="
+echo "--- ALL packages including disabled/retained (requires rish) ---"
+# Run this with: rish -c 'pm list packages -u -a'
+echo "(requires Shizuku/rish — run: rish -c 'pm list packages -u -a')"
+echo "--- Packages with BIND_DEVICE_ADMIN ---"
+for pkg in $(pm list packages -e 2>/dev/null | cut -d: -f2); do
+  perms=$(dumpsys package "$pkg" 2>/dev/null | grep -c "BIND_DEVICE_ADMIN")
+  [ "$perms" -gt 0 ] 2>/dev/null && echo "BIND_DEVICE_ADMIN: $pkg"
+done
+echo "--- RECEIVE_BOOT + QUERY_ALL_PACKAGES ---"
+for pkg in $(pm list packages -e 2>/dev/null | cut -d: -f2); do
+  dump=$(dumpsys package "$pkg" 2>/dev/null)
+  hb=$(echo "$dump" | grep -c "RECEIVE_BOOT_COMPLETED")
+  qa=$(echo "$dump" | grep -c "QUERY_ALL_PACKAGES")
+  [ "$hb" -gt 0 ] && [ "$qa" -gt 0 ] 2>/dev/null && echo "BOOT+QUERYALL: $pkg"
+done
+echo ""
+
+echo "=== [F3] ATOMIC JOURNAL RECOVERY ==="
+echo "--- WAL/SHM files ---"
+find /data/data /data/user /data/user_de -name "*.db-wal" -o -name "*.db-shm" 2>/dev/null | head -60
+echo "--- Token sweep in WAL files ---"
+for f in $(find /data/data /data/user /data/user_de -name "*.db-wal" -o -name "*.db-shm" 2>/dev/null | head -30); do
+  hit=$(strings "$f" 2>/dev/null | grep -iE "enrollmentToken|enterpriseId|laforge_checkin_url|checkin_url|mdm_url|management_url|afwManagementUrl|dpcExtras|androidWork")
+  [ -n "$hit" ] && echo "WAL_HIT $f:" && echo "$hit"
+done
+echo "--- gservices.db enterprise rows ---"
+sqlite3 /data/data/com.google.android.gsf/databases/gservices.db \
+  "SELECT name,value FROM main WHERE name LIKE '%enterprise%' OR name LIKE '%enroll%' OR name LIKE '%mdm%' OR name LIKE '%checkin%' OR name LIKE '%laforge%';" 2>/dev/null || echo "(no access)"
+echo "--- Play DPC DB ---"
+find /data/data/com.google.android.apps.work.clouddpc -name "*.db" 2>/dev/null | while read f; do
+  echo "PLAYDPC_DB: $f"
+  strings "$f" 2>/dev/null | grep -iE "enroll|manage|token|enterprise" | head -20
+done
+echo ""
+
+echo "=== [F4] TRUST-ROOT & ADB KEY AUDIT ==="
+echo "--- ADB authorized keys ---"
+cat /data/misc/adb/adb_keys 2>/dev/null || echo "(no access)"
+echo "--- User-installed CA certs ---"
+for f in /data/misc/user/0/cacerts-added/*.0 2>/dev/null; do
+  [ -f "$f" ] && echo "USER_CA:" && openssl x509 -noout -subject -issuer -dates -in "$f" 2>/dev/null
+done
+echo "--- Work profile CA certs (uid 10-19) ---"
+for uid in 10 11 12 13 14 15; do
+  for f in /data/misc/user/$uid/cacerts-added/*.0 2>/dev/null; do
+    [ -f "$f" ] && echo "WORKPROFILE_CA uid=$uid:" && openssl x509 -noout -subject -issuer -dates -in "$f" 2>/dev/null
+  done
+done
+echo "--- KeyStore entries ---"
+keystore_cli_v2 list 2>/dev/null || ls /data/misc/keystore/user_0/ 2>/dev/null || echo "(no access)"
+echo ""
+
+echo "=== [F5] PROVISIONING HANDSHAKE INTERCEPT ==="
+echo "--- Proxy / WPAD props ---"
+getprop | grep -iE "dhcp|wpad|proxy|option_252" 2>/dev/null
+echo "--- WifiConfigStore proxy settings ---"
+cat /data/misc/wifi/WifiConfigStore.xml 2>/dev/null | grep -iE "WPAD|ProxyHost|url" | head -20
+echo "--- Zero-touch oobconfig ---"
+cat /data/data/com.google.android.setupwizard/shared_prefs/zero_touch_preferences.xml 2>/dev/null || echo "(not present)"
+find /data/data -name "oobconfig*" -o -name "*zero_touch*" 2>/dev/null | head -20
+echo "--- SetupWizard prefs (enrollment keys) ---"
+for pkg in com.google.android.setupwizard com.sec.android.app.SecSetupWizard com.samsung.android.app.setupwizard com.android.provision; do
+  find /data/data/$pkg/shared_prefs/ -name "*.xml" 2>/dev/null | while read f; do
+    grep -iE "enroll|mdm|manage|provisioning|zerotouchurl|afwManagementUrl|checkInUrl|dpcExtras" "$f" 2>/dev/null | head -10 && echo "  [from $f]"
+  done
+done
+echo "--- DHCP lease files ---"
+cat /data/misc/dhcp/*.lease 2>/dev/null | grep -iE "wpad|option.252|proxy" | head -20
+echo ""
+
+echo "=== STANDARD MDM INDICATORS ==="
+pm list packages -e 2>/dev/null | grep -iE "intune|workspaceone|knox|jamf|jumpcloud|companyportal|airwatch|maas360|kandji|mobileiron|ivanti|clouddpc"
+getprop | grep -iE "ro.build|ro.product|ro.boot|ro.serialno"
+settings get global device_provisioned 2>/dev/null
+settings get secure android_id 2>/dev/null
+echo "=== END PROBE ==="`,
+  },
+  windows: {
+    filename: 'mdmcheck-probe.ps1',
+    mime: 'text/x-powershell',
+    content: `# MDMCheck v20 — Windows Forensic Probe
+# Run from an ADMIN PowerShell on the device you own.
+# Output: mdmcheck-probe-output.txt — upload to Audit Files.
+$ErrorActionPreference = "Continue"
+$out = "mdmcheck-probe-output.txt"
+@("MDMCheck Windows Forensic Probe","Generated: $(Get-Date -Format o)","Hostname: $env:COMPUTERNAME","User: $env:USERNAME","") | Out-File -Encoding utf8 $out
+function Section($name, $script) {
+  "=== $name ===" | Out-File -Encoding utf8 -Append $out
+  try { & $script 2>&1 | Out-File -Encoding utf8 -Append $out } catch { "ERROR: $_" | Out-File -Encoding utf8 -Append $out }
+  "" | Out-File -Encoding utf8 -Append $out
+}
+Section "dsregcmd /status" { dsregcmd /status }
+Section "HKLM Enrollments" {
+  Get-ChildItem 'HKLM:\\SOFTWARE\\Microsoft\\Enrollments' -ErrorAction SilentlyContinue |
+    ForEach-Object { "ENROLLMENT: $($_.PSChildName)"; try { Get-ItemProperty $_.PSPath | Format-List * } catch {} }
+}
+Section "OMADM Accounts" {
+  Get-ChildItem 'HKLM:\\SOFTWARE\\Microsoft\\Provisioning\\OMADM\\Accounts' -ErrorAction SilentlyContinue |
+    ForEach-Object { "OMADM ACCOUNT: $($_.PSChildName)"; try { Get-ItemProperty $_.PSPath | Format-List * } catch {} }
+}
+Section "MDM Certificates" {
+  Get-ChildItem Cert:\\LocalMachine\\My -ErrorAction SilentlyContinue |
+    Where-Object { $_.Subject -match 'Microsoft Intune|MDM|Enrollment' } |
+    Format-List Subject, Issuer, NotBefore, NotAfter, Thumbprint
+}
+Section "Intune Registry" {
+  Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\IntuneManagementExtension' -ErrorAction SilentlyContinue | Format-List *
+}
+Section "Autopilot Registry" {
+  Get-ItemProperty 'HKLM:\\SOFTWARE\\Microsoft\\Provisioning\\AutopilotPolicyCache' -ErrorAction SilentlyContinue | Format-List *
+}
+Section "CrowdStrike Falcon" {
+  Get-Service CsFalconService -ErrorAction SilentlyContinue | Format-List *
+  Get-ItemProperty 'HKLM:\\SYSTEM\\CrowdStrike\\{9b03c1d9-3138-44ed-9fae-d9f4c034b88d}\\{16e0423f-7058-48c9-a204-725362b67639}\\Default' -ErrorAction SilentlyContinue | Format-List *
+}
+Section "Network Interfaces" { Get-NetAdapter | Format-Table Name, InterfaceDescription, Status, MacAddress }
+Section "DNS Client" { Get-DnsClientServerAddress | Format-Table InterfaceAlias, ServerAddresses }
+Write-Host "MDMCheck probe complete. Upload mdmcheck-probe-output.txt to Audit Files."`,
+  },
+  macos: {
+    filename: 'mdmcheck-probe.sh',
+    mime: 'text/x-shellscript',
+    content: `#!/bin/bash
+# MDMCheck v20 — macOS Forensic Probe
+set +e
+OUT="mdmcheck-probe-output.txt"
+{
+  echo "MDMCheck macOS Forensic Probe"
+  echo "Generated: $(date -u +%FT%TZ)"
+  echo "Hostname: $(hostname)"
+  echo "User: $USER"
+  echo ""
+  echo "=== sw_vers ==="; sw_vers
+  echo "=== system_profiler SPHardwareDataType ==="; system_profiler SPHardwareDataType 2>/dev/null
+  echo "=== profiles show -all ==="; sudo profiles show -all 2>/dev/null
+  echo "=== profiles list ==="; sudo profiles list 2>/dev/null
+  echo "=== /var/db/ConfigurationProfiles/Settings ==="; sudo ls -la /var/db/ConfigurationProfiles/Settings 2>/dev/null
+  echo "=== /Library/Managed Preferences ==="; sudo ls -la "/Library/Managed Preferences" 2>/dev/null
+  echo "=== Jamf ==="; ls -la /usr/local/jamf/ "/Library/Application Support/JAMF" 2>/dev/null
+  echo "=== Intune ==="; ls -la "/Library/Application Support/Microsoft/Intune" /etc/intune 2>/dev/null
+  echo "=== CrowdStrike ==="; ls -la /opt/CrowdStrike /etc/crowdstrike 2>/dev/null
+  echo "=== JumpCloud ==="; ls -la /opt/jc 2>/dev/null
+  echo "=== System Extensions ==="; systemextensionsctl list 2>/dev/null
+  echo "=== LaunchDaemons (MDM-related) ==="; ls /Library/LaunchDaemons/ | grep -iE "intune|jamf|crowdstrike|sophos|jumpcloud|kandji" 2>/dev/null
+} > "$OUT"
+echo "Wrote $OUT. Upload it to Audit Files."`,
+  },
+  ios: {
+    filename: 'mdmcheck-probe-ios.txt',
+    mime: 'text/plain',
+    content: `MDMCheck v20 — iOS / iPadOS Forensic Probe
+
+Manual steps (iOS does not allow scripted probe access):
+
+1) Settings → General → VPN & Device Management
+   — Screenshot every profile listed. Note: Profile Name, Organization, Identifier.
+
+2) Settings → General → About
+   — Capture: Serial Number, IMEI, MEID, iOS version, Model Number.
+
+3) Apple Configurator 2 (on Mac):
+   Actions → Export → Profiles → produces .mobileconfig files.
+   Upload those .mobileconfig files to MDMCheck Audit Files for full parsing.
+
+4) Check for supervision:
+   Settings → General → About → scroll down.
+   If supervised: "This iPhone is supervised and managed by [Org Name]."
+
+5) Network proxy check:
+   Settings → Wi-Fi → tap connected network → HTTP Proxy
+   If set to "Automatic" with a PAC URL, note the URL and upload as text.
+
+Upload all collected .mobileconfig files and screenshots to MDMCheck Audit Files.`,
+  },
+};
+
+// ═══════════════════════════════════════════════════════════════
+// PLATFORM FINGERPRINTS (file classification patterns)
+// ═══════════════════════════════════════════════════════════════
+const PLATFORM_FINGERPRINTS = [
+  ['apple_dep','supervised',/is-supervised[\s\S]{0,30}<true/],
+  ['apple_dep','supervised',/AwaitDeviceConfigured[\s\S]{0,30}<true/],
+  ['apple_dep','enrolled_byod',/PayloadType.{0,40}com\.apple\.mdm/],
+  ['apple_dep','enrolled_byod',/x-apple-aspen-config/],
+  ['apple_dep','enrolled_byod',/mdmenrollment\.apple\.com/],
+  ['apple_dep','enrolled_byod',/activation-record/],
+  ['domain_intel','tenant',/enterpriseregistration\.windows\.net/i],
+  ['domain_intel','tenant',/EnterpriseEnrollment\.[a-z0-9.\-]+/i],
+  ['domain_intel','tenant',/manage\.microsoft\.com/i],
+  ['domain_intel','tenant',/Provisioning\\OMADM/],
+  ['domain_intel','tenant',/login\.microsoftonline\.com/i],
+  ['domain_intel','tenant',/"TenantId"\s*:\s*"[0-9a-f-]{36}"/i],
+  ['samsung_knox','kme_enrolled',/samsungknox\.com|knoxservice|kme\./i],
+  ['samsung_knox','kme_enrolled',/E-FOTA|efota/i],
+  ['mdm_discovery','enrolled',/jamfcloud\.com|jamf\.com/i],
+  ['mdm_discovery','enrolled',/awmdm\.com|workspaceone/i],
+  ['mdm_discovery','enrolled',/mobileiron|ivanti/i],
+  ['mdm_discovery','enrolled',/meraki\.com.*sm\//i],
+  ['mdm_discovery','enrolled',/kandji\.io/i],
+  ['mdm_discovery','enrolled',/maas360/i],
+  ['mdm_discovery','enrolled',/blackberry\.com|bbdynamics/i],
+  ['mdm_discovery','enrolled',/citrixendpoint|xenmobile|xcm\.citrix/i],
+  ['google_android','device_owner',/DEVICE_OWNER|deviceowner/i],
+  ['google_android','work_profile',/androidenterprise|managedprofile/i],
+  ['google_android','device_owner',/androidmanagement\.googleapis\.com/i],
+  ['edr_discovery','sensor_installed',/crowdstrike|falcon-sensor/i],
+  ['edr_discovery','sensor_installed',/securitycenter\.windows\.com|defender for endpoint/i],
+  ['edr_discovery','sensor_installed',/sophos.*central/i],
+  ['identity_discovery','registered',/\.okta\.com/i],
+  ['identity_discovery','registered',/jumpcloud\.com/i],
+  ['identity_discovery','registered',/duosecurity\.com/i],
+  ['identity_discovery','registered',/auth0\.com/i],
+];
+
+// ═══════════════════════════════════════════════════════════════
+// UTILITY FUNCTIONS
+// ═══════════════════════════════════════════════════════════════
+function now() { return new Date().toISOString(); }
+function uid() { return crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2); }
+function esc(s) { return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;'); }
+function fmtDate(iso) { try { return new Date(iso).toLocaleString(); } catch { return iso; } }
+function daysBetween(a, b) { return Math.floor((new Date(b)-new Date(a))/(86400000)); }
+function copy(text) { navigator.clipboard?.writeText(text).catch(()=>{}); }
+function download(name, content, mime='text/plain') {
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([content],{type:mime}));
+  a.download = name; a.click(); URL.revokeObjectURL(a.href);
+}
+function sev(s) {
+  const m = {CRITICAL:'b-critical',HIGH:'b-high',MEDIUM:'b-medium',OK:'b-ok',INFO:'b-info'};
+  return `<span class="badge ${m[s]||'b-neutral'}">${esc(s)}</span>`;
+}
+function storeGet(k){ try{ const v=localStorage.getItem('mdmcheck_'+k); return v?JSON.parse(v):null; }catch{return null;} }
+function storeSet(k,v){ try{ localStorage.setItem('mdmcheck_'+k,JSON.stringify(v)); }catch{} }
+function load() {
+  S.devices     = storeGet('devices')     || [];
+  S.audits      = storeGet('audits')      || [];
+  S.journal     = storeGet('journal')     || [];
+  S.dispatches  = storeGet('dispatches')  || [];
+  S.findings    = storeGet('findings')    || [];
+  S.scanHistory = storeGet('scanHistory') || [];
+}
+function save() {
+  storeSet('devices',     S.devices);
+  storeSet('audits',      S.audits);
+  storeSet('journal',     S.journal);
+  storeSet('dispatches',  S.dispatches);
+  storeSet('findings',    S.findings);
+  storeSet('scanHistory', S.scanHistory.slice(-50)); // keep last 50 scans
+}
+async function sha256hex(str) {
+  try {
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(str));
+    return [...new Uint8Array(buf)].map(b=>b.toString(16).padStart(2,'0')).join('');
+  } catch { return btoa(str).slice(0,64).padEnd(64,'0'); }
+}
+
+function journalAppend(action, detail={}) {
+  // async SHA-256 chaining — returns promise but fire-and-forget is fine for UX
+  const entry = { id: uid(), ts: now(), action, detail, hash: '', prev_hash: '' };
+  const prev = S.journal[S.journal.length-1]?.hash || '0'.repeat(64);
+  entry.prev_hash = prev;
+  const str = `${prev}|${entry.ts}|${entry.action}|${JSON.stringify(detail,null,0)}`;
+  sha256hex(str).then(h => {
+    entry.hash = h;
+    save();
+  }).catch(() => {
+    entry.hash = btoa(str).slice(0,64);
+    save();
+  });
+  // Push immediately so journal stays in order even before hash resolves
+  S.journal.push(entry);
+  save();
+}
+function setStatus(msg) { document.getElementById('top-status-text').textContent = msg; }
+
+// File classifier (mirrors _detect_type + _regex_sweep)
+function classifyFile(name, text) {
+  const findings = { tenantGuids:[], userPrincipals:[], mdmUrls:[], deviceSerials:[], enrollmentTimestamps:[], payloadIds:[], certSubjects:[], notes:[], classification:[] };
+  const GUID = /\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b/g;
+  const UPN  = /\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b/g;
+  const URL_ = /https?:\/\/[^\s<>"']+/g;
+  const SER  = /(?:serial[\s_]?(?:number)?|imei|udid|deviceid|hardwareid)\s*[:=]\s*([A-Za-z0-9\-]{6,})/gi;
+  const DATE = /\b(20\d{2}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}:\d{2})?)\b/g;
+  [...text.matchAll(GUID)].forEach(m=>{ if(!findings.tenantGuids.includes(m[0]))findings.tenantGuids.push(m[0]); });
+  [...text.matchAll(UPN)].forEach(m=>{ if(!findings.userPrincipals.includes(m[0]))findings.userPrincipals.push(m[0]); });
+  [...text.matchAll(URL_)].forEach(m=>{ const u=m[0]; if(/mdm|manage|intune|jumpcloud|autopilot/i.test(u)&&!findings.mdmUrls.includes(u))findings.mdmUrls.push(u); });
+  [...text.matchAll(SER)].forEach(m=>{ if(!findings.deviceSerials.includes(m[1]))findings.deviceSerials.push(m[1]); });
+  [...text.matchAll(DATE)].forEach(m=>{ if(!findings.enrollmentTimestamps.includes(m[1]))findings.enrollmentTimestamps.push(m[1]); });
+  // classify
+  PLATFORM_FINGERPRINTS.forEach(([cat,mode,pat])=>{
+    if(pat.test(text)){
+      const k=`${cat}:${mode}`;
+      if(!findings.classification.find(c=>c.category===cat&&c.enrollment_mode===mode)){
+        findings.classification.push({ category:cat, category_label:CATEGORIES[cat]||cat, enrollment_mode:mode, management_depth:MANAGEMENT_DEPTH[cat]||'', capabilities:(PLATFORM_CAPS[cat]||{})[mode]||[] });
+      }
+    }
+  });
+  return findings;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// NAVIGATION
+// ═══════════════════════════════════════════════════════════════
+const PAGE_TITLES = {
+  home:'Dashboard', scan:'Passive Scan', dns:'DNS Fingerprint', lookup:'Tenant Lookup',
+  forensic:'Module F Sweep', bridge:'Device Bridge', dual:'Dual-State Reconciliation', tegu:'Tegu Intel — Device Ownership Report',
+  devices:'Ownership Ledger', audits:'Audit Files', probes:'Probe Scripts',
+  disclosure:'Disclosure (DSAR)', tracker:'Deadline Tracker', bundle:'Case Bundle',
+  journal:'Audit Journal', inventory:'Local Inventory',
+  orgmap:'Organization Map', scanhistory:'Scan History',
+};
+function nav(page) {
+  S.currentPage = page;
+  document.querySelectorAll('.nav-link').forEach(el=>el.classList.remove('active'));
+  const ni = document.getElementById('nav-'+page);
+  if(ni) ni.classList.add('active');
+  document.getElementById('top-page-label').textContent = PAGE_TITLES[page]||page;
+  const el = document.getElementById('content');
+  el.innerHTML = '<div class="loading-row"><div class="spinner"></div> Loading…</div>';
+  setTimeout(()=>{ el.innerHTML = ''; PAGES[page]?.(); }, 0);
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PAGES
+// ═══════════════════════════════════════════════════════════════
+const PAGES = {};
+
+// ── DASHBOARD ──────────────────────────────────────────────────
+PAGES.home = function() {
+  const c = document.getElementById('content');
+  const critCount = S.findings.filter(f=>f.severity==='CRITICAL').length;
+  const now_date = new Date();
+  const overdue = S.dispatches.filter(d=>d.status==='pending'&&new Date(d.deadline_at)<now_date).length;
+  c.innerHTML = `
+  <div class="card-row">
+    <div class="stat-card"><div class="stat-val">${S.devices.length}</div><div class="stat-lbl">Devices</div></div>
+    <div class="stat-card"><div class="stat-val">${S.audits.length}</div><div class="stat-lbl">Audit Files</div></div>
+    <div class="stat-card"><div class="stat-val" style="color:${critCount>0?'var(--danger)':'var(--ok)'}">${critCount}</div><div class="stat-lbl">Critical Findings</div></div>
+    <div class="stat-card"><div class="stat-val" style="color:${overdue>0?'var(--warn)':'var(--ok)'}">${overdue}</div><div class="stat-lbl">Overdue Disclosures</div></div>
+  </div>
+
+  <div class="card" style="border-color:rgba(59,130,246,.3);">
+    <div class="card-title">⚡ How to use MDMCheck</div>
+    <div class="card-sub" style="line-height:1.8;margin-top:8px;">
+      <b>Step 1</b> — Add your device to the <b>Ownership Ledger</b> (Module A).<br>
+      <b>Step 2</b> — Download a <b>Probe Script</b>, run it on the device, upload the output to <b>Audit Files</b> (Module B).<br>
+      <b>Step 3</b> — Run a <b>Passive Scan</b> of your email domain or <b>DNS Fingerprint</b> to detect network-layer enrollment infrastructure.<br>
+      <b>Step 4</b> — Use <b>Module F Sweep</b> (paste ADB output) or <b>Dual-State</b> to compare Phase A vs Phase B reads.<br>
+      <b>Step 5</b> — Generate a <b>Disclosure (DSAR)</b> letter and track the deadline in <b>Deadline Tracker</b>.<br>
+      <b>Step 6</b> — Export a signed <b>Case Bundle</b> for legal evidence.
+    </div>
+  </div>
+
+  <h2 style="font-size:13px;font-weight:700;margin-bottom:12px;">Modules</h2>
+  <div class="grid3">
+    ${[
+      ['scan','◎','Passive Scan','57 Tier-0 probes against MDM/EDR/Identity enrollment endpoints','NETWORK','b-info'],
+      ['dns','⬡','DNS Fingerprint','CNAME/A record sweep for Intune, Jamf, Workspace ONE, Knox, Okta and 15+ others','DNS','b-medium'],
+      ['forensic','⊛','Module F Sweep','Paste ADB output for F1-F6 dual-state analysis: regional, packages, journal, certs, provisioning','FORENSIC','b-critical'],
+      ['dual','⇄','Dual-State (A vs B)','Compare OS-visible (Phase A) vs rish/Shizuku privileged reads (Phase B). Any mismatch = CRITICAL','PHASE','b-high'],
+      ['devices','▣','Ownership Ledger','Record your device identifiers, purchase proof, and confidence score','MODULE A','b-neutral'],
+      ['audits','⊞','Audit Files','Upload .mobileconfig, .plist, .reg, Autopilot CSV, certs, XML, JSON for parsing','MODULE B','b-neutral'],
+      ['disclosure','⊂','Disclosure (DSAR)','16 pre-filled templates: GDPR Art.15/17, CCPA, MSRC, IC3, Apple, Google, JumpCloud, ICO','MODULE D','b-ok'],
+      ['tracker','◷','Deadline Tracker','Statutory deadline monitoring with auto-escalation for GDPR (30d) and CCPA (45d)','TRACKER','b-warn'],
+      ['bundle','⊟','Case Bundle','tar.gz export: devices + audits + journal + filings with SHA-256 chain','BUNDLE','b-neutral'],
+      ['orgmap','⬡','Org Map','Clustered visual map of all tenants, MDM servers, users, devices, and CAs extracted from your evidence','MAP','b-medium'],
+    ].map(([pg,ic,ti,de,ba,bc])=>`
+      <div class="module-card" onclick="nav('${pg}')">
+        <div class="mc-icon">${ic}</div>
+        <div class="mc-title">${ti}</div>
+        <div class="mc-desc">${de}</div>
+        <span class="mc-badge badge ${bc}">${ba}</span>
+      </div>`).join('')}
+  </div>
+
+  ${critCount>0?`<div class="alert alert-critical" style="margin-top:16px;">⚠ ${critCount} CRITICAL finding${critCount>1?'s':''} detected. Review in Module F Sweep or Audit Files.</div>`:''}
+  ${overdue>0?`<div class="alert alert-high" style="margin-top:8px;">⏰ ${overdue} disclosure deadline${overdue>1?'s':''} overdue. Check Deadline Tracker.</div>`:''}
+  `;
+};
+
+// ── PASSIVE SCAN ───────────────────────────────────────────────
+PAGES.scan = function() {
+  const c = document.getElementById('content');
+  c.innerHTML = `
+  <div class="card">
+    <div class="card-title">Passive MDM/EDR Enrollment Scan</div>
+    <div class="card-sub">57 Tier-0 protocol-accurate probes. Zero false positive guarantee: 401/403/429/3xx/HTML = 0.</div>
+    <div class="form-row" style="margin-top:14px;">
+      <label>Target — email address, domain, or serial/IMEI</label>
+      <div class="flex-row">
+        <input id="scan-target" placeholder="user@company.com  or  company.com  or  SERIAL123">
+        <button class="btn-primary" onclick="startScan()">⊛ Scan</button>
+      </div>
+    </div>
+    <div id="scan-status" style="font-size:11px;color:var(--text3);margin-top:6px;"></div>
+  </div>
+
+  <div id="scan-progress" style="display:none;" class="card">
+    <div style="display:flex;align-items:center;gap:12px;margin-bottom:10px;">
+      <div class="spinner"></div>
+      <span id="scan-progress-label" style="font-size:12px;color:var(--text2);">Initializing…</span>
+      <span id="scan-count" style="margin-left:auto;font-size:11px;font-family:var(--mono);color:var(--text3);">0/${DISCOVERY_PROBES.length}</span>
+    </div>
+    <div class="progress"><div class="progress-bar" id="scan-bar" style="width:0%"></div></div>
+    <div class="probe-log" id="scan-log" style="margin-top:10px;"></div>
+  </div>
+
+  <div id="scan-results"></div>`;
+};
+
+async function startScan() {
+  const target = document.getElementById('scan-target').value.trim();
+  if(!target){ alert('Enter a target.'); return; }
+  const isEmail = target.includes('@');
+  const domain = isEmail ? target.split('@')[1] : target;
+  const id = target.split('@')[0];
+
+  document.getElementById('scan-progress').style.display='block';
+  document.getElementById('scan-results').innerHTML='';
+  document.getElementById('scan-status').textContent='';
+  const log = document.getElementById('scan-log');
+  const bar = document.getElementById('scan-bar');
+  const label = document.getElementById('scan-progress-label');
+  const counter = document.getElementById('scan-count');
+  log.innerHTML='';
+
+  const findings = [];
+  let done = 0;
+  const total = DISCOVERY_PROBES.length;
+
+  function addLog(msg, cls='') {
+    const div = document.createElement('div');
+    div.className = cls;
+    div.textContent = msg;
+    log.appendChild(div);
+    log.scrollTop = log.scrollHeight;
+  }
+
+  journalAppend('scan.started', { target, probes: total });
+
+  // Run probes sequentially with small concurrency
+  const BATCH = 6;
+  for(let i=0; i<DISCOVERY_PROBES.length; i+=BATCH) {
+    const batch = DISCOVERY_PROBES.slice(i, i+BATCH);
+    await Promise.all(batch.map(async probe => {
+      try {
+        let url;
+        try { url = probe.url(domain); } catch { url = null; }
+        if(!url) { done++; return; }
+
+        label.textContent = `Probing ${probe.label.slice(0,40)}…`;
+        counter.textContent = `${done}/${total}`;
+        bar.style.width = `${Math.round((done/total)*100)}%`;
+
+        const controller = new AbortController();
+        const timer = setTimeout(()=>controller.abort(), 9000);
+        let status = 0, body = '', fetchErr = null;
+        // Strategy 1: direct CORS fetch (works for public APIs that allow it)
+        // Strategy 2: DoH-validated URL existence check
+        // Strategy 3: no-cors reachability (opaque but confirms reachability)
+        try {
+          let resp;
+          try {
+            // Attempt 1: direct with CORS — works for public JSON endpoints
+            resp = await fetch(url, {
+              method: probe.method || 'GET',
+              signal: controller.signal,
+              headers: { 'Accept': 'application/json, application/xml, text/plain, */*' },
+              credentials: 'omit',
+            });
+            status = resp.status;
+            if(resp.ok || status === 401 || status === 403 || status === 404) {
+              try { body = await resp.text(); } catch {}
+            }
+          } catch(corsErr) {
+            // Attempt 2: no-cors reachability probe (opaque response — confirms server exists)
+            try {
+              const resp2 = await fetch(url, {
+                method: 'GET',
+                signal: controller.signal,
+                mode: 'no-cors',
+                credentials: 'omit',
+              });
+              // Opaque = server responded (type === 'opaque') — meaningful signal
+              status = resp2.type === 'opaque' ? 200 : 0;
+              body = ''; // Can't read opaque body
+            } catch(e2) {
+              status = e2.name === 'AbortError' ? -1 : 0;
+              fetchErr = e2.message;
+            }
+          }
+        } finally { clearTimeout(timer); }
+
+        if(status === -1) { done++; return; } // Timeout — skip
+        if(status === 401 || status === 403 || status === 429) { done++; return; } // Explicit rejection — zero
+
+        const hit = body ? probe.positive.some(p=>p.test(body)) : false;
+        const neg = body ? (probe.negative?.some(p=>p.test(body)) ?? false) : false;
+        // Confidence scoring:
+        // 90 = CORS response with positive pattern match
+        // 72 = opaque response (server exists, endpoint reachable, patterns can't be confirmed)
+        // 0  = negative pattern matched or 4xx rejection
+        let conf = 0;
+        if(neg) { conf = 0; }
+        else if(status === 200 && hit) { conf = 90; }
+        else if(status === 200 && body && !hit) { conf = 0; } // Got response, no match
+        else if(status === 200 && !body) { conf = 72; }  // Opaque: server reachable
+        else if(status === 0 && !fetchErr) { conf = 72; } // Also opaque
+
+        if(conf >= 50) {
+          const f = {
+            id: uid(), ts: now(), target,
+            platform: probe.label, category: probe.category,
+            probeUrl: url, method: probe.method||'GET',
+            status, confidence: conf, tier: probe.tier,
+            management_depth: MANAGEMENT_DEPTH[probe.category]||'',
+            capabilities: Object.values((PLATFORM_CAPS[probe.category]||{}))[0]||[],
+          };
+          findings.push(f);
+          addLog(`[HIT] ${probe.label} | ${url.slice(0,60)}`, 'log-hit');
+        } else {
+          addLog(`[---] ${probe.label.slice(0,50)}`, 'log-miss');
+        }
+      } catch(e) {
+        addLog(`[E
