@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  deploy_ironring.sh  —  IronRing OCI Multi-Compartment Deploy  (v3)
+#  deploy_ironring_v3.sh  —  IronRing OCI Multi-Compartment Deploy  (v3)
 #  Region: us-phoenix-1  |  Shape: A1.Flex (Always Free) w/ fallback
 #  Instances: n8n-Docker (Traefik+n8n), ubuntu-Node, netstack-Docker (WireGuard)
 #  Ubuntu 24.04 LTS  |  Docker via cloud-init  |  Dual NSG (public/private)
