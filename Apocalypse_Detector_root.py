@@ -1,22 +1,20 @@
 #!/data/data/com.termux/files/usr/bin/python3
 """
-Apocalypse Detector v5.5 – The Professional's Choice
-- Full DNS with TCP fallback (proper length-looped TCP read)
-- Optimised /proc scanning
-- Robust threat intel validation with cross-run domain resolution caching
-- Enhanced ADB detection
-- Granular, whitelist-configurable SELinux context checks
-- Deep hidden-network analysis: sysfs-vs-netlink interface hiding, policy
-  routing, hidden network namespaces (with unavailable-vs-clean distinction),
-  mangle/raw table TPROXY/MARK/NOTRACK across both iptables and nftables,
-  hidden listening sockets (ss with netstat fallback), DNS config mismatch,
-  ARP spoofing heuristics (with false-positive disclaimer)
-- Certificate validation across all DNS-cross-checked IPs, not just the first
-- Scoped (not filesystem-wide) persistence scan with batched grep
-- --quick mode to skip expensive checks
-- --output-dir to relocate all state/reports
-- HTML report
-- Verbose mode
+v5.11 — third real scan (score down to 20/LOW) surfaced two more:
+- Policy-routing allowlist didn't recognize "from all unreachable" rules
+  (seen at priority 32000). This is Android's own network-gating pattern
+  — used to fail traffic closed for UIDs/networks that shouldn't have
+  connectivity — the opposite of a hijack if anything. Added as a third
+  recognized standard pattern.
+- Hidden-process check's v5.10 cmdline filter was correct, but the real
+  cause was one level deeper: cross-referencing the "hidden" PIDs against
+  a known-good full ps dump showed they're legitimate named vendor/HAL
+  daemons (vndservicemanager, media.drm@1.4-service.clearkey,
+  gnss-service, fdrcontrol) — real, non-kernel-thread processes that
+  "ps -A -o pid" (the custom column-format invocation) was silently
+  dropping on this toybox/ps build, while the same processes list fine
+  under plain "ps -A". Switched to parsing PIDs from the default listing
+  format instead of relying on -o pid.
 """
 
 import subprocess
@@ -30,6 +28,7 @@ import socket
 import struct
 import ssl
 import random
+import ipaddress
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -80,11 +79,11 @@ DEFAULT_WHITELIST = {
     "vpn_interfaces": ["tun0", "wg0", "ppp0"],
     "safe_kernel_modules": ["nf_nat", "nf_conntrack", "iptable_filter", "bridge", "ip_tunnel", "xfrm", "tun"],
     "safe_processes": ["netd", "dnsmasq", "sshd", "keystore", "servicemanager", "logd", "vold", "healthd", "adb"],
-    "trusted_ca_orgs": ["DigiCert", "Let's Encrypt", "GlobalSign", "Amazon", "Cloudflare", "Google Trust Services"],
+    "trusted_ca_orgs": ["DigiCert", "Let's Encrypt", "GlobalSign", "Amazon", "Cloudflare", "Google Trust Services",
+                        "Microsoft Corporation", "Sectigo", "Entrust", "GoDaddy", "IdenTrust", "ISRG"],
     "cdn_prefixes": ["104.16.", "172.64.", "162.159.", "151.101.", "142.250.", "172.217.", "142.251.", "34.120.", "35.186.", "34.64."],
     "system_binaries": ["/system/bin/sh", "/system/bin/netd", "/system/bin/su", "/system/bin/init", "/system/bin/app_process64"],
     "trusted_dns_resolvers": ["8.8.8.8", "1.1.1.1", "9.9.9.9", "80.80.80.80", "77.88.8.8"],
-    "risk_weights": {"default": 3, "critical": 8, "high": 5, "medium": 3, "low": 1},
     "score_thresholds": {"low": 30, "medium": 60},
     # Expected SELinux contexts per critical binary — now user-extensible via
     # whitelist.json instead of being hardcoded only inside check_system().
@@ -211,10 +210,14 @@ def check_system():
         alerts.append(pl('CAUTION', 2, "No baseline file; run with --create-baseline", "Integrity checks skipped"))
 
     out,_,_ = run(["ls", "-l", "/system/bin/su", "/system/xbin/su", "/sbin/su"])
+    ps_out,_,_ = run(["ps", "-A"])
+    root_daemon = re.search(r'\b(magiskd|ksud|apd|apatch)\b', ps_out, re.I)
     if out:
         alerts.append(pl('OK', 0, "SU binaries present"))
+    elif root_daemon:
+        alerts.append(pl('OK', 0, f"No su at legacy paths, but a root-manager daemon is running ({root_daemon.group(1)}) — normal for modern Magisk/KernelSU/APatch, which broker su via daemon rather than a persistent binary"))
     else:
-        alerts.append(pl('CAUTION', 2, "SU binaries missing (unusual)", out))
+        alerts.append(pl('CAUTION', 2, "SU binaries missing and no known root-manager daemon found (unusual, though the script's own root requirement confirms some root path exists)", out))
     return alerts
 
 def check_network():
@@ -279,9 +282,34 @@ def check_hidden_network():
     # ever creating an obvious tun/wg interface.
     out,_,_ = run(["ip", "rule", "show"])
     default_rules = {"0:\tfrom all lookup local", "32766:\tfrom all lookup main", "32767:\tfrom all lookup default"}
-    extra_rules = [l for l in out.splitlines() if l.strip() and l.strip() not in default_rules]
+    # Android's netd manages a substantial set of its own standard policy
+    # routing rules (per-UID app routing, legacy VPN compatibility tables,
+    # explicit per-network socket binding, etc.) at several different
+    # priority bands and table names — this is stock infrastructure on
+    # every real device, not evidence of tampering. Only the 3 kernel-
+    # default rules were previously recognized, so this fired on every
+    # single scan; a second real-device scan then showed a valid pattern
+    # (iif lo lookup <ifname>, Android's explicit-network-selection rule)
+    # falling outside the priority range initially allowed for here.
+    android_standard_rule = re.compile(
+        r'lookup (legacy_system|legacy_network|local_network)\b|^1\d{4}:\s|from all unreachable\s*$'
+    )
+    # "iif lo lookup <ifname>" is recognized only when <ifname> is a real
+    # interface actually present on the device (cross-checked against the
+    # sysfs/netlink interface list from step 1) — keeps this from blindly
+    # whitelisting a rule that points at something that doesn't exist.
+    iif_lo_rule = re.compile(r'iif lo(?: fwmark \S+)? lookup (\S+)')
+    known_ifaces = sysfs_ifaces | netlink_ifaces
+    def is_standard_rule(line):
+        if android_standard_rule.search(line):
+            return True
+        m = iif_lo_rule.search(line)
+        return bool(m and m.group(1) in known_ifaces)
+    extra_rules = [l for l in out.splitlines()
+                   if l.strip() and l.strip() not in default_rules
+                   and not is_standard_rule(l)]
     if extra_rules:
-        alerts.append(pl('CAUTION', 5, f"Non-default policy routing rules present ({len(extra_rules)})", extra_rules[0][:100]))
+        alerts.append(pl('CAUTION', 5, f"Non-default, non-standard policy routing rules present ({len(extra_rules)})", extra_rules[0][:100]))
     else:
         alerts.append(pl('OK', 0, "No unexpected policy routing rules"))
 
@@ -300,15 +328,35 @@ def check_hidden_network():
     # 4. mangle/raw tables – TPROXY, packet MARKing for policy routing, and
     # NOTRACK (which hides traffic from conntrack-based monitoring) don't
     # require any nat-table rule at all, so the basic firewall check misses them.
+    def strip_known_benign_chains(text):
+        """Drop rule blocks belonging to known-benign stock Android/OEM
+        chains before keyword matching. Confirmed on real devices: per-UID
+        data-usage MARKing (bw_mangle_*, routectrl_mangle_*), tethering
+        MSS clamp (tetherctrl_mangle_*), idle-timer notifications
+        (idletimer_mangle_*), and empty OEM/vendor security-agent
+        placeholder chains (oem_mangle_*, wakeupctrl_mangle_*, and
+        OEM-branded chains like thinkshield_*) all legitimately use
+        MARK/CONNMARK and are not transparent proxying.
+        """
+        benign_chain = re.compile(
+            r'^Chain (bw_mangle_\w+|routectrl_mangle_\w+|tetherctrl_mangle_\w+|'
+            r'idletimer_mangle_\w+|oem_mangle_\w+|wakeupctrl_mangle_\w+|\w*shield_\w+)\b',
+            re.M
+        )
+        blocks = re.split(r'(?=^Chain )', text, flags=re.M)
+        return '\n'.join(b for b in blocks if not benign_chain.match(b))
+
     out,_,_ = run(["iptables", "-t", "mangle", "-L", "-n", "-v"])
-    if re.search(r'\b(TPROXY|MARK|CONNMARK)\b', out):
-        alerts.append(pl('CAUTION', 5, "mangle table has TPROXY/MARK/CONNMARK rules (possible transparent proxy)", out[:120]))
+    flagged_mangle = strip_known_benign_chains(out)
+    if re.search(r'\b(TPROXY|MARK|CONNMARK)\b', flagged_mangle):
+        alerts.append(pl('CAUTION', 5, "mangle table has TPROXY/MARK/CONNMARK rules outside known-good stock chains (possible transparent proxy)", flagged_mangle[:120]))
     out,_,_ = run(["iptables", "-t", "raw", "-L", "-n", "-v"])
-    if "NOTRACK" in out or "CT" in out:
+    if "NOTRACK" in out or re.search(r'\bCT\b', out):
         alerts.append(pl('CAUTION', 5, "raw table has NOTRACK/CT rules (traffic evading conntrack)", out[:120]))
     out6,_,_ = run(["ip6tables", "-t", "mangle", "-L", "-n", "-v"])
-    if re.search(r'\b(TPROXY|MARK|CONNMARK)\b', out6):
-        alerts.append(pl('CAUTION', 5, "IPv6 mangle table has TPROXY/MARK/CONNMARK rules", out6[:120]))
+    flagged_mangle6 = strip_known_benign_chains(out6)
+    if re.search(r'\b(TPROXY|MARK|CONNMARK)\b', flagged_mangle6):
+        alerts.append(pl('CAUTION', 5, "IPv6 mangle table has TPROXY/MARK/CONNMARK rules outside known-good stock chains", flagged_mangle6[:120]))
     # nftables can implement the exact same tricks (tproxy, mark, ct) without
     # any iptables ruleset existing at all on a modern nft-only kernel.
     nft_out,_,_ = run(["nft", "list", "ruleset"])
@@ -415,14 +463,28 @@ def check_proxy_vpn():
     alerts = []
     ps("📡 Proxy & VPN Settings")
     progress()
-    out,_,_ = run(["settings", "get", "global", "http_proxy"])
-    if out and out != "null":
+    out,err,rc = run(["settings", "get", "global", "http_proxy"])
+    # A failed Binder transaction (e.g. "cmd: Failure calling service
+    # settings: Failed transaction (...)") still prints non-empty,
+    # non-"null" text to stdout on some ROMs/execution contexts. That error
+    # text was being treated as if it were the actual proxy value. Require
+    # the command to have actually succeeded before trusting its output.
+    looks_like_failure = out.lower().startswith(('cmd:', 'exception', 'error', 'failure'))
+    if rc == 0 and out and out != "null" and not looks_like_failure:
         alerts.append(pl('CAUTION', 4, f"Global proxy: {out}", out))
+    elif rc != 0 or looks_like_failure:
+        alerts.append(pl('CAUTION', 1, "Could not query global proxy setting (command failed)", out or err))
     else:
         alerts.append(pl('OK', 0, "No global proxy"))
 
     out,_,_ = run(["dumpsys", "connectivity"])
-    if "vpn" in out.lower():
+    # "vpn" as a bare substring is present in dumpsys connectivity's
+    # structural/header text (mVpns maps, legacy VPN state fields, etc.) on
+    # most devices even with zero VPNs active — that made this fire a
+    # near-universal false "Unknown VPN service" CAUTION. TRANSPORT_VPN is
+    # the actual NetworkCapabilities marker Android sets only on a live,
+    # connected VPN network.
+    if "TRANSPORT_VPN" in out:
         if any(pkg in out for pkg in WL["vpn_apps"]):
             alerts.append(pl('OK', 0, "VPN service from known app"))
         else:
@@ -446,7 +508,17 @@ def check_hosts_dns():
             parts = line.split()
             if len(parts)>=2:
                 ip = parts[0]
-                if not ip.startswith(('127.','::1','192.168.','10.','172.16.','0.0.0.0')):
+                try:
+                    # ipaddress correctly covers the full 172.16.0.0/12 block
+                    # (172.16.x through 172.31.x) plus loopback/link-local —
+                    # the old string-prefix tuple only matched "172.16."
+                    # literally, so e.g. 172.17.x.x (Docker's default bridge)
+                    # or 172.31.x.x (common VPC/VPN range) were false-flagged.
+                    addr = ipaddress.ip_address(ip)
+                    is_local = addr.is_private or addr.is_loopback or addr.is_link_local or addr.is_unspecified
+                except ValueError:
+                    is_local = False  # not a valid IP at all — worth flagging
+                if not is_local:
                     suspicious.append(line)
     if suspicious:
         alerts.append(pl('CAUTION', 3, f"Suspicious /etc/hosts entries: {len(suspicious)}", suspicious[0]))
@@ -463,7 +535,7 @@ def check_processes():
         out,_,_ = run(["netstat", "-tulpn"])
     suspicious = []
     for line in out.splitlines():
-        if '127.0.0.1' in line:
+        if '127.0.0.1' in line or '::1' in line:
             continue
         if 'LISTEN' in line:
             if any(s in line for s in WL["safe_processes"]):
@@ -475,7 +547,7 @@ def check_processes():
         alerts.append(pl('OK', 0, "No suspicious listeners"))
 
     # LD_PRELOAD – optimised: iterate /proc/*/environ in Python
-    preload_found = []
+    preload_found = []       # (pid, preload_value)
     try:
         for pid in os.listdir('/proc'):
             if not pid.isdigit():
@@ -484,15 +556,25 @@ def check_processes():
             try:
                 with open(env_path, 'rb') as f:
                     env_data = f.read()
-                    if b'LD_PRELOAD' in env_data:
-                        preload_found.append(pid)
+                for entry in env_data.split(b'\x00'):
+                    if entry.startswith(b'LD_PRELOAD='):
+                        preload_found.append((pid, entry.split(b'=', 1)[1].decode('utf-8', 'replace')))
+                        break
             except (IOError, PermissionError):
                 continue
     except Exception:
         pass
-    if preload_found:
+    # Termux's own exec wrapper (libtermux-exec-ld-preload.so) works around
+    # Android's W^X restrictions and is a well-known, benign, expected
+    # LD_PRELOAD on any Termux install — not process hooking. Excluding it
+    # avoids flagging the tool's own primary deployment environment as
+    # CRITICAL on every single scan.
+    known_good_preload = re.compile(r'libtermux-exec-ld-preload\.so')
+    unexplained = [(pid, val) for pid, val in preload_found if not known_good_preload.search(val)]
+    termux_only = [(pid, val) for pid, val in preload_found if known_good_preload.search(val)]
+    if unexplained:
         zygote_detected = False
-        for pid in preload_found:
+        for pid, _ in unexplained:
             try:
                 with open(f'/proc/{pid}/cmdline', 'r') as f:
                     cmd = f.read()
@@ -501,23 +583,59 @@ def check_processes():
                         break
             except:
                 continue
+        pids_str = ', '.join(p for p, _ in unexplained[:3])
         if zygote_detected:
-            alerts.append(pl('CAUTION', 2, "LD_PRELOAD in zygote (likely Magisk)", f"PIDs: {', '.join(preload_found[:3])}"))
+            alerts.append(pl('CAUTION', 2, "LD_PRELOAD in zygote (likely Magisk)", f"PIDs: {pids_str}"))
         else:
-            alerts.append(pl('CRITICAL', 7, "LD_PRELOAD detected (possible hooking)", f"PIDs: {', '.join(preload_found[:3])}"))
+            alerts.append(pl('CRITICAL', 7, "LD_PRELOAD detected (possible hooking)", f"PIDs: {pids_str}"))
+    elif termux_only:
+        alerts.append(pl('OK', 0, f"LD_PRELOAD present but matches known-good Termux exec shim ({len(termux_only)} process(es))"))
     else:
         alerts.append(pl('OK', 0, "No LD_PRELOAD"))
 
-    # Hidden processes – compare /proc with ps
+    # Hidden processes – compare /proc with ps. These two views are read at
+    # slightly different instants, so a PID that simply exited in that race
+    # window (extremely common on a busy Android kernel with constant
+    # short-lived kworker/binder threads) will always show up as a
+    # spurious "hidden" PID. Re-check each candidate against /proc right
+    # now — if it's genuinely gone, it just exited normally, not hidden.
     try:
         proc_pids = set([d for d in os.listdir('/proc') if d.isdigit()])
     except:
         proc_pids = set()
-    out,_,_ = run(["ps", "-A", "-o", "pid"])
-    ps_pids = set(out.splitlines())
-    hidden = proc_pids - ps_pids
+    # "ps -A -o pid" (custom column format) was confirmed on a real device
+    # to silently drop certain SELinux-restricted vendor/HAL daemon rows
+    # (vndservicemanager, media.drm, gnss-service, fdrcontrol, etc.) that
+    # the default "ps -A" listing format lists correctly — a toybox/ps
+    # quirk with -o formatting, not anything actually hidden. Parse PIDs
+    # from the default listing instead (PID is the 2nd whitespace-
+    # separated column on this ps build, confirmed from real output).
+    out,_,_ = run(["ps", "-A"])
+    ps_pids = set()
+    for line in out.splitlines()[1:]:  # skip header row
+        parts = line.split()
+        if len(parts) >= 2 and parts[1].isdigit():
+            ps_pids.add(parts[1])
+    candidates = proc_pids - ps_pids
+    still_present = [pid for pid in candidates if os.path.exists(f'/proc/{pid}')]
+    # Real-device testing showed this wasn't primarily a race condition —
+    # the same small set of low-numbered PIDs recurred across separate
+    # scans, meaning this ps build simply doesn't enumerate certain
+    # kernel worker threads consistently, not that anything is hidden.
+    # Kernel threads always have an empty /proc/<pid>/cmdline (no argv —
+    # they're kernel-space, no executable is mapped); a hidden userspace
+    # backdoor process, which is what this check actually cares about,
+    # always has a non-empty one. Filter to that.
+    hidden = []
+    for pid in still_present:
+        try:
+            with open(f'/proc/{pid}/cmdline', 'rb') as f:
+                if f.read().strip(b'\x00'):
+                    hidden.append(pid)
+        except (IOError, PermissionError):
+            continue  # unreadable cmdline — can't confirm either way, skip rather than false-alarm
     if hidden:
-        alerts.append(pl('CAUTION', 6, f"PIDs in /proc but not in ps output (possible kernel hiding — can also be kernel threads or processes that exited mid-scan; verify manually)", f"PIDs: {', '.join(list(hidden)[:5])}"))
+        alerts.append(pl('CAUTION', 6, f"PIDs in /proc but not in ps output, with a non-empty cmdline (possible kernel hiding of a userspace process; verify manually)", f"PIDs: {', '.join(hidden[:5])}"))
     else:
         alerts.append(pl('OK', 0, "No hidden processes detected"))
 
@@ -542,7 +660,7 @@ def check_adb():
     # Check listening ports for adb
     out,_,_ = run(["netstat", "-tulpn"])
     for line in out.splitlines():
-        if "adb" in line and "LISTEN" in line:
+        if re.search(r'\badbd?\b', line) and "LISTEN" in line:
             alerts.append(pl('CRITICAL', 7, f"ADB listener: {line}", line))
             break
     else:
@@ -554,23 +672,36 @@ def check_kernel():
     ps("🐧 Kernel & eBPF")
     progress()
     out,_,_ = run(["lsmod"])
-    mods = [line.split()[0] for line in out.splitlines()]
+    mods = [line.split()[0] for line in out.splitlines() if line.split()]
     suspicious = [m for m in mods if any(kw in m for kw in ['vpn','tunnel','proxy','hook']) and m not in WL["safe_kernel_modules"]]
     if suspicious:
         alerts.append(pl('CAUTION', 4, f"Suspicious kernel modules: {', '.join(suspicious[:3])}", out[:100]))
     else:
         alerts.append(pl('OK', 0, "No unusual modules"))
 
+    # eBPF – flag genuine network-hook program types, but first strip out
+    # Android's own stock per-UID traffic-accounting BPF programs (netd
+    # creates these — e.g. "prog_netd_skfilter_egress_xtbpf" — on every
+    # modern Android device). A bare substring match for "sk"/"tc" would
+    # otherwise false-positive CRITICAL on that name alone (it contains
+    # "sk" from "skfilter"), flagging every stock phone.
+    known_good_bpf = re.compile(r'netd_skfilter|netd_shared|cgroup_bpf|xt_bpf|gpu_mem|gpu_work|mali|kgsl|thermal', re.I)
     out,_,_ = run(["bpftool", "prog", "show"])
     if out:
-        if 'xdp' in out.lower() or 'tc' in out.lower() or 'sk' in out.lower():
-            alerts.append(pl('CRITICAL', 8, "eBPF programs with network hooks", out[:200]))
-        else:
+        flagged_lines = [l for l in out.splitlines() if not known_good_bpf.search(l)]
+        flagged_text = '\n'.join(flagged_lines)
+        if re.search(r'\b(xdp|sched_cls|sched_act|sk_skb|sk_msg|sk_reuseport|cgroup_skb)\b', flagged_text, re.I):
+            alerts.append(pl('CRITICAL', 8, "eBPF programs with network hooks (excluding known-good netd traffic-stats programs)", flagged_text[:200]))
+        elif flagged_lines:
             alerts.append(pl('OK', 0, "eBPF programs present but not network-specific"))
+        else:
+            alerts.append(pl('OK', 0, "Only known-good netd traffic-accounting BPF programs present"))
     else:
         out,_,_ = run(["ls", "/sys/fs/bpf/"])
-        if re.search(r'(xdp|tc|sk|hook)', out, re.I):
-            alerts.append(pl('CAUTION', 5, f"eBPF network programs in /sys/fs/bpf", out[:100]))
+        unexpected_bpf = [l for l in out.splitlines() if l.strip() and not known_good_bpf.search(l)]
+        unexpected_text = '\n'.join(unexpected_bpf)
+        if unexpected_bpf and re.search(r'\b(xdp|tproxy|hook)\b', unexpected_text, re.I):
+            alerts.append(pl('CAUTION', 5, f"Unrecognised eBPF network programs in /sys/fs/bpf", unexpected_text[:100]))
         out,_,_ = run(["tc", "filter", "show"])
         if out:
             alerts.append(pl('CAUTION', 5, "TC filters present (possible eBPF)", out[:100]))
@@ -586,9 +717,31 @@ def check_frida():
     else:
         alerts.append(pl('OK', 0, "No Frida server found"))
     
-    out,_,_ = run(["grep", "-r", "TracerPid:", "/proc/*/status"])
-    if out and "TracerPid:\t0" not in out:
-        alerts.append(pl('CRITICAL', 7, "Processes with non-zero TracerPid (debugger attached)", out[:100]))
+    # TracerPid check – "/proc/*/status" is a shell glob, but run() execs
+    # without a shell (by design, to avoid shell=True), so grep was being
+    # handed a literal filename ("/proc/*/status") that never exists.
+    # grep always failed silently and this check has been a permanent
+    # no-op. Iterate /proc directly instead, same pattern already used by
+    # the LD_PRELOAD and hidden-process checks.
+    traced = []
+    try:
+        for pid in os.listdir('/proc'):
+            if not pid.isdigit():
+                continue
+            try:
+                with open(f'/proc/{pid}/status') as f:
+                    for line in f:
+                        if line.startswith('TracerPid:'):
+                            tracer = line.split(':', 1)[1].strip()
+                            if tracer not in ('0', ''):
+                                traced.append(f"{pid}:{tracer}")
+                            break
+            except (IOError, PermissionError):
+                continue
+    except Exception:
+        pass
+    if traced:
+        alerts.append(pl('CRITICAL', 7, "Processes with non-zero TracerPid (debugger/ptrace attached)", f"pid:tracer {traced[:5]}"))
     else:
         alerts.append(pl('OK', 0, "No debuggers attached"))
     return alerts
@@ -642,11 +795,22 @@ def check_threat_intel():
             else:
                 out,_,_ = run(["netstat", "-tan"])
                 for line in out.splitlines():
-                    if "ESTABLISHED" in line:
-                        for ip in threat_ips:
-                            if ip in line:
-                                alerts.append(pl('CRITICAL', 8, f"Active connection to known threat: {ip}", line))
-                                break
+                    if "ESTABLISHED" not in line:
+                        continue
+                    parts = line.split()
+                    if len(parts) < 5:
+                        continue
+                    foreign = parts[4]
+                    # "if ip in line" was a raw substring match — threat IP
+                    # "1.1.1.1" would false-match a line containing
+                    # "31.1.1.1" or "1.1.1.10:443" anywhere on it. Parse the
+                    # actual foreign-address field and compare the exact IP.
+                    if foreign.startswith('['):
+                        foreign_ip = foreign.split(']')[0].lstrip('[')
+                    else:
+                        foreign_ip = foreign.rsplit(':', 1)[0]
+                    if foreign_ip in threat_ips:
+                        alerts.append(pl('CRITICAL', 8, f"Active connection to known threat: {foreign_ip}", line))
                 if not alerts:
                     alerts.append(pl('OK', 0, "No connections to known threats"))
         except Exception as e:
@@ -806,6 +970,23 @@ def dns_query(domain, server, qtype='A'):
 
 DNS_CROSS_IPS = {}  # populated by check_dns_cross(); domain -> set of all IPs seen
 
+def _tls_handshake_valid(ip, domain, timeout=3):
+    """True if a real TLS handshake to ip:443 with SNI=domain succeeds
+    using the system's default trust store (full certificate chain +
+    hostname validation, not our own trusted_ca_orgs list). A DNS
+    hijacker would need a certificate that's both issued by a CA the
+    device already trusts AND valid for this exact hostname — something
+    they don't have — so success here is cryptographic proof this IP is
+    a legitimate server for the domain, regardless of which IP range
+    it's in."""
+    try:
+        ctx = ssl.create_default_context()
+        with socket.create_connection((ip, 443), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=domain):
+                return True
+    except Exception:
+        return False
+
 def check_dns_cross():
     global DNS_CROSS_IPS
     alerts = []
@@ -816,12 +997,19 @@ def check_dns_cross():
         'Google': '8.8.8.8',
         'Cloudflare': '1.1.1.1',
         'Quad9': '9.9.9.9',
-        'Freenom': '80.80.80.80',
+        'OpenDNS': '208.67.222.222',
         'Yandex': '77.88.8.8',
-        'FDN (FR)': '80.67.169.40',
-        'JPRS (JP)': '202.12.30.2',
-        'Telstra (AU)': '203.0.178.191',
+        'Comodo': '8.26.56.26',
+        'Verisign': '64.6.64.6',
+        'CleanBrowsing': '185.228.168.9',
     }
+    # Note: Freenom (80.80.80.80), FDN (80.67.169.40), JPRS (202.12.30.2),
+    # and Telstra (203.0.178.191) were dropped after a real scan showed all
+    # four failing on every single domain queried — a domain-independent
+    # failure pattern means the resolvers themselves are unreachable/dead
+    # rather than anything being hijacked, and it was contributing 15+
+    # points of guaranteed "resolver failed" noise per scan. Re-review this
+    # list periodically; public resolver uptime changes over time.
     
     domains = ['fbi.gov', 'google.com', 'microsoft.com', 'chase.com', 'github.com']
     
@@ -840,8 +1028,13 @@ def check_dns_cross():
                 continue
             results[domain][name][qtype] = ips
     
-    # Analyse
-    for domain, resolver_results in results.items():
+    # Analyse — iterate over the full domain list, not just results.items().
+    # A domain where every resolver timed out never gets a key written into
+    # `results` (defaultdict only materializes on a successful reply), so
+    # iterating results.items() silently dropped it and its "all resolvers
+    # failed" signal entirely instead of reporting it.
+    for domain in domains:
+        resolver_results = results.get(domain, {})
         resolver_ips = {}
         for name, qtypes in resolver_results.items():
             ips = set()
@@ -851,9 +1044,14 @@ def check_dns_cross():
                 ips.update(qtypes['AAAA'])
             resolver_ips[name] = ips
         
-        empties = [name for name, ips in resolver_ips.items() if not ips]
-        if empties:
-            alerts.append(pl('CAUTION', 3, f"Domain {domain}: {len(empties)} resolvers failed", ', '.join(empties)))
+        # Resolvers with an empty-but-present reply (e.g. NXDOMAIN) AND
+        # resolvers that never made it into resolver_results at all (both
+        # A and AAAA timed out) both count as "failed" for this domain.
+        empty_replies = [name for name, ips in resolver_ips.items() if not ips]
+        no_reply_at_all = [name for name in resolvers if name not in resolver_results]
+        failed = empty_replies + no_reply_at_all
+        if failed:
+            alerts.append(pl('CAUTION', 3, f"Domain {domain}: {len(failed)}/{len(resolvers)} resolvers failed", ', '.join(failed)))
         
         DNS_CROSS_IPS[domain] = set().union(*resolver_ips.values()) if resolver_ips else set()
 
@@ -863,14 +1061,37 @@ def check_dns_cross():
             for name, ips in resolver_ips.items():
                 if ips != baseline:
                     all_ips = baseline.union(ips)
-                    is_cdn = all(any(ip.startswith(pre) for pre in WL["cdn_prefixes"]) for ip in all_ips)
-                    if not is_cdn:
-                        v4_ips = [ip for ip in all_ips if '.' in ip]
-                        if v4_ips and len(v4_ips) == len(all_ips):
-                            prefixes = [ip.rsplit('.', 1)[0] for ip in v4_ips]
-                            if len(set(prefixes)) == 1:
-                                continue
-                        alerts.append(pl('CAUTION', 5, f"DNS mismatch for {domain}: {name} differs", f"{name}: {ips} vs {baseline}"))
+                    diff_ips = ips - baseline
+                    v4_all = [ip for ip in all_ips if '.' in ip]
+                    v6_all = [ip for ip in all_ips if ':' in ip]
+                    # Fast path: cheap prefix check for the handful of
+                    # ranges we do maintain, avoids extra handshakes for
+                    # the common/fast case.
+                    is_cdn_v4 = bool(v4_all) and all(any(ip.startswith(pre) for pre in WL["cdn_prefixes"]) for ip in v4_all)
+                    v6_prefixes = {':'.join(ip.split(':')[:2]) for ip in v6_all}
+                    is_cdn_v6 = bool(v6_all) and len(v6_prefixes) <= 3
+                    is_cdn = (is_cdn_v4 or not v4_all) and (is_cdn_v6 or not v6_all) and (v4_all or v6_all)
+                    if is_cdn:
+                        continue
+                    if v4_all and not v6_all:
+                        prefixes = [ip.rsplit('.', 1)[0] for ip in v4_all]
+                        if len(set(prefixes)) == 1:
+                            continue
+                    # Slow path: no static IP list can keep up with a
+                    # hyperscale anycast provider's actual range diversity
+                    # (this exact scan's differing Google IPs aren't in
+                    # cdn_prefixes at all). Instead, cryptographically
+                    # verify the differing IPs directly: a full-chain +
+                    # hostname-validated TLS handshake succeeding proves
+                    # the server holds a certificate the device's own
+                    # trust store accepts for this exact domain — a DNS
+                    # hijacker doesn't have that. Success here is strictly
+                    # stronger evidence of legitimacy than any IP range
+                    # check, and needs no maintained list at all.
+                    sample = list(diff_ips)[:3] or list(ips)[:3]
+                    if sample and all(_tls_handshake_valid(ip, domain) for ip in sample):
+                        continue
+                    alerts.append(pl('CAUTION', 5, f"DNS mismatch for {domain}: {name} differs", f"{name}: {ips} vs {baseline}"))
     
     return alerts
 
@@ -907,7 +1128,13 @@ def check_certificates(resolver_ip_map=None):
             except Exception as e:
                 alerts.append(pl('CAUTION', 3, f"{domain} @ {ip}: cert check failed", str(e)))
         for ip, issuer in seen_issuers.items():
-            if any(t in issuer for t in WL["trusted_ca_orgs"]):
+            # BUG: "t in issuer" tests dict KEYS by default (field names like
+            # 'organizationName', 'commonName'), never the VALUES (the
+            # actual CA name, e.g. "DigiCert Inc"). trusted_ca_orgs could
+            # never match anything, so every successful handshake fell
+            # through to "untrusted issuer" regardless of the real CA.
+            issuer_text = ' '.join(str(v) for v in issuer.values())
+            if any(t in issuer_text for t in WL["trusted_ca_orgs"]):
                 alerts.append(pl('OK', 0, f"{domain} @ {ip}: trusted issuer {issuer}"))
             else:
                 alerts.append(pl('CAUTION', 4, f"{domain} @ {ip}: untrusted issuer {issuer}", str(issuer)))
@@ -929,7 +1156,7 @@ h1 {{ color: #f5c2e7; }}
 .CRITICAL {{ background: #5a2e2e; }}
 .evidence {{ color: #a6adc8; font-size: 0.9em; margin-left: 20px; }}
 </style></head><body>
-<h1>🔥 Apocalypse Detector v5.5 – Scan Report</h1>
+<h1>🔥 Apocalypse Detector v5.11 – Scan Report</h1>
 <div class="summary">
 <p><b>Timestamp:</b> {time.strftime("%Y-%m-%d %H:%M:%S")}</p>
 <p><b>Risk Score:</b> {score} → <b>{risk_level}</b></p>
@@ -968,7 +1195,7 @@ def main():
     os.chmod(OUTPUT_DIR, 0o750)
     
     print("\n" + "="*70)
-    print("🔥 APOCALYPSE DETECTOR v5.5 – The Professional's Choice")
+    print("🔥 APOCALYPSE DETECTOR v5.11 – The Professional's Choice")
     print("="*70)
     print(f"{C['grey']}Running with root privileges...{C['reset']}\n")
     
