@@ -63,7 +63,10 @@ Not MDM-specific, just general device maintenance.
 | Status | Script | Platform | What it does |
 |---|---|---|---|
 | 🟢 | `adb_cache_purge.sh` | Host, drives phone via `adb` | Measures per-app cache via `du`, supports `--dry-run`/`--force`, escalates `pm trim-caches` → `adb root` → `su`-based cleanup (each gated by an actual capability check, not blind execution), then verifies bytes actually freed. |
-| 🟢 | `lan_sigint_scanner.py` | On-device, Termux (Pydroid3 works degraded) | Flask web UI (`localhost:8747`) for LAN asset discovery: TCP/ICMP sweep, ARP, full mDNS with TXT/SRV parsing (real model names, not guesses), SSDP, optional WiFi RSSI + Bluetooth. Runs a real functional preflight per Termux capability instead of just checking `which`, and tells you exactly which permission or APK is missing. |
+| 🟢 | `lan_sigint_scanner.py` | On-device, Termux (Pydroid3 works degraded) | Flask web UI (`localhost:8747`) for LAN asset discovery: TCP/ICMP sweep, ARP, full mDNS with TXT/SRV parsing (real model names, not guesses), SSDP, optional WiFi RSSI + Bluetooth. Runs a real functional preflight per Termux capability instead of just checking `which`, and tells you exactly which permission or APK is missing. Binds `0.0.0.0:8747` — reachable by anything else on the LAN unless you firewall it. |
+| 🟢 | `sigint-pydroid.py` | On-device, Termux or Pydroid3 | Self-labeled "SIGINT v3" — same passive LAN-discovery approach as `lan_sigint_scanner.py` ("v2"): ARP-cache read (not spoofed), mDNS/SSDP queries, TCP port fingerprinting. Adds IPv6 discovery and `--bind`/`--port` flags. One functional difference worth knowing: it defaults to binding the web UI to `127.0.0.1` rather than every interface — the file's own comment says "change to 0.0.0.0 only on trusted networks." |
+
+**Which is stronger:** `sigint-pydroid.py` — same discovery capability, adds IPv6, and its safer bind default means the dashboard (and the LAN inventory it collects) isn't reachable from the rest of the network unless you deliberately open it up, unlike `lan_sigint_scanner.py`'s default.
 
 ---
 
@@ -79,6 +82,38 @@ Companion pair for a Motorola locked into a managed/kiosk state by a misconfigur
 **Must-knows:** both need a data-carrying USB-C OTG cable and the target already sitting in fastboot/fastbootd — recovery-sideload speaks `adb`, not fastboot, and won't work. `moto_recover_termux.py` additionally needs the **Termux:API app** (not just the `pkg`) installed from F-Droid. Destructive commands (`kill-dpc`, `unlock`, `flash-stock`, `root`) require typing `WIPE` to confirm unless you pass `--yes`. Read-only/safe: `detect`, `usb-test`, `bridge`, `pull-firmware`, prep-only flash steps, and Magisk patching itself (pure file patching, no device touch).
 
 **Which is stronger:** neither, by design — they solve different halves of the same problem and neither one is optional if you only have the VM or only have Termux. But before this pass, `moto_recover_avf.py` was the more *correct* of the two: it always had a working `flashing()` method for the `fastboot flashing unlock` verb, while `moto_recover_termux.py` was missing it entirely and silently no-op'd on that fallback path (fixed above). Same script, same feature, one copy got it right and the other didn't — worth remembering next time a fix lands in one of a pair like this and not the other.
+
+---
+
+## 🪪 Device identifier / banking-app compatibility
+
+Same Moto G 5G (2022, MediaTek Dimensity 700) as the recovery pair above — three different strategies for getting a rooted phone's banking apps to stop rejecting it, ranging from "just hide root" (no identifier changes at all) to "change the identifiers device-fingerprinting checks actually look at."
+
+| Status | Script | Platform | What it does |
+|---|---|---|---|
+| 🟢 | `Blah.sh` | Rooted Android, Magisk | Interactive Magisk/Zygisk root-hiding walkthrough — Play Integrity Fix + Shamiko + DenyList, explicitly **no hardware identifier changes**. Checks Zygisk is enabled, checks for the PIF/Shamiko modules (offers to fetch their GitHub releases if missing), walks through enabling DenyList for Google Play Services plus a list of named banking apps, and points at the Play Integrity API Checker app to confirm it worked. |
+| 🟡 | `SafeIDupdater.sh` | Rooted Android, raw root shell | Backs up, then rewrites: Wi-Fi/Bluetooth MAC (direct NVRAM byte patch), IMEI ×2 (baseband AT commands over `/dev/radio/pttycmd1` or `/dev/ttyC0`, with read-back verification), serial number (NVRAM + Magisk `resetprop`), Android ID (`settings put secure android_id`), and optionally GSF ID (direct `gservices.db` edit after force-stopping Play Services). Generates a matching `restore.sh` from the backups it takes before touching anything. **Read before running:** the script's own text says Wi-Fi/BT MAC and Android ID changes may not survive a reboot, and offers to reboot immediately so you can find out. |
+| 🟡 | `Termux_safeIDupdater.sh` | Termux (rooted) | Same operation set as `SafeIDupdater.sh` — same identifiers, same backup-then-patch-then-restore-script shape — adapted for Termux, with an interactive backup-destination picker (internal storage / external SD / falls back to `/data/local/tmp`). Not a different tool, the same one for a different shell environment. |
+| 🟢 | `fix.sh` | Termux (`termux-fastboot`/`termux-adb`) | Small rescue script for the two above: reboots a device stuck in fastboot, waits for ADB to reconnect, then bulk-`pm enable`s every currently-disabled package it finds. Generic — it re-enables whatever's disabled without knowing or caring what disabled it. |
+| 🟡 | `moto_full_respoof_and_evidence_wipe.sh` | Rooted Android, MediaTek `mt6833`/`mt6877` only | *(was `TheLazyBaby.sh`)*. The most consequential file in this group, so spelling out exactly what it does rather than summarizing: after a pre-flight checklist confirmed by typing `READY` (SIM out, logged out of Google, radios off), it does everything `SafeIDupdater.sh` does (IMEI/IMSI/MACs/serial/Android ID/GSF ID) *plus* applies a hardcoded Motorola "certified" build fingerprint (`motorola/rhodei_g/rhodei:12/S1RLS32.55-25-10/25-10:user/release-keys`) if none is supplied, adds ~12 named banking/payment package names to the Magisk DenyList, and — each individually gated behind typing `YES` — offers to zero the `modemst1`/`modemst2` radio NVRAM partitions, zero the NVRAM backup area, and overwrite free space. Separately, and **not** gated behind any of those `YES` prompts, it unconditionally runs `rm -rf /data/system/dropbox/*`, `logcat -c`, and `dmesg -c` regardless of what you answered. A final typed `APPLY` (or `EXIT` to abort) confirms before any of it is written; all new identifier values are backed up first and validated by regex. |
+
+**Must-know:** the three `YES`-gated wipe steps in `moto_full_respoof_and_evidence_wipe.sh` are optional and off by default — but the dropbox/logcat/dmesg clear is not, it runs every time the script completes, independent of how you answered the wipe prompts.
+
+---
+
+## 🌐 DNS / VPN / privacy-stack deployment
+
+Several overlapping attempts at the same goal — a self-hosted, ad-blocking, DNSSEC-validating DNS resolver plus optional VPN/Tor egress — across Termux, a Chrome OS Crostini container, and a Google TV. All are opt-in: other devices have to be manually pointed at the resolver/proxy, none of these do DHCP-option or ARP-based forcing.
+
+| Status | Script | Platform | What it does |
+|---|---|---|---|
+| 🔴 | `Stack.sh` | Termux | Byte-identical to `PoststackDeployment.sh` through line 648, then cuts off mid-`echo` inside a banner (`bash -n` fails: "unexpected EOF"). An earlier, incomplete draft of the file below — not runnable as committed. |
+| 🟢 | `PoststackDeployment.sh` | Termux | Post-install configuration and verification for Unbound + DNSCrypt-Proxy (+ optional VPN): DNSSEC root anchor, port checks, VPN detection, DNS-resolution/ad-block/DNSSEC tests via `dig`. Also writes three persistent CLI utilities to `$PREFIX/bin` — `privacy-status`, `dns-service` (start/stop/restart/enable/disable, autostart via a `.bashrc` hook), `dns-monitor` (live 2-second-refresh dashboard). |
+| 🟢 | `UnboundDNS_stack_installer.sh` | Termux | The main installer: installs Unbound + DNSCrypt-Proxy (source-build fallback if the prebuilt binary isn't available), downloads ad/malware/tracking blocklists (StevenBlack, BlocklistProject) and converts them into Unbound `local-zone` NXDOMAIN entries, configures Unbound on `5335` forwarding to local DNSCrypt-Proxy on `5353` (DNS-over-TLS to Cloudflare/Quad9 as fallback), and generates three more helper scripts: `vpn-setup` (WireGuard/WARP/OpenVPN, ships only a placeholder `YOUR_PRIVATE_KEY_HERE` template — no real keys), `proxy-setup` (tinyproxy:8888, 3proxy SOCKS5:1080/HTTP:3128), `dns-manager` (block/allow/status/test CLI). |
+| 🟢 | `GoogleTVFullNetworkDNSVPNProxy.sh` | Termux on a Google TV | Orchestrates the two scripts above on a Google TV device, verifies DNS resolution/ad-blocking, offers interactive VPN and proxy setup plus a `.bashrc` autostart hook. Self-describes as "Router Bypass Architecture" — the point being the router only ever sees encrypted VPN traffic, since the resolver/proxy run on the TV itself. Same opt-in mechanism as the rest of this family; worth knowing given it's usually a shared living-room device. |
+| 🟡 | `ChromeOS_Linux_DNS_gateway.sh` | Chrome OS Crostini (Debian) | Same resolver stack plus optional Tor/I2P, installed as persistent systemd services rather than a Termux userspace process. **Read before running:** Unbound here binds `0.0.0.0`/`::0` on the standard DNS port `53` (not a high port, not loopback-only) with access-control opened to the detected LAN's `/8` range — this one is built to be a real network-wide gateway other devices point at, not just a personal-device resolver. |
+| 🟢 | `ChromeOS_LINUX_SECANON_stack_v2.sh` | Termux | "Production hardened" variant: PIN (SHA-256 hashed) plus optional FIDO2/U2F requirement gates first run, generates and PIN-encrypts (AES-256-CBC/PBKDF2) a self-signed CA/cert chain for a local VPN, then installs Unbound/Tor/I2P/DNSCrypt/tinyproxy under `proot` isolation with a 60-second self-healing watchdog and Termux:Boot autostart. All key material is generated and used locally. |
+| 🔴 | `ChromeOS_linux_SECANON_stack_v1_draft.sh` | Termux | *(was `ChromeOS_linux_SECANON_stacksh` — also given a proper extension while renaming)*. An earlier draft of the file above: same PIN/FIDO2/cert-generation logic, but cuts off mid-function before the package-install/service-start/watchdog phases exist (`bash -n` fails at line 345: "unexpected end of file"). |
 
 ---
 
@@ -106,6 +141,8 @@ What started as one userscript is now four pieces that work together: read the t
 **Must-know:** `blackjack_advisor_ocr.user.js` declares `readoutEl` far below where it's first used — it only works because `buildPanel()` happens to run after the declaration executes at module-load time; the order is load-bearing even though nothing enforces it.
 
 **Which is stronger:** version number says `blackjack_advisor_ocr.user.js` (v6.0.0) should beat `blackjack-advisor.user.js` (v1.7.0), but it's a lateral fork, not a successor — it traded away the plugin system, calibrated pixel-matching, accessibility output, and the provably-fair audit panel to make room for OCR and a real error log. For a DOM-readable table, v1.7.0 is strictly more capable. For a canvas-drawn table with no DOM to read, v1.7.0 can't see it at all and the OCR fork is the only one of the two that has a chance. Worth keeping both rather than picking one.
+
+**A fifth file, `blackjack_autoplay_bot.py` (was `Bja.py`), is not part of this toolkit and works on a different principle on purpose — flagging that separately rather than folding it into the table above.** It's a Playwright bot that auto-discovers a live table's Hit/Stand/Double/Split/Deal buttons via injected JS, computes the same basic-strategy/Hi-Lo math as the four tools above, and then **clicks those buttons itself** for up to `--rounds` (default 100) hands with no human in the loop — launched with `--disable-blink-features=AutomationControlled`, a Chromium flag whose only documented function is suppressing the browser property automation-detection systems check for. None of the four tools above ever touch a page's own controls; this one exists specifically to. 🔴 — it also doesn't run as committed: `Strategy.HARD`/`SOFT`/`PAIRS` are dict literals missing the tuple/list wrapper around their values (`4: 'H','H','H',...` instead of `4: ('H','H','H',...)`), which is a `SyntaxError` in the file as-is (`python3 -m py_compile` fails on line 252), left unfixed.
 
 ---
 
@@ -218,3 +255,6 @@ Everything is `snake_case.ext` now (userscripts keep their required `.user.js` s
 | `motorola_recover.py` | `moto_recover_termux.py` |
 | `Bja.js` | `blackjack_advisor_ocr.user.js` |
 | `setup.sh` | `medtool_setup.sh` |
+| `Bja.py` | `blackjack_autoplay_bot.py` |
+| `TheLazyBaby.sh` | `moto_full_respoof_and_evidence_wipe.sh` |
+| `ChromeOS_linux_SECANON_stacksh` | `ChromeOS_linux_SECANON_stack_v1_draft.sh` |
