@@ -1,17 +1,20 @@
 #!/data/data/com.termux/files/usr/bin/python3
 """
-Apocalypse Detector v5.4 – The Professional's Choice
+Apocalypse Detector v5.5 – The Professional's Choice
 - Full DNS with TCP fallback (proper length-looped TCP read)
 - Optimised /proc scanning
-- Robust threat intel validation
+- Robust threat intel validation with cross-run domain resolution caching
 - Enhanced ADB detection
-- Granular SELinux context checks (vs known-good policy, not just "unconfined")
+- Granular, whitelist-configurable SELinux context checks
 - Deep hidden-network analysis: sysfs-vs-netlink interface hiding, policy
-  routing, hidden network namespaces, mangle/raw table TPROXY/MARK/NOTRACK,
-  hidden listening sockets, DNS config mismatch, ARP spoofing
+  routing, hidden network namespaces (with unavailable-vs-clean distinction),
+  mangle/raw table TPROXY/MARK/NOTRACK across both iptables and nftables,
+  hidden listening sockets (ss with netstat fallback), DNS config mismatch,
+  ARP spoofing heuristics (with false-positive disclaimer)
 - Certificate validation across all DNS-cross-checked IPs, not just the first
-- Scoped (not filesystem-wide) persistence scan
+- Scoped (not filesystem-wide) persistence scan with batched grep
 - --quick mode to skip expensive checks
+- --output-dir to relocate all state/reports
 - HTML report
 - Verbose mode
 """
@@ -61,7 +64,17 @@ def run(cmd, timeout=12):
 # ----------------------------------------------------------------------
 #  Config & whitelist
 # ----------------------------------------------------------------------
-WHITELIST_PATH = "/data/local/apocalypse/whitelist.json"
+def _get_output_dir():
+    """Parsed early (before whitelist load) so --output-dir affects every
+    path in the script, not just the ones set up after main() starts."""
+    if '--output-dir' in sys.argv:
+        idx = sys.argv.index('--output-dir')
+        if idx + 1 < len(sys.argv):
+            return sys.argv[idx + 1].rstrip('/')
+    return "/data/local/apocalypse"
+
+OUTPUT_DIR = _get_output_dir()
+WHITELIST_PATH = f"{OUTPUT_DIR}/whitelist.json"
 DEFAULT_WHITELIST = {
     "vpn_apps": ["com.android.vpndialogs", "org.openvpn", "com.wireguard"],
     "vpn_interfaces": ["tun0", "wg0", "ppp0"],
@@ -72,7 +85,14 @@ DEFAULT_WHITELIST = {
     "system_binaries": ["/system/bin/sh", "/system/bin/netd", "/system/bin/su", "/system/bin/init", "/system/bin/app_process64"],
     "trusted_dns_resolvers": ["8.8.8.8", "1.1.1.1", "9.9.9.9", "80.80.80.80", "77.88.8.8"],
     "risk_weights": {"default": 3, "critical": 8, "high": 5, "medium": 3, "low": 1},
-    "score_thresholds": {"low": 30, "medium": 60}
+    "score_thresholds": {"low": 30, "medium": 60},
+    # Expected SELinux contexts per critical binary — now user-extensible via
+    # whitelist.json instead of being hardcoded only inside check_system().
+    "expected_selinux_contexts": {
+        "/system/bin/sh": ["u:object_r:shell_exec:s0"],
+        "/system/bin/netd": ["u:object_r:netd_exec:s0"],
+        "/system/bin/su": ["u:object_r:su_exec:s0", "u:object_r:magisk_file:s0", "u:object_r:system_file:s0"],
+    }
 }
 
 def load_whitelist():
@@ -104,11 +124,11 @@ def create_baseline():
             print(f"  {path} -> {baseline[path][:8]}...")
         else:
             baseline[path] = None
-    os.makedirs("/data/local/apocalypse", exist_ok=True)
-    with open("/data/local/apocalypse/baseline.json", "w") as f:
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    with open(f"{OUTPUT_DIR}/baseline.json", "w") as f:
         json.dump(baseline, f, indent=2)
-    os.chmod("/data/local/apocalypse", 0o750)
-    print(f"{C['green']}[+] Baseline saved to /data/local/apocalypse/baseline.json{C['reset']}")
+    os.chmod(OUTPUT_DIR, 0o750)
+    print(f"{C['green']}[+] Baseline saved to {OUTPUT_DIR}/baseline.json{C['reset']}")
     sys.exit(0)
 
 # ----------------------------------------------------------------------
@@ -169,7 +189,7 @@ def check_system():
         elif not any('unconfined' in l for l in out.splitlines()):
             alerts.append(pl('OK', 0, "SELinux contexts match expected policy"))
 
-    baseline_file = "/data/local/apocalypse/baseline.json"
+    baseline_file = f"{OUTPUT_DIR}/baseline.json"
     if os.path.exists(baseline_file):
         try:
             with open(baseline_file) as f:
@@ -267,9 +287,13 @@ def check_hidden_network():
 
     # 3. Network namespaces – a full second network stack (own interfaces,
     # own routes) can be hidden entirely from the default namespace's `ip`/`ss` view.
-    out,_,_ = run(["ip", "netns", "list"])
-    if out:
-        alerts.append(pl('CAUTION', 6, f"Non-default network namespaces exist ({len(out.splitlines())})", out[:100]))
+    # Many Android kernels are built without CONFIG_NET_NS, so a failed/absent
+    # `ip netns` doesn't mean "clean" — it means the check couldn't run.
+    ns_out, ns_err, ns_rc = run(["ip", "netns", "list"])
+    if ns_rc != 0:
+        alerts.append(pl('CAUTION', 1, "Network namespace check unavailable (ip netns not supported on this kernel)", ns_err[:100]))
+    elif ns_out:
+        alerts.append(pl('CAUTION', 6, f"Non-default network namespaces exist ({len(ns_out.splitlines())})", ns_out[:100]))
     else:
         alerts.append(pl('OK', 0, "No extra network namespaces"))
 
@@ -285,6 +309,14 @@ def check_hidden_network():
     out6,_,_ = run(["ip6tables", "-t", "mangle", "-L", "-n", "-v"])
     if re.search(r'\b(TPROXY|MARK|CONNMARK)\b', out6):
         alerts.append(pl('CAUTION', 5, "IPv6 mangle table has TPROXY/MARK/CONNMARK rules", out6[:120]))
+    # nftables can implement the exact same tricks (tproxy, mark, ct) without
+    # any iptables ruleset existing at all on a modern nft-only kernel.
+    nft_out,_,_ = run(["nft", "list", "ruleset"])
+    if nft_out:
+        if any(kw in nft_out.lower() for kw in ("tproxy", "meta mark", "ct mark")):
+            alerts.append(pl('CAUTION', 5, "nftables ruleset has tproxy/mark/ct-mark rules (possible transparent proxy)", nft_out[:120]))
+        if "notrack" in nft_out.lower():
+            alerts.append(pl('CAUTION', 5, "nftables ruleset has notrack rules (traffic evading conntrack)", nft_out[:120]))
 
     # 5. Hidden sockets – compare raw /proc/net/tcp[6] entries against ss output.
     # A hooked ss/netstat binary (or LD_PRELOAD'd libc) can filter its own output
@@ -304,17 +336,27 @@ def check_hidden_network():
             pass
         return ports
     kernel_ports = parse_proc_net_tcp('/proc/net/tcp') | parse_proc_net_tcp('/proc/net/tcp6')
-    out,_,_ = run(["ss", "-tlnH"])
-    ss_ports = set()
-    for line in out.splitlines():
-        m = re.search(r':(\d+)\s+\d', line)
-        if m:
-            ss_ports.add(int(m.group(1)))
-    missing_from_ss = kernel_ports - ss_ports
-    if missing_from_ss:
-        alerts.append(pl('CRITICAL', 8, f"Listening ports visible in /proc/net/tcp but hidden from ss (possible tool hooking)", f"ports: {sorted(missing_from_ss)[:10]}"))
-    else:
-        alerts.append(pl('OK', 0, "No discrepancy between kernel socket table and ss output"))
+    out,_,ss_rc = run(["ss", "-tlnH"])
+    tool_used = "ss"
+    if ss_rc != 0 or not out:
+        # ss missing/unusable on some minimal Android builds — fall back to
+        # netstat rather than treating every kernel port as "hidden".
+        out,_,ns_rc2 = run(["netstat", "-tln"])
+        tool_used = "netstat"
+        if ns_rc2 != 0 or not out:
+            alerts.append(pl('CAUTION', 2, "Could not verify listening sockets — both ss and netstat unavailable/failed", ""))
+            tool_used = None
+    listed_ports = set()
+    if tool_used:
+        for line in out.splitlines():
+            m = re.search(r':(\d+)\s+\d', line)
+            if m:
+                listed_ports.add(int(m.group(1)))
+        missing = kernel_ports - listed_ports
+        if missing:
+            alerts.append(pl('CRITICAL', 8, f"Listening ports visible in /proc/net/tcp but hidden from {tool_used} (possible tool hooking)", f"ports: {sorted(missing)[:10]}"))
+        else:
+            alerts.append(pl('OK', 0, f"No discrepancy between kernel socket table and {tool_used} output"))
 
     # 6. DNS config mismatch – Android's reported resolver (net.dns1/2 props)
     # vs what's actually configured in-effect for the shell environment.
@@ -345,9 +387,9 @@ def check_hidden_network():
             all_entries_for_mac[mac].add(ip)
         suspicious_macs = {mac: ips for mac, ips in all_entries_for_mac.items() if len(ips) > 3}
         if len(gw_macs) > 1:
-            alerts.append(pl('CRITICAL', 7, f"Gateway {gw_ip} has multiple MAC addresses in ARP table (possible ARP spoofing)", f"MACs: {gw_macs}"))
+            alerts.append(pl('CAUTION', 5, f"Gateway {gw_ip} has multiple MAC addresses in ARP table — possible ARP spoofing, but router failover/bonding can also cause this; verify manually before acting", f"MACs: {gw_macs}"))
         elif suspicious_macs:
-            alerts.append(pl('CAUTION', 4, "Single MAC claims an unusually large number of IPs on the LAN", str(list(suspicious_macs.items())[:1])))
+            alerts.append(pl('CAUTION', 3, "Single MAC claims an unusually large number of IPs on the LAN — can indicate MITM, but is also normal behind a NAT/proxy device; verify manually", str(list(suspicious_macs.items())[:1])))
         else:
             alerts.append(pl('OK', 0, "ARP table looks normal"))
 
@@ -555,23 +597,46 @@ def check_threat_intel():
     alerts = []
     ps("🛡️ Threat Intelligence")
     progress()
-    threat_file = "/data/local/apocalypse/threats.txt"
+    threat_file = f"{OUTPUT_DIR}/threats.txt"
+    cache_file = f"{OUTPUT_DIR}/threats_resolved.json"
     if os.path.exists(threat_file):
         try:
             with open(threat_file) as f:
                 lines = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+            # Cache domain->IP resolutions across runs so a large threats.txt
+            # doesn't re-resolve every entry (and re-fail on dead domains)
+            # on every single scan.
+            cache = {}
+            if os.path.exists(cache_file):
+                try:
+                    with open(cache_file) as f:
+                        cache = json.load(f)
+                except Exception:
+                    cache = {}
             threat_ips = set()
+            cache_dirty = False
             for entry in lines:
                 if re.match(r'^\d+\.\d+\.\d+\.\d+$', entry):
                     threat_ips.add(entry)
+                elif entry in cache:
+                    threat_ips.update(cache[entry])
                 else:
                     try:
-                        for info in socket.getaddrinfo(entry, 443, socket.AF_INET):
-                            ip = info[4][0]
-                            threat_ips.add(ip)
-                    except:
+                        resolved = list({info[4][0] for info in socket.getaddrinfo(entry, 443, socket.AF_INET)})
+                        cache[entry] = resolved
+                        cache_dirty = True
+                        threat_ips.update(resolved)
+                    except Exception:
+                        cache[entry] = []
+                        cache_dirty = True
                         if VERBOSE:
                             print(f"{C['yellow']}[WARN] Could not resolve threat: {entry}{C['reset']}")
+            if cache_dirty:
+                try:
+                    with open(cache_file, "w") as f:
+                        json.dump(cache, f, indent=2)
+                except Exception:
+                    pass
             if not threat_ips:
                 alerts.append(pl('OK', 0, "Threat file contained no valid entries", "Add valid IPs or domain names"))
             else:
@@ -587,11 +652,18 @@ def check_threat_intel():
         except Exception as e:
             alerts.append(pl('CAUTION', 2, f"Error reading threat file: {e}"))
     else:
-        sample = "# Add IPs or domain names, one per line\n# 192.168.1.100\n# malicious-domain.com\n"
+        sample = (
+            "# Add IPs or domain names, one per line.\n"
+            "# For a maintained starting list, pull a current feed yourself, e.g.\n"
+            "# abuse.ch's feeds (https://abuse.ch) — do not hardcode indicators here\n"
+            "# blindly, they go stale. Example format:\n"
+            "# 192.168.1.100\n"
+            "# malicious-domain.com\n"
+        )
         try:
             with open(threat_file, "w") as f:
                 f.write(sample)
-            alerts.append(pl('OK', 0, "Threat intelligence file created (empty)", "Add entries to /data/local/apocalypse/threats.txt"))
+            alerts.append(pl('OK', 0, "Threat intelligence file created (empty)", f"Add entries to {threat_file}"))
         except:
             alerts.append(pl('OK', 0, "Threat intelligence file not found (skipping)"))
     return alerts
@@ -606,8 +678,10 @@ def check_persistence():
             alerts.append(pl('CAUTION', 3, f"Scripts in {location}", out[:100]))
     # Scoped to /system /vendor /data — scanning "/" also walks /proc, /sys,
     # /dev unnecessarily, costing minutes of CPU/battery for no extra signal.
+    # "-exec grep -l service {} +" batches files into as few grep invocations
+    # as possible instead of spawning one process per .rc file found.
     out,_,_ = run(["find", "/system", "/vendor", "/data", "-xdev", "-name", "*.rc", "-type", "f",
-                   "-exec", "grep", "-l", "service", "{}", ";"], timeout=30)
+                   "-exec", "grep", "-l", "service", "{}", "+"], timeout=30)
     if out:
         alerts.append(pl('CAUTION', 3, "init.rc files with service definitions", out[:100]))
     return alerts
@@ -855,7 +929,7 @@ h1 {{ color: #f5c2e7; }}
 .CRITICAL {{ background: #5a2e2e; }}
 .evidence {{ color: #a6adc8; font-size: 0.9em; margin-left: 20px; }}
 </style></head><body>
-<h1>🔥 Apocalypse Detector v5.4 – Scan Report</h1>
+<h1>🔥 Apocalypse Detector v5.5 – Scan Report</h1>
 <div class="summary">
 <p><b>Timestamp:</b> {time.strftime("%Y-%m-%d %H:%M:%S")}</p>
 <p><b>Risk Score:</b> {score} → <b>{risk_level}</b></p>
@@ -872,9 +946,9 @@ h1 {{ color: #f5c2e7; }}
             html += f'<div class="evidence">→ {alert["evidence"]}</div>'
         html += '</div>'
     html += '</body></html>'
-    with open("/data/local/apocalypse/report.html", "w") as f:
+    with open(f"{OUTPUT_DIR}/report.html", "w") as f:
         f.write(html)
-    print(f"{C['green']}[+] HTML report saved to /data/local/apocalypse/report.html{C['reset']}")
+    print(f"{C['green']}[+] HTML report saved to {OUTPUT_DIR}/report.html{C['reset']}")
 
 # ----------------------------------------------------------------------
 #  Main
@@ -890,11 +964,11 @@ def main():
         print(f"{C['red']}[!] Run as root")
         sys.exit(1)
     
-    os.makedirs("/data/local/apocalypse", exist_ok=True)
-    os.chmod("/data/local/apocalypse", 0o750)
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    os.chmod(OUTPUT_DIR, 0o750)
     
     print("\n" + "="*70)
-    print("🔥 APOCALYPSE DETECTOR v5.4 – The Professional's Choice")
+    print("🔥 APOCALYPSE DETECTOR v5.5 – The Professional's Choice")
     print("="*70)
     print(f"{C['grey']}Running with root privileges...{C['reset']}\n")
     
@@ -946,9 +1020,9 @@ def main():
         "risk_level": risk_level,
         "alerts": all_alerts
     }
-    with open("/data/local/apocalypse/report.json", "w") as f:
+    with open(f"{OUTPUT_DIR}/report.json", "w") as f:
         json.dump(report, f, indent=2)
-    print("\n📁 JSON report saved to /data/local/apocalypse/report.json")
+    print(f"\n📁 JSON report saved to {OUTPUT_DIR}/report.json")
     
     if '--html' in sys.argv:
         generate_html(all_alerts, score, risk_level)
