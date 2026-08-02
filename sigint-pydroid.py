@@ -30,6 +30,7 @@ SETUP (Termux):
 """
 
 import argparse
+import atexit
 import ipaddress
 import json
 import os

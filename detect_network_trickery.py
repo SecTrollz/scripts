@@ -10,6 +10,7 @@ import sys
 import re
 import socket
 import json
+import ipaddress
 from urllib.request import urlopen
 
 # ----------------------------------------------------------------------
@@ -129,7 +130,8 @@ def detect_dns():
     try:
         ip = socket.gethostbyname('google.com')
         print(f"  [+] google.com resolves to {ip}")
-        if ip not in ['142.250.0.0/16', '172.217.0.0/16']:
+        google_nets = [ipaddress.ip_network('142.250.0.0/16'), ipaddress.ip_network('172.217.0.0/16')]
+        if not any(ipaddress.ip_address(ip) in net for net in google_nets):
             print("  [!] google.com resolution may be hijacked.")
     except Exception as e:
         print(f"  [!] DNS resolution failed: {e}")

@@ -69,15 +69,15 @@ if [ "$INSTALL_MODE" = "full" ]; then
     echo ""
     
     # Check if installer script exists
-    if [ -f "./install-complete-stack.sh" ]; then
+    if [ -f "./dns_stack_installer.sh" ]; then
         log_info "Running installer script..."
-        chmod +x ./install-complete-stack.sh
-        ./install-complete-stack.sh || {
+        chmod +x ./dns_stack_installer.sh
+        ./dns_stack_installer.sh || {
             log_error "Installation failed"
             exit 1
         }
     else
-        log_error "Installer script not found: install-complete-stack.sh"
+        log_error "Installer script not found: dns_stack_installer.sh"
         log_info "Please download both scripts to the same directory"
         exit 1
     fi
@@ -90,10 +90,10 @@ log_step "PHASE 2: POST-INSTALL CONFIGURATION"
 echo ""
 
 # Check if configuration script exists
-if [ -f "./complete-working-implementation.sh" ]; then
+if [ -f "./dns_stack_postinstall.sh" ]; then
     log_info "Running configuration script..."
-    chmod +x ./complete-working-implementation.sh
-    ./complete-working-implementation.sh || {
+    chmod +x ./dns_stack_postinstall.sh
+    ./dns_stack_postinstall.sh || {
         log_error "Configuration failed"
         exit 1
     }
