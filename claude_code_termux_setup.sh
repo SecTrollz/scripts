@@ -1,30 +1,39 @@
 #!/data/data/com.termux/files/usr/bin/bash
 set -e
 
-echo "=== Termux Claude Code Installer ==="
+echo "=== Termux Claude Code Installer (Ubuntu PRoot) ==="
 
-# 1. Update package lists and upgrade core packages
+# 1. Update Termux and install proot-distro
 pkg update -y && pkg upgrade -y
+pkg install -y proot-distro
 
-# 2. Install required runtime dependencies
-pkg install -y nodejs-lts git proot
-
-# 3. Ensure Termux tmp directory exists
-mkdir -p /data/data/com.termux/files/usr/tmp
-
-# 4. Install Claude Code globally via npm
-npm install -g @anthropic-ai/claude-code
-
-# 5. Configure persistent proot wrapper alias in .bashrc
-BASHRC="$HOME/.bashrc"
-ALIAS_CMD='alias claude="proot -b /data/data/com.termux/files/usr/tmp:/tmp claude"'
-
-if ! grep -q "proot -b /data/data/com.termux/files/usr/tmp:/tmp claude" "$BASHRC" 2>/dev/null; then
-    echo "" >> "$BASHRC"
-    echo "# Claude Code Termux tmp binding wrapper" >> "$BASHRC"
-    echo "$ALIAS_CMD" >> "$BASHRC"
-    echo "[+] Alias added to $BASHRC"
+# 2. Install Ubuntu container
+if ! proot-distro list | grep -q "ubuntu (installed)"; then
+    echo "[+] Installing Ubuntu PRoot environment..."
+    proot-distro install ubuntu
 fi
 
+# 3. Provision Node.js LTS and Claude Code inside Ubuntu glibc environment
+echo "[+] Provisioning Node.js and Claude Code inside Ubuntu..."
+proot-distro login ubuntu -- bash -c "
+    set -e
+    apt update && apt upgrade -y
+    apt install -y curl git
+    if ! command -v node &> /dev/null; then
+        curl -fsSL https://deb.nodesource.com/setup_lts.x | bash -
+        apt install -y nodejs
+    fi
+    npm install -g @anthropic-ai/claude-code
+"
+
+# 4. Create transparent global host launcher
+LAUNCHER="/data/data/com.termux/files/usr/bin/claude"
+cat << 'EOF' > "$LAUNCHER"
+#!/data/data/com.termux/files/usr/bin/bash
+exec proot-distro login ubuntu --bind /data/data/com.termux/files/home:/root -- claude "$@"
+EOF
+
+chmod +x "$LAUNCHER"
+
 echo "=== Installation Complete ==="
-echo "Run 'source ~/.bashrc' or restart Termux, then execute 'claude' to launch."
+echo "Execute 'claude' directly from any directory to launch."
