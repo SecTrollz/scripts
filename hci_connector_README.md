@@ -29,7 +29,8 @@ honest throughput and success-rate numbers instead of a pile of hidden
 "Command Disallowed" rejections from a thread pool fighting itself.
 
 Each attempt:
-1. Sends `Create Connection` (or `LE Create Connection` with `--le`).
+1. Sends `Create Connection` (classic) or `LE Create Connection`,
+   depending on `--mode`.
 2. Waits for `Command Status`, matched by opcode.
 3. Waits for `Connection Complete` (or the LE Meta Event's Connection
    Complete subevent), matched by peer address.
@@ -50,9 +51,9 @@ exactly that list, `--rounds` times.
 **Live discovery** (`--discover`): for targets whose address rotates or
 changes during the test (e.g. simulated/emulated peripherals, or real
 BLE devices using random resolvable addresses), a short scan burst runs
-before each round on the same socket - classic `Inquiry` normally, or LE
-scanning with `--le` - and the round targets whatever's currently live.
-Three knobs control how this tracks a moving target:
+before each round on the same socket - classic `Inquiry`, LE scanning,
+or both depending on `--mode` - and the round targets whatever's
+currently live. Three knobs control how this tracks a moving target:
 
 - `--scan-window` - how long each scan burst runs before a round. Set it
   shorter than however often your targets' identifiers change, so you
@@ -64,51 +65,74 @@ Three knobs control how this tracks a moving target:
   device that answers, not just your targets - use this to scope
   discovery to hardware you're actually testing.
 
-## Classic BR/EDR vs. LE
+## Classic BR/EDR vs. LE vs. auto
 
 Most modern peripherals - wearables, sensors, beacons, most IoT hardware
 - are Bluetooth LE only and won't respond to classic `Create Connection`
-at all. Pass `--le` to switch the whole tool (both discovery and
-connects) to the LE equivalents. Without `--le`, it speaks classic
-BR/EDR, matching hardware that still uses the "page scan" style
-connection flow.
+at all; older/simpler devices are often classic-only. `--mode` controls
+which transport(s) are used:
 
-One LE-specific note: `Create Connection` needs the correct
+- `--mode auto` (**default**) - supports both without needing to know
+  which one a target uses in advance:
+  - In `--discover` mode, both an `Inquiry` burst and an LE scan burst
+    run before each round, and each discovered target is connected with
+    whichever transport it actually answered on.
+  - In static-list mode, each MAC tries classic first, then LE (public
+    address) if classic doesn't succeed, and caches whichever transport
+    worked so later rounds don't pay for both attempts every time.
+- `--mode classic` - classic BR/EDR only (`Inquiry` / `Create Connection`).
+- `--mode le` - LE only (LE scan / `LE Create Connection`).
+
+Trade-off: `auto` costs up to double the time per attempt against a
+target that's genuinely unreachable on both transports (or during the
+first, uncached attempt against each new static-list target), since it
+has to try both before giving up. If you already know your fleet is
+one transport or the other, pinning `--mode` avoids that overhead.
+
+One LE-specific note: `LE Create Connection` needs the correct
 public-vs-random address type for a peer, or the controller will reject
 it. In `--discover` mode this is learned automatically from the scan. In
 static-list mode there's no way to specify it from a plain MAC list, so
-it defaults to public (`0x00`) - if your targets use random addresses,
-use `--discover` instead of a static file.
+`--mode le` and the LE half of `--mode auto` both default to public
+(`0x00`) - if your targets use random addresses, use `--discover`
+instead of a static file.
 
 **Heads up on LE advertising report parsing**: the LE Advertising Report
 event uses a parallel-array wire format (all address types together,
 then all addresses together, etc. - not per-device chunks), which is
 implemented here per the Core Spec but hasn't been validated against a
-real capture. If `--le --discover` doesn't pick up devices you can see
-with `bluetoothctl` or a phone, that parsing is the first place to check
-- ideally with a packet capture (`btmon`) to compare against.
+real capture. If LE discovery doesn't pick up devices you can see with
+`bluetoothctl` or a phone, that parsing is the first place to check -
+ideally with a packet capture (`btmon`) to compare against.
 
 ## Usage examples
 
-Fixed list, classic BT, 50 reconnect rounds:
+Fixed list, don't know (or don't want to specify) classic vs. LE per
+device, 50 reconnect rounds - this is the default:
 ```
 python3 hci_connector.py -f devices.txt -d 0 --rounds 50 -t 5 -v
 ```
 
-Live discovery, classic BT, scoped to a known OUI, rotating identifiers:
+Live discovery, auto transport, scoped to a known OUI, rotating
+identifiers:
 ```
 python3 hci_connector.py -d 0 --discover --allow-prefix 28:CD:C1 \
     --ttl 15 --scan-window 3 --rounds 100 -t 5 -v
 ```
 
-LE peripheral with a fixed public address:
+Classic-only, fixed list (skip the LE fallback attempt entirely):
 ```
-python3 hci_connector.py -f devices.txt --le -d 0 --rounds 50 -t 5 -v
+python3 hci_connector.py -f devices.txt --mode classic -d 0 --rounds 50 -t 5 -v
 ```
 
-LE with rotating random addresses, discovered live:
+LE-only peripheral with a fixed public address:
 ```
-python3 hci_connector.py --le --discover --allow-prefix DE:AD:BE \
+python3 hci_connector.py -f devices.txt --mode le -d 0 --rounds 50 -t 5 -v
+```
+
+LE-only with rotating random addresses, discovered live:
+```
+python3 hci_connector.py --mode le --discover --allow-prefix DE:AD:BE \
     --ttl 20 --scan-window 4 --rounds 100 -t 8 -v
 ```
 

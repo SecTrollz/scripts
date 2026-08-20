@@ -222,12 +222,14 @@ class HCIReconnectTester:
         min_delay_ms: int = DEFAULT_MIN_DELAY_MS,
         max_delay_ms: int = DEFAULT_MAX_DELAY_MS,
         initial_delay_ms: int = DEFAULT_INITIAL_DELAY_MS,
-        le: bool = False,
+        mode: str = "auto",
     ):
+        if mode not in ("auto", "classic", "le"):
+            raise ValueError("mode must be 'auto', 'classic', or 'le'")
         self.dev_id = dev_id
         self.connect_timeout = connect_timeout
         self.retries = retries
-        self.le = le
+        self.mode = mode
         self.min_delay = min_delay_ms / 1000.0
         self.max_delay = max_delay_ms / 1000.0
         self.initial_delay = initial_delay_ms / 1000.0
@@ -235,6 +237,7 @@ class HCIReconnectTester:
         self._stop = False
         self._current_delay = self.initial_delay
         self._consecutive_fails = 0
+        self._transport_cache = {}  # mac -> 'classic' | 'le', learned in auto mode
         self._stats = {
             "attempts": 0,
             "success": 0,
@@ -276,7 +279,7 @@ class HCIReconnectTester:
                 break
             addr_bytes = data[offset:offset + 6]
             mac = ':'.join(f'{b:02X}' for b in reversed(addr_bytes))
-            tracker.observe(mac)
+            tracker.observe(mac, meta=('classic', None))
             offset += entry_size
 
     def _scan_burst(self, hci: HCISocket, tracker: TargetTracker, scan_window: float) -> None:
@@ -382,7 +385,7 @@ class HCIReconnectTester:
 
         for addr_bytes, addr_type in zip(addresses, addr_types):
             mac = ':'.join(f'{b:02X}' for b in reversed(addr_bytes))
-            tracker.observe(mac, meta=addr_type)
+            tracker.observe(mac, meta=('le', addr_type))
 
     def _scan_burst_le(self, hci: HCISocket, tracker: TargetTracker, scan_window: float) -> None:
         """Run one LE scan burst on the given socket, feeding results into tracker."""
@@ -464,6 +467,27 @@ class HCIReconnectTester:
             hci.recv_event(0.3)
         return False
 
+    def connect_one_auto(self, mac: str, hci: HCISocket) -> bool:
+        """
+        Transport-agnostic connect for a static target list: tries whichever
+        transport already worked for this MAC before, or tries classic then
+        LE (public address) the first time, caching whichever succeeds so
+        later rounds don't pay for both attempts every time.
+        """
+        cached = self._transport_cache.get(mac)
+        if cached == 'le':
+            return self.connect_one_le(mac, 0x00, hci)
+        if cached == 'classic':
+            return self.connect_one(mac, hci)
+
+        if self.connect_one(mac, hci):
+            self._transport_cache[mac] = 'classic'
+            return True
+        if self.connect_one_le(mac, 0x00, hci):
+            self._transport_cache[mac] = 'le'
+            return True
+        return False
+
     def run(
         self,
         macs: Optional[List[str]] = None,
@@ -479,13 +503,22 @@ class HCIReconnectTester:
         the local controller, for the given number of rounds.
 
         With discover=False (default), targets are the fixed `macs` list.
-        With discover=True, a short Inquiry burst runs before each round
-        on the same socket, and the round targets whatever's currently
-        live in the TargetTracker (last seen within `ttl` seconds) -
-        so rotating/emulated identifiers get picked up as they change
+        With discover=True, a short scan burst runs before each round on
+        the same socket, and the round targets whatever's currently live
+        in the TargetTracker (last seen within `ttl` seconds) - so
+        rotating/emulated identifiers get picked up as they change
         instead of chasing a stale static list. `allow_prefixes` scopes
         discovery to known target OUIs so it doesn't chase unrelated
         nearby devices.
+
+        self.mode controls which transport(s) are used:
+        - 'classic': classic BR/EDR only (Inquiry / Create Connection)
+        - 'le': LE only (LE Scan / LE Create Connection)
+        - 'auto' (default): both. In discover mode, both an Inquiry and an
+          LE scan burst run each cycle and each target is connected with
+          whichever transport it was actually seen on. In static-list
+          mode, each MAC tries classic then LE the first time and caches
+          whichever transport works.
         """
         if not discover and not macs:
             raise ValueError("macs is required when discover=False")
@@ -503,26 +536,32 @@ class HCIReconnectTester:
             round_num = 0
             while round_num < rounds and not self._stop:
                 if discover:
-                    if self.le:
-                        self._scan_burst_le(hci, tracker, scan_window)
-                        targets = tracker.live_targets()
-                    else:
+                    if self.mode in ('classic', 'auto'):
                         self._scan_burst(hci, tracker, scan_window)
-                        targets = [(m, None) for m in tracker.live_macs()]
+                    if self.mode in ('le', 'auto'):
+                        self._scan_burst_le(hci, tracker, scan_window)
+                    targets = tracker.live_targets()
                     if not targets:
                         logging.info("No live targets discovered yet, rescanning...")
                         continue
                 else:
-                    # Static list: LE needs an address type per target - default to
-                    # public (0x00). Devices using random addresses need --discover
-                    # to learn the correct type instead of a static file.
-                    targets = [(m, 0x00 if self.le else None) for m in macs]
+                    if self.mode == 'classic':
+                        targets = [(m, ('classic', None)) for m in macs]
+                    elif self.mode == 'le':
+                        targets = [(m, ('le', 0x00)) for m in macs]
+                    else:
+                        targets = [(m, ('auto', None)) for m in macs]
 
                 round_num += 1
-                for mac, addr_type in targets:
+                for mac, (transport, payload) in targets:
                     if self._stop:
                         break
-                    ok = self.connect_one_le(mac, addr_type, hci) if self.le else self.connect_one(mac, hci)
+                    if transport == 'classic':
+                        ok = self.connect_one(mac, hci)
+                    elif transport == 'le':
+                        ok = self.connect_one_le(mac, payload if payload is not None else 0x00, hci)
+                    else:
+                        ok = self.connect_one_auto(mac, hci)
                     processed += 1
 
                     with self._lock:
@@ -594,10 +633,11 @@ def main():
                          help="Seconds a discovered identifier stays a live target after last seen (--discover only)")
     parser.add_argument("--scan-window", type=float, default=DEFAULT_SCAN_WINDOW,
                          help="Inquiry/scan burst duration in seconds, run before each round (--discover only)")
-    parser.add_argument("--le", action="store_true",
-                         help="Use LE (Bluetooth Low Energy) instead of classic BR/EDR: LE scan for --discover, "
-                              "LE Create Connection for connects. Use this for most modern IoT/wearable/beacon "
-                              "peripherals, which are LE-only")
+    parser.add_argument("--mode", choices=["auto", "classic", "le"], default="auto",
+                         help="Transport to use: 'classic' (BR/EDR only), 'le' (Bluetooth Low Energy only), or "
+                              "'auto' (default) - tries both, so classic devices and LE-only devices "
+                              "(most modern wearables/sensors/beacons) are both supported without knowing "
+                              "which one a target uses in advance")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging")
     args = parser.parse_args()
 
@@ -625,18 +665,19 @@ def main():
         min_delay_ms=args.min_delay,
         max_delay_ms=args.max_delay,
         initial_delay_ms=args.initial_delay,
-        le=args.le,
+        mode=args.mode,
     )
 
-    mode = "LE" if args.le else "classic BR/EDR"
     if args.discover:
         logging.info(
-            f"Starting reconnect test: {mode} live discovery on hci{args.dev} "
+            f"Starting reconnect test: mode={args.mode} live discovery on hci{args.dev} "
             f"(ttl={args.ttl}s, scan={args.scan_window}s, {args.rounds} round(s), "
             f"prefixes={args.allow_prefix or 'any'})"
         )
     else:
-        logging.info(f"Starting reconnect test: {mode}, {len(macs)} devices x {args.rounds} round(s) on hci{args.dev}")
+        logging.info(
+            f"Starting reconnect test: mode={args.mode}, {len(macs)} devices x {args.rounds} round(s) on hci{args.dev}"
+        )
 
     def progress(processed, total):
         if total is None:
