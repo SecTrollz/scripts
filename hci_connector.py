@@ -611,6 +611,47 @@ def load_macs_from_file(filepath: str) -> List[str]:
     return list(dict.fromkeys(valid))  # dedupe, preserve order
 
 
+CONSENT_BANNER = """\
+================================================================
+ hci_connector.py - active Bluetooth reconnect stress tester
+================================================================
+ This tool actively scans for and connects to real nearby
+ Bluetooth devices (classic and/or LE). Only run it against
+ devices you own or are explicitly authorized to test.
+================================================================\
+"""
+
+
+def confirm_authorized_use(assume_yes: bool = False) -> None:
+    """
+    Print the consent banner and require explicit confirmation before
+    doing anything active on the radio. --yes/-y confirms non-interactively
+    for scripted runs; otherwise this requires a typed 'yes' at a TTY and
+    exits rather than silently proceeding if neither is available.
+    """
+    print(CONSENT_BANNER, file=sys.stderr)
+
+    if assume_yes:
+        logging.info("Authorization confirmed via --yes")
+        return
+
+    if not sys.stdin.isatty():
+        logging.error(
+            "No TTY to prompt for confirmation and --yes was not passed. "
+            "Re-run with -y/--yes to confirm you're authorized to target these devices."
+        )
+        sys.exit(1)
+
+    try:
+        answer = input("Type 'yes' to confirm you are authorized to proceed: ")
+    except (EOFError, KeyboardInterrupt):
+        answer = ""
+
+    if answer.strip().lower() != "yes":
+        logging.error("Not confirmed - exiting.")
+        sys.exit(1)
+
+
 # -------------------- Main Entry Point --------------------
 
 def main():
@@ -628,7 +669,9 @@ def main():
                          help="Discover live targets via HCI Inquiry between rounds instead of using a static file "
                               "- for targets with rotating/changing identifiers")
     parser.add_argument("--allow-prefix", action="append", default=None,
-                         help="Restrict --discover to BD_ADDR prefixes (OUIs), e.g. AA:BB:CC. Repeatable")
+                         help="Optional: restrict --discover to BD_ADDR prefixes (OUIs), e.g. AA:BB:CC. Repeatable. "
+                              "Only useful when targets keep a stable OUI while rotating the rest of the address - "
+                              "does nothing for targets using fully-random addresses")
     parser.add_argument("--ttl", type=float, default=DEFAULT_TARGET_TTL,
                          help="Seconds a discovered identifier stays a live target after last seen (--discover only)")
     parser.add_argument("--scan-window", type=float, default=DEFAULT_SCAN_WINDOW,
@@ -638,6 +681,9 @@ def main():
                               "'auto' (default) - tries both, so classic devices and LE-only devices "
                               "(most modern wearables/sensors/beacons) are both supported without knowing "
                               "which one a target uses in advance")
+    parser.add_argument("-y", "--yes", action="store_true",
+                         help="Confirm you are authorized to run this against its targets, non-interactively "
+                              "(skips the interactive consent prompt - for scripted/automated runs)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging")
     args = parser.parse_args()
 
@@ -645,6 +691,8 @@ def main():
         level=logging.DEBUG if args.verbose else logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s"
     )
+
+    confirm_authorized_use(assume_yes=args.yes)
 
     macs = None
     if not args.discover:

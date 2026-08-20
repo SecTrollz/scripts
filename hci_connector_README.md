@@ -60,10 +60,12 @@ currently live. Three knobs control how this tracks a moving target:
   never go a full round without a fresh read.
 - `--ttl` - how long a discovered identifier is considered "live" after
   last being seen. Once it expires, the script stops chasing it.
-- `--allow-prefix AA:BB:CC` (repeatable) - restrict discovery to known
-  address prefixes (OUIs). Without this, a scan picks up *every* nearby
-  device that answers, not just your targets - use this to scope
-  discovery to hardware you're actually testing.
+- `--allow-prefix AA:BB:CC` (repeatable, optional) - restrict discovery
+  to known address prefixes (OUIs), if your targets keep a stable OUI
+  while rotating the rest of the address. This does nothing for targets
+  using fully-random addresses (no fixed prefix to filter on) - without
+  it, or when it doesn't apply, a scan picks up every nearby device that
+  answers, not just your targets. See **Authorization** below.
 
 ## Classic BR/EDR vs. LE vs. auto
 
@@ -110,39 +112,50 @@ ideally with a packet capture (`btmon`) to compare against.
 Fixed list, don't know (or don't want to specify) classic vs. LE per
 device, 50 reconnect rounds - this is the default:
 ```
-python3 hci_connector.py -f devices.txt -d 0 --rounds 50 -t 5 -v
+python3 hci_connector.py -f devices.txt -d 0 --rounds 50 -t 5 -v -y
 ```
 
 Live discovery, auto transport, scoped to a known OUI, rotating
 identifiers:
 ```
 python3 hci_connector.py -d 0 --discover --allow-prefix 28:CD:C1 \
-    --ttl 15 --scan-window 3 --rounds 100 -t 5 -v
+    --ttl 15 --scan-window 3 --rounds 100 -t 5 -v -y
 ```
 
 Classic-only, fixed list (skip the LE fallback attempt entirely):
 ```
-python3 hci_connector.py -f devices.txt --mode classic -d 0 --rounds 50 -t 5 -v
+python3 hci_connector.py -f devices.txt --mode classic -d 0 --rounds 50 -t 5 -v -y
 ```
 
 LE-only peripheral with a fixed public address:
 ```
-python3 hci_connector.py -f devices.txt --mode le -d 0 --rounds 50 -t 5 -v
+python3 hci_connector.py -f devices.txt --mode le -d 0 --rounds 50 -t 5 -v -y
 ```
 
-LE-only with rotating random addresses, discovered live:
+LE-only with rotating/fully-random addresses, discovered live (no
+`--allow-prefix` - a random address has no stable OUI to filter on):
 ```
-python3 hci_connector.py --mode le --discover --allow-prefix DE:AD:BE \
-    --ttl 20 --scan-window 4 --rounds 100 -t 8 -v
+python3 hci_connector.py --mode le --discover \
+    --ttl 20 --scan-window 4 --rounds 100 -t 8 -v -y
 ```
 
-## Intended use
+## Authorization
 
 This is a reconnect/load-testing tool for Bluetooth hardware you own or
 are authorized to test - a bench rig, a fleet of devices under your
 control, or similar. It actively scans for and connects to real
 Bluetooth devices; point it only at things you have permission to
-connect to.
+connect to. `--allow-prefix` can narrow *what* a scan picks up when it
+applies, but it isn't reliable enforcement (it does nothing against
+fully-random addresses) and isn't the thing that's supposed to be
+doing the enforcing here.
+
+Every run prints a warning banner and requires explicit confirmation
+before touching the radio - type `yes` at the prompt, or pass `-y/--yes`
+to confirm non-interactively for scripted/automated runs. This is a
+consent gate, not a technical restriction: it doesn't verify anything
+about the targets, it just makes sure a human (or an explicit flag)
+affirmed authorization before the tool does anything active.
 
 ## Output
 
