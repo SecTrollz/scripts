@@ -12,6 +12,9 @@ rather than faking concurrency with a thread pool.
 Features:
 - Correct HCI Create Connection / Connection Complete / Disconnect flow
 - Retry with adaptive backoff
+- Optional live target discovery (--discover) via HCI Inquiry, interleaved
+  between rounds on the same socket, for targets with rotating/changing
+  identifiers - scopeable to known OUIs with --allow-prefix
 - MAC validation and deduplication
 - Detailed logging and performance metrics
 - Graceful shutdown and resource cleanup
@@ -42,10 +45,17 @@ HCI_EVENT_PKT = 0x04
 OGF_LINK_CTL = 0x01
 OCF_CREATE_CONN = 0x0005
 OCF_DISCONNECT = 0x0006
+OCF_INQUIRY = 0x0001
+OCF_INQUIRY_CANCEL = 0x0002
 
 EVT_CMD_STATUS = 0x0F
 EVT_CONN_COMPLETE = 0x03
 EVT_DISCONN_COMPLETE = 0x05
+EVT_INQUIRY_COMPLETE = 0x01
+EVT_INQUIRY_RESULT = 0x02
+EVT_INQUIRY_RESULT_WITH_RSSI = 0x22
+
+GIAC_LAP = bytes([0x33, 0x8B, 0x9E])  # General Inquiry Access Code 0x9E8B33, little-endian on the wire
 
 DEFAULT_HCI_DEV = 0
 DEFAULT_CONNECT_TIMEOUT = 5.0
@@ -53,6 +63,8 @@ DEFAULT_RETRIES = 1
 DEFAULT_MIN_DELAY_MS = 20
 DEFAULT_MAX_DELAY_MS = 150
 DEFAULT_INITIAL_DELAY_MS = 50
+DEFAULT_TARGET_TTL = 30.0
+DEFAULT_SCAN_WINDOW = 4.0
 
 
 def hci_opcode(ogf: int, ocf: int) -> int:
@@ -123,13 +135,56 @@ class HCISocket:
         self.close()
 
 
+# -------------------- Live Target Tracking --------------------
+
+class TargetTracker:
+    """
+    Tracks recently-discovered BD_ADDRs with a last-seen timestamp so
+    rotating/emulated identifiers can be chased as they change, instead
+    of relying on a MAC list that goes stale. Optionally restricted to
+    an allowlist of address prefixes (OUIs) so discovery only picks up
+    the intended targets rather than every nearby classic BT device.
+    """
+
+    def __init__(self, ttl: float, allow_prefixes: Optional[List[str]] = None):
+        self.ttl = ttl
+        self.allow_prefixes = [p.upper().replace('-', ':') for p in (allow_prefixes or [])]
+        self._lock = threading.Lock()
+        self._seen = {}  # mac -> last_seen timestamp
+
+    def _allowed(self, mac: str) -> bool:
+        if not self.allow_prefixes:
+            return True
+        mac_u = mac.upper()
+        return any(mac_u.startswith(p) for p in self.allow_prefixes)
+
+    def observe(self, mac: str) -> None:
+        if not self._allowed(mac):
+            return
+        with self._lock:
+            self._seen[mac] = time.time()
+
+    def live_macs(self) -> List[str]:
+        now = time.time()
+        with self._lock:
+            return [m for m, t in self._seen.items() if now - t <= self.ttl]
+
+    def prune(self) -> None:
+        now = time.time()
+        with self._lock:
+            stale = [m for m, t in self._seen.items() if now - t > self.ttl]
+            for m in stale:
+                del self._seen[m]
+
+
 # -------------------- Connection Manager --------------------
 
 class HCIReconnectTester:
     """
     Queues Create Connection attempts on a single local controller and
-    measures reconnect behavior against a fixed device list. One attempt
-    is in flight at a time - that matches what a real controller can do.
+    measures reconnect behavior against a fixed or live-discovered device
+    list. One attempt is in flight at a time - that matches what a real
+    controller can do.
     """
 
     def __init__(
@@ -177,6 +232,52 @@ class HCIReconnectTester:
             if evt and evt.code == EVT_DISCONN_COMPLETE:
                 return
 
+    @staticmethod
+    def _parse_inquiry_result(data: bytes, tracker: TargetTracker) -> None:
+        # Both EVT_INQUIRY_RESULT and EVT_INQUIRY_RESULT_WITH_RSSI are
+        # Num_Responses(1) followed by fixed 14-byte entries, BD_ADDR
+        # first in each entry - that's the only field we need.
+        if len(data) < 1:
+            return
+        num = data[0]
+        offset = 1
+        entry_size = 14
+        for _ in range(num):
+            if offset + 6 > len(data):
+                break
+            addr_bytes = data[offset:offset + 6]
+            mac = ':'.join(f'{b:02X}' for b in reversed(addr_bytes))
+            tracker.observe(mac)
+            offset += entry_size
+
+    def _scan_burst(self, hci: HCISocket, tracker: TargetTracker, scan_window: float) -> None:
+        """Run one Inquiry burst on the given socket, feeding results into tracker."""
+        opcode_inq = hci_opcode(OGF_LINK_CTL, OCF_INQUIRY)
+        length_units = max(1, min(0x30, round(scan_window / 1.28)))
+        params = GIAC_LAP + struct.pack('<B', length_units) + struct.pack('<B', 0)
+        hci.send_command(HCICommand(opcode_inq, params))
+
+        deadline = time.time() + scan_window + 1.0
+        completed = False
+        while time.time() < deadline and not self._stop:
+            evt = hci.recv_event(0.2)
+            if not evt:
+                continue
+            if evt.code in (EVT_INQUIRY_RESULT, EVT_INQUIRY_RESULT_WITH_RSSI):
+                self._parse_inquiry_result(evt.data, tracker)
+            elif evt.code == EVT_INQUIRY_COMPLETE:
+                completed = True
+                break
+
+        if not completed:
+            # Scan didn't self-terminate in time (or we're stopping) - cancel it
+            # so it doesn't keep occupying the radio during connect attempts.
+            opcode_cancel = hci_opcode(OGF_LINK_CTL, OCF_INQUIRY_CANCEL)
+            hci.send_command(HCICommand(opcode_cancel, b''))
+            hci.recv_event(0.5)
+
+        tracker.prune()
+
     def connect_one(self, mac: str, hci: HCISocket) -> bool:
         """Attempt a single connection (with retries) on an already-open socket."""
         mac_bytes = bytes(reversed(bytes.fromhex(mac.replace(':', ''))))  # BD_ADDR is little-endian on the wire
@@ -219,24 +320,53 @@ class HCIReconnectTester:
 
     def run(
         self,
-        macs: List[str],
+        macs: Optional[List[str]] = None,
         rounds: int = 1,
         progress_callback=None,
+        discover: bool = False,
+        ttl: float = DEFAULT_TARGET_TTL,
+        allow_prefixes: Optional[List[str]] = None,
+        scan_window: float = DEFAULT_SCAN_WINDOW,
     ) -> Tuple[int, int, float]:
         """
-        Repeatedly attempt reconnects to each MAC, one attempt in flight
-        at a time on the local controller, for the given number of rounds.
+        Repeatedly attempt reconnects, one attempt in flight at a time on
+        the local controller, for the given number of rounds.
+
+        With discover=False (default), targets are the fixed `macs` list.
+        With discover=True, a short Inquiry burst runs before each round
+        on the same socket, and the round targets whatever's currently
+        live in the TargetTracker (last seen within `ttl` seconds) -
+        so rotating/emulated identifiers get picked up as they change
+        instead of chasing a stale static list. `allow_prefixes` scopes
+        discovery to known target OUIs so it doesn't chase unrelated
+        nearby devices.
         """
+        if not discover and not macs:
+            raise ValueError("macs is required when discover=False")
+
         self._stop = False
         success_count = 0
         fail_count = 0
         start_time = time.time()
-        total = len(macs) * rounds
         processed = 0
+        total = None if discover else len(macs) * rounds
+
+        tracker = TargetTracker(ttl=ttl, allow_prefixes=allow_prefixes) if discover else None
 
         with HCISocket(self.dev_id) as hci:
-            for _ in range(rounds):
-                for mac in macs:
+            round_num = 0
+            while round_num < rounds and not self._stop:
+                if discover:
+                    self._scan_burst(hci, tracker, scan_window)
+                    targets = tracker.live_macs()
+                    if not targets:
+                        logging.info("No live targets discovered yet, rescanning...")
+                        continue
+                else:
+                    targets = macs
+
+                round_num += 1
+                for mac in targets:
                     if self._stop:
                         break
                     ok = self.connect_one(mac, hci)
@@ -294,14 +424,23 @@ def load_macs_from_file(filepath: str) -> List[str]:
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Raw HCI Bluetooth reconnect stress tester")
-    parser.add_argument("-f", "--file", default="devices.txt", help="File with target MACs (one per line)")
+    parser.add_argument("-f", "--file", default="devices.txt", help="File with target MACs (one per line). Ignored with --discover")
     parser.add_argument("-d", "--dev", type=int, default=DEFAULT_HCI_DEV, help="HCI device index (e.g. 0 for hci0)")
-    parser.add_argument("--rounds", type=int, default=1, help="Number of reconnect rounds per device")
+    parser.add_argument("--rounds", type=int, default=1, help="Number of reconnect rounds")
     parser.add_argument("-t", "--timeout", type=float, default=DEFAULT_CONNECT_TIMEOUT, help="Per-attempt timeout (seconds)")
     parser.add_argument("-r", "--retries", type=int, default=DEFAULT_RETRIES, help="Retry attempts per device per round")
     parser.add_argument("--min-delay", type=int, default=DEFAULT_MIN_DELAY_MS, help="Minimum delay between attempts (ms)")
     parser.add_argument("--max-delay", type=int, default=DEFAULT_MAX_DELAY_MS, help="Maximum delay between attempts (ms)")
     parser.add_argument("--initial-delay", type=int, default=DEFAULT_INITIAL_DELAY_MS, help="Initial delay (ms)")
+    parser.add_argument("--discover", action="store_true",
+                         help="Discover live targets via HCI Inquiry between rounds instead of using a static file "
+                              "- for targets with rotating/changing identifiers")
+    parser.add_argument("--allow-prefix", action="append", default=None,
+                         help="Restrict --discover to BD_ADDR prefixes (OUIs), e.g. AA:BB:CC. Repeatable")
+    parser.add_argument("--ttl", type=float, default=DEFAULT_TARGET_TTL,
+                         help="Seconds a discovered identifier stays a live target after last seen (--discover only)")
+    parser.add_argument("--scan-window", type=float, default=DEFAULT_SCAN_WINDOW,
+                         help="Inquiry burst duration in seconds, run before each round (--discover only)")
     parser.add_argument("-v", "--verbose", action="store_true", help="Enable verbose logging")
     args = parser.parse_args()
 
@@ -310,15 +449,17 @@ def main():
         format="%(asctime)s [%(levelname)s] %(message)s"
     )
 
-    try:
-        macs = load_macs_from_file(args.file)
-    except Exception as e:
-        logging.error(f"Failed to load MACs: {e}")
-        sys.exit(1)
+    macs = None
+    if not args.discover:
+        try:
+            macs = load_macs_from_file(args.file)
+        except Exception as e:
+            logging.error(f"Failed to load MACs: {e}")
+            sys.exit(1)
 
-    if not macs:
-        logging.error("No valid MACs found.")
-        sys.exit(1)
+        if not macs:
+            logging.error("No valid MACs found.")
+            sys.exit(1)
 
     tester = HCIReconnectTester(
         dev_id=args.dev,
@@ -329,14 +470,32 @@ def main():
         initial_delay_ms=args.initial_delay,
     )
 
-    logging.info(f"Starting reconnect test: {len(macs)} devices x {args.rounds} round(s) on hci{args.dev}")
+    if args.discover:
+        logging.info(
+            f"Starting reconnect test: live discovery on hci{args.dev} "
+            f"(ttl={args.ttl}s, scan={args.scan_window}s, {args.rounds} round(s), "
+            f"prefixes={args.allow_prefix or 'any'})"
+        )
+    else:
+        logging.info(f"Starting reconnect test: {len(macs)} devices x {args.rounds} round(s) on hci{args.dev}")
 
     def progress(processed, total):
-        if processed % 10 == 0 or processed == total:
+        if total is None:
+            if processed % 10 == 0:
+                logging.info(f"Progress: {processed} attempts so far")
+        elif processed % 10 == 0 or processed == total:
             logging.info(f"Progress: {processed}/{total} ({processed/total*100:.1f}%)")
 
     try:
-        success, failed, elapsed = tester.run(macs, rounds=args.rounds, progress_callback=progress)
+        success, failed, elapsed = tester.run(
+            macs,
+            rounds=args.rounds,
+            progress_callback=progress,
+            discover=args.discover,
+            ttl=args.ttl,
+            allow_prefixes=args.allow_prefix,
+            scan_window=args.scan_window,
+        )
         logging.info(f"Completed in {elapsed:.1f}s. Success: {success}, Failed: {failed}")
     except KeyboardInterrupt:
         tester.stop()
