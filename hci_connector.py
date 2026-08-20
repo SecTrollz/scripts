@@ -160,7 +160,7 @@ class HCIReconnectTester:
 
     def _next_delay(self) -> float:
         with self._lock:
-            if self._consecutive_fails >= 10:
+            if self._consecutive_fails > 0:
                 self._current_delay = min(self._current_delay * 1.5, self.max_delay)
             else:
                 self._current_delay = max(self._current_delay * 0.95, self.min_delay)
@@ -202,12 +202,12 @@ class HCIReconnectTester:
                 evt = hci.recv_event(0.1)
                 if not evt:
                     continue
-                if evt.code == EVT_CMD_STATUS and len(evt.data) >= 3 and evt.data[1:3] == struct.pack('<H', opcode):
+                if evt.code == EVT_CMD_STATUS and len(evt.data) >= 4 and evt.data[2:4] == struct.pack('<H', opcode):
                     status = evt.data[0]
                     if status != 0x00:
                         break  # command rejected (e.g. another connection already in progress)
                     status_seen = True
-                elif evt.code == EVT_CONN_COMPLETE and status_seen and len(evt.data) >= 10:
+                elif evt.code == EVT_CONN_COMPLETE and status_seen and len(evt.data) >= 11:
                     conn_status = evt.data[0]
                     conn_handle = struct.unpack('<H', evt.data[1:3])[0]
                     conn_mac = evt.data[3:9]
