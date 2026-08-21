@@ -938,6 +938,19 @@ def deauth_capability(iface):
         return {'method': 'arp_fallback', 'iface_type': iface_type}
     return {'method': 'unavailable', 'iface_type': iface_type}
 
+def syn_flood_capability():
+    """What mechanism start_attack_syn_flood will actually use.
+
+    SYN Flood requires root to send raw TCP packets. It prefers hping3 (a
+    dedicated tool with no dependencies) but falls back to raw sockets if
+    hping3 is not installed.
+    """
+    if os.geteuid() != 0:
+        return {'method': 'unavailable', 'reason': 'not_root'}
+    # Check if hping3 is available
+    hping3_available = ensure_tool('hping3')
+    return {'method': 'available', 'tool': 'hping3' if hping3_available else 'raw_socket'}
+
 # ---------- checksum helpers ----------
 def ip_checksum(data):
     if len(data) % 2 == 1:
@@ -2933,6 +2946,7 @@ GODHAND_DDNS_ENABLED=1                  # optional, default on when the above ar
         <div class="weapon-btn" data-w="5"><span class="num">5</span><span class="label">Traffic Capture</span></div>
       </div>
       <div id="deauth-capability" class="status-message">Deauth method: checking...</div>
+      <div id="syn-flood-capability" class="status-message">SYN Flood method: checking...</div>
       <div style="display:flex; gap:10px; flex-wrap:wrap;">
         <button class="btn big" id="start-btn" onclick="confirmStartAttack()">▶ Start</button>
         <button class="btn big secondary" id="stop-btn" onclick="confirmStopAttack()" disabled>⏹ Stop</button>
@@ -3245,7 +3259,7 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
     btn.classList.add('active');
     document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
-    if (btn.dataset.tab === 'attacks') refreshDeauthCapability();
+    if (btn.dataset.tab === 'attacks') { refreshDeauthCapability(); refreshSynFloodCapability(); }
   });
 });
 
@@ -3799,6 +3813,24 @@ async function refreshDeauthCapability() {
       box.innerHTML = `<span class="badge warning">ARP fallback</span> ${res.iface_type} interface has no monitor mode/injection support (typical for a phone's built-in Wi-Fi, and there's no netlink shortcut around it — a client interface can only forge frames at itself, not a third party) — Kick / Deauth Flood will fall back to ARP-based disconnection instead. This cuts network access rather than sending a true 802.11 deauth frame, and is less durable.`;
     } else {
       box.innerHTML = `<span class="badge danger">Unavailable</span> Interface is ${res.iface_type}, doesn't support monitor mode, and no gateway is set for the ARP-based fallback — Kick / Deauth Flood can't function yet. Set a gateway on the Settings tab.`;
+    }
+  } catch(e) {}
+}
+
+async function refreshSynFloodCapability() {
+  const box = document.getElementById('syn-flood-capability');
+  if (!box) return;
+  try {
+    const res = await apiCall('syn_flood_capability');
+    if (!res.success) {
+      box.textContent = 'SYN Flood method: ' + (res.error || 'unknown');
+      return;
+    }
+    if (res.method === 'available') {
+      const toolName = res.tool === 'hping3' ? 'hping3 (recommended)' : 'raw socket';
+      box.innerHTML = `<span class="badge success">Available</span> SYN Flood will use ${toolName} to send SYN packets. Requires root; you're running as root.`;
+    } else {
+      box.innerHTML = `<span class="badge danger">Unavailable</span> SYN Flood requires root — not running as root. Run with \`sudo\` (or as root in Termux) to enable this weapon.`;
     }
   } catch(e) {}
 }
@@ -4817,6 +4849,11 @@ def api_deauth_capability():
     if not iface:
         return jsonify({'success': False, 'error': 'Interface not set'})
     return jsonify({'success': True, **deauth_capability(iface)})
+
+@app.route('/api/syn_flood_capability', methods=['GET'])
+@require_auth
+def api_syn_flood_capability():
+    return jsonify({'success': True, **syn_flood_capability()})
 
 @app.route('/api/packet_builder/send', methods=['POST'])
 @require_auth
