@@ -3039,6 +3039,26 @@ GODHAND_DDNS_ENABLED=1                  # optional, default on when the above ar
     <div class="card">
       <h2>Live packet feed</h2>
       <p class="sub">Every IPv4 TCP/UDP/ICMP packet to or from your targets, newest at the bottom -- like a live Wireshark capture scoped to this device.</p>
+      <div style="display:grid; grid-template-columns:1fr 1fr 1fr auto; gap:8px; margin-bottom:12px; align-items:end;">
+        <div>
+          <label style="font-size:0.75rem; display:block; margin-bottom:4px; color:#999;">Protocol</label>
+          <select id="filter-proto" onchange="applyPacketFilters()" style="width:100%; padding:6px; border:1px solid #444; background:#1a1a1a; color:#0f0; border-radius:4px; font-size:0.85rem;">
+            <option value="">All</option>
+            <option value="tcp">TCP only</option>
+            <option value="udp">UDP only</option>
+            <option value="icmp">ICMP only</option>
+          </select>
+        </div>
+        <div>
+          <label style="font-size:0.75rem; display:block; margin-bottom:4px; color:#999;">Source/Dest IP</label>
+          <input type="text" id="filter-ip" placeholder="Filter by IP" onkeyup="applyPacketFilters()" style="width:100%; padding:6px; border:1px solid #444; background:#1a1a1a; color:#0f0; border-radius:4px; font-size:0.85rem;">
+        </div>
+        <div>
+          <label style="font-size:0.75rem; display:block; margin-bottom:4px; color:#999;">Info search</label>
+          <input type="text" id="filter-info" placeholder="HTTP status, port, TLS SNI..." onkeyup="applyPacketFilters()" style="width:100%; padding:6px; border:1px solid #444; background:#1a1a1a; color:#0f0; border-radius:4px; font-size:0.85rem;">
+        </div>
+        <button onclick="clearPacketFilters()" style="padding:6px 12px; background:#444; color:#0f0; border:1px solid #555; border-radius:4px; cursor:pointer; font-size:0.85rem;">Reset</button>
+      </div>
       <div class="table-responsive" style="max-height:380px; overflow-y:auto;">
         <table id="traffic-packets-table" style="display:none; font-family:'JetBrains Mono',monospace; font-size:0.78rem;">
           <thead><tr><th>No.</th><th>Time</th><th>Dir</th><th>Source</th><th>Destination</th><th>Proto</th><th>Length</th><th>Info</th></tr></thead>
@@ -3304,16 +3324,18 @@ function formatPacketRow(e) {
     </tr>
   `;
 }
+var TRAFFIC_ALL_ENTRIES = [];
 async function pollTrafficCapture() {
   try {
     const res = await apiCall('monitor_log');
+    TRAFFIC_ALL_ENTRIES = res.entries || [];
     const table = document.getElementById('traffic-packets-table');
     const body = document.getElementById('traffic-packets-body');
     const empty = document.getElementById('traffic-empty');
-    if (res.entries && res.entries.length) {
+    if (TRAFFIC_ALL_ENTRIES.length) {
       empty.style.display = 'none';
       table.style.display = 'table';
-      body.innerHTML = res.entries.map(formatPacketRow).join('');
+      applyPacketFilters();
       const wrap = table.closest('.table-responsive');
       if (wrap) wrap.scrollTop = wrap.scrollHeight;
     } else {
@@ -3325,7 +3347,7 @@ async function pollTrafficCapture() {
     }
     const attacksStatus = document.getElementById('attacks-traffic-status');
     if (attacksStatus) {
-      const n = res.entries ? res.entries.length : 0;
+      const n = TRAFFIC_ALL_ENTRIES.length;
       attacksStatus.textContent = res.capturing
         ? `Capturing — ${n} recent packet(s) logged. See the Monitor tab for the full analysis panel.`
         : 'Not capturing.';
@@ -3333,6 +3355,32 @@ async function pollTrafficCapture() {
   } catch(e) {}
   refreshTrafficStats();
   refreshTcpStreams();
+}
+
+function applyPacketFilters() {
+  const proto = document.getElementById('filter-proto').value.toLowerCase();
+  const ip = document.getElementById('filter-ip').value.toLowerCase();
+  const info = document.getElementById('filter-info').value.toLowerCase();
+
+  const filtered = TRAFFIC_ALL_ENTRIES.filter(e => {
+    if (proto && e.proto !== proto) return false;
+    if (ip && !e.src.toLowerCase().includes(ip) && !e.dst.toLowerCase().includes(ip)) return false;
+    if (info) {
+      const infoStr = (formatPacketInfo(e) + '').toLowerCase();
+      if (!infoStr.includes(info)) return false;
+    }
+    return true;
+  });
+
+  const body = document.getElementById('traffic-packets-body');
+  body.innerHTML = filtered.map(formatPacketRow).join('') || '<tr><td colspan="8" style="text-align:center; color:#666;">No packets match filters.</td></tr>';
+}
+
+function clearPacketFilters() {
+  document.getElementById('filter-proto').value = '';
+  document.getElementById('filter-ip').value = '';
+  document.getElementById('filter-info').value = '';
+  applyPacketFilters();
 }
 
 function escapeHtml(s) {
