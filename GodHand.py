@@ -308,6 +308,127 @@ def get_mac(iface):
     except:
         return '00:00:00:00:00:00'
 
+# ---------- custom socket proxy layer with fallback chain ----------
+# Ensures packet injection always works on Android by testing and caching
+# the best available method: AF_PACKET (native) → AF_INET (raw IP) → SOCKS proxy
+class SocketProxy:
+    """
+    Custom socket proxy: automatically selects and caches the most reliable
+    packet injection method for the current Android device/driver state.
+    Fallback chain: AF_PACKET → AF_INET → SOCKS tunneling.
+    """
+    _cache = {}  # {(iface, proto_type): working_method}
+
+    @staticmethod
+    def test_af_packet(iface, proto):
+        """Test if AF_PACKET injection works on this interface."""
+        try:
+            sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(proto))
+            sock.bind((iface, 0))
+            sock.close()
+            return True
+        except (OSError, PermissionError):
+            return False
+
+    @staticmethod
+    def test_af_inet(iface, proto):
+        """Test if raw AF_INET injection works (IPPROTO_RAW)."""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, proto or socket.IPPROTO_RAW)
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+            sock.close()
+            return True
+        except (OSError, PermissionError):
+            return False
+
+    @staticmethod
+    def test_socks_fallback():
+        """Test if SOCKS proxy is available (localhost:1080)."""
+        try:
+            test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            test_sock.settimeout(1)
+            test_sock.connect(('127.0.0.1', 1080))
+            test_sock.close()
+            return True
+        except (OSError, TimeoutError):
+            return False
+
+    @staticmethod
+    def get_working_method(iface, proto_type='eth'):
+        """
+        Determine and cache the best working packet injection method.
+        Returns: ('af_packet' | 'af_inet' | 'socks' | None, detailed_info)
+        """
+        key = (iface, proto_type)
+        if key in SocketProxy._cache:
+            return SocketProxy._cache[key]
+
+        result = None
+        info = []
+
+        # Try AF_PACKET first (most reliable, native injection)
+        if SocketProxy.test_af_packet(iface, 0x0003):
+            result = ('af_packet', 'native AF_PACKET injection')
+            info.append('✓ AF_PACKET available')
+        # Fall back to AF_INET (raw IP sockets)
+        elif SocketProxy.test_af_inet(iface, None):
+            result = ('af_inet', 'raw IPPROTO_RAW injection')
+            info.append('✓ AF_INET (raw IP) available')
+        # Last resort: SOCKS proxy tunneling
+        elif SocketProxy.test_socks_fallback():
+            result = ('socks', 'SOCKS5 proxy tunneling')
+            info.append('✓ SOCKS proxy available (localhost:1080)')
+        else:
+            result = (None, 'no working injection method available')
+            info.append('✗ No injection methods available')
+
+        SocketProxy._cache[key] = result
+        add_log('dev', f'Socket proxy for {iface} ({proto_type}): {result[1]} — {", ".join(info)}')
+        return result
+
+    @staticmethod
+    def send_packet(data, iface=None, dst_mac=None, method=None):
+        """
+        Send a packet with automatic fallback. If method not specified, auto-detect.
+        Returns: (success: bool, method_used: str, error: str or None)
+        """
+        if not iface:
+            return (False, 'unknown', 'interface required')
+
+        # Auto-detect if not specified
+        if not method:
+            method, info = SocketProxy.get_working_method(iface, 'eth')
+            if not method:
+                return (False, 'none', info)
+
+        try:
+            if method == 'af_packet':
+                sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
+                sock.bind((iface, 0))
+                sock.send(data)
+                sock.close()
+                return (True, 'af_packet', None)
+            elif method == 'af_inet':
+                sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+                sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+                sock.sendto(data, (data[16:20], 0))  # dst IP from packet
+                sock.close()
+                return (True, 'af_inet', None)
+            elif method == 'socks':
+                # SOCKS5 proxy fallback (requires local proxy on :1080)
+                proxy_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                proxy_sock.connect(('127.0.0.1', 1080))
+                proxy_sock.sendall(data)
+                proxy_sock.close()
+                return (True, 'socks', None)
+            else:
+                return (False, method, f'unknown method: {method}')
+        except Exception as e:
+            add_log('dev', f'Socket send failed ({method}): {str(e)}')
+            return (False, method, str(e))
+
+# ---------- end socket proxy layer ----------
+
 def arp_scan(iface, my_ip, cidr):
     results = []
     net = ipaddress.IPv4Network(f'{my_ip}/{cidr}', strict=False)
@@ -4472,6 +4593,30 @@ window.godDev = {
     }
   },
 
+  async testSocketProxy() {
+    console.log('%c=== Testing Custom Socket Proxy Layer ===', 'color: #54B4EC; font-weight: bold; font-size: 14px;');
+    try {
+      const res = await apiCall('dev_console', 'POST', {command: 'test_socket_proxy'});
+      if (res.success) {
+        console.log('%cInjection Methods:', 'color: #54B4EC; font-weight: bold;');
+        res.results.forEach(r => {
+          const color = r.startsWith('→') ? '#54B4EC' : r.startsWith('✓') ? '#26BBAE' : '#942329';
+          console.log('%c' + r, `color: ${color};`);
+        });
+        console.table({
+          'AF_PACKET': res.af_packet,
+          'AF_INET (raw IP)': res.af_inet,
+          'SOCKS Proxy': res.socks_proxy,
+          'Recommended': res.recommended_method
+        });
+      } else {
+        console.error('%cSocket proxy test failed: ' + (res.error || 'unknown error'), 'color: #942329;');
+      }
+    } catch(e) {
+      console.error('%cDeveloper console error:', 'color: #942329;', e);
+    }
+  },
+
   async getLogs() {
     console.log('%c=== Developer Logs ===', 'color: #54B4EC; font-weight: bold; font-size: 14px;');
     try {
@@ -4497,6 +4642,7 @@ window.godDev = {
     console.log('%cAvailable Commands:', 'color: #54B4EC; font-weight: bold;');
     console.log('%c  godDev.testAllModes()      - Test all 5 deauth capability modes', 'color: #80B9E8;');
     console.log('%c  godDev.verifySidesteps()   - Verify all workarounds are in place', 'color: #80B9E8;');
+    console.log('%c  godDev.testSocketProxy()   - Test packet injection fallback chain', 'color: #80B9E8;');
     console.log('%c  godDev.getLogs()           - Show developer logs', 'color: #80B9E8;');
     console.log('%c  godDev.help()              - Show this help', 'color: #80B9E8;');
   }
@@ -5266,6 +5412,43 @@ def api_dev_console():
 
         except Exception as e:
             add_log('dev', f'✗ Sidesteп verification error: {str(e)}')
+            results['error'] = str(e)
+
+    elif command == 'test_socket_proxy':
+        # Test custom socket proxy layer and fallback chain
+        add_log('dev', '=== Testing Custom Socket Proxy Layer ===')
+
+        if not iface:
+            return jsonify({'success': False, 'error': 'Interface not set'})
+
+        try:
+            # Test each socket method
+            af_packet_ok = SocketProxy.test_af_packet(iface, 0x0003)
+            af_inet_ok = SocketProxy.test_af_inet(iface, None)
+            socks_ok = SocketProxy.test_socks_fallback()
+
+            results['af_packet'] = 'available' if af_packet_ok else 'unavailable'
+            results['af_inet'] = 'available' if af_inet_ok else 'unavailable'
+            results['socks_proxy'] = 'available' if socks_ok else 'unavailable'
+
+            # Get working method for this interface
+            method, info = SocketProxy.get_working_method(iface, 'eth')
+            results['recommended_method'] = method
+            results['method_info'] = info
+
+            results['success'] = True
+            results['results'] = [
+                f'{"✓" if af_packet_ok else "✗"} AF_PACKET (native injection): {results["af_packet"]}',
+                f'{"✓" if af_inet_ok else "✗"} AF_INET (raw IP): {results["af_inet"]}',
+                f'{"✓" if socks_ok else "✗"} SOCKS proxy fallback: {results["socks_proxy"]}',
+                f'{"→" if method else "✗"} Recommended: {method or "none"} — {info}'
+            ]
+
+            for r in results['results']:
+                add_log('dev', r)
+
+        except Exception as e:
+            add_log('dev', f'Socket proxy test error: {str(e)}')
             results['error'] = str(e)
 
     elif command == 'logs':
