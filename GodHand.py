@@ -740,6 +740,51 @@ def ddns_supervisor_loop():
         except Exception as e:
             add_log('error', f'DDNS supervisor error: {e}')
 
+def ddns_bootstrap_from_env():
+    """Load DDNS config from GODHAND_DDNS_* env vars at startup.
+
+    The UI's DDNS settings only live in STATE (in-memory) -- they're gone the
+    next time this script is restarted (phone reboot, Termux session killed,
+    battery-optimization kill, etc.), silently turning auto-update back off
+    with no indication anything changed. Env vars are the one config path
+    that survives every restart, so they're the supported way to keep DDNS
+    running unattended; the UI form is still there for one-off/interactive use.
+    """
+    provider = os.environ.get('GODHAND_DDNS_PROVIDER', '').strip().lower()
+    if provider not in ('duckdns', 'noip'):
+        if provider:
+            print(f"WARNING: GODHAND_DDNS_PROVIDER={provider!r} is invalid (must be 'duckdns' or 'noip') -- ignoring DDNS env config.")
+        return
+    domain = os.environ.get('GODHAND_DDNS_DOMAIN', '').strip()
+    if not domain:
+        print("WARNING: GODHAND_DDNS_PROVIDER is set but GODHAND_DDNS_DOMAIN is missing -- ignoring DDNS env config.")
+        return
+    token = os.environ.get('GODHAND_DDNS_TOKEN', '').strip()
+    username = os.environ.get('GODHAND_DDNS_USERNAME', '').strip()
+    password = os.environ.get('GODHAND_DDNS_PASSWORD', '').strip()
+    if provider == 'duckdns' and not token:
+        print("WARNING: GODHAND_DDNS_PROVIDER=duckdns but GODHAND_DDNS_TOKEN is missing -- ignoring DDNS env config.")
+        return
+    if provider == 'noip' and not (username and password):
+        print("WARNING: GODHAND_DDNS_PROVIDER=noip but GODHAND_DDNS_USERNAME/GODHAND_DDNS_PASSWORD are missing -- ignoring DDNS env config.")
+        return
+    try:
+        interval = max(1, int(os.environ.get('GODHAND_DDNS_INTERVAL_MINUTES', 5)))
+    except ValueError:
+        interval = 5
+    enabled_raw = os.environ.get('GODHAND_DDNS_ENABLED', '1').strip().lower()
+    enabled = enabled_raw not in ('0', 'false', 'no', 'off')
+    with STATE_LOCK:
+        STATE['ddns']['provider'] = provider
+        STATE['ddns']['domain'] = domain
+        STATE['ddns']['token'] = token or None
+        STATE['ddns']['username'] = username or None
+        STATE['ddns']['password'] = password or None
+        STATE['ddns']['interval_minutes'] = interval
+        STATE['ddns']['enabled'] = enabled
+    print(f"DDNS: loaded {provider} config for {domain} from environment (auto-update {'on' if enabled else 'off'}, every {interval}m).")
+    add_log('info', f'DDNS configured from environment: {provider} / {domain}')
+
 # ---------- gateway: remote tunnel (ngrok) ----------
 def start_ngrok_tunnel(port, authtoken=None):
     if not ensure_tool('ngrok'):
@@ -2290,6 +2335,30 @@ nav button .icon svg { display: block; }
         <span id="ddns-badge"></span>
       </div>
       <p class="sub">Keep a hostname pointed at this network's current public IP — DuckDNS or No-IP.</p>
+      <details style="margin-bottom:14px;">
+        <summary style="cursor:pointer; color:var(--text-secondary); font-size:0.85rem;">How to set this up, and which variables you need</summary>
+        <div style="margin-top:10px; font-size:0.85rem; color:var(--text-secondary); line-height:1.6;">
+          <p style="margin-bottom:8px;"><strong style="color:var(--text-primary);">DuckDNS:</strong>
+            Sign in free at <span style="font-family:'JetBrains Mono',monospace;">duckdns.org</span>, add a subdomain
+            (e.g. <span style="font-family:'JetBrains Mono',monospace;">pet-my</span> → pet-my.duckdns.org), then copy the
+            token shown on that page. Enter the subdomain and token below, Save, then turn on auto-update.</p>
+          <p style="margin-bottom:8px;"><strong style="color:var(--text-primary);">No-IP:</strong>
+            Create a free hostname at <span style="font-family:'JetBrains Mono',monospace;">noip.com</span>
+            (e.g. sucka.sytes.net), then enter that full hostname plus your No-IP account username and password below.
+            Free No-IP hostnames must be confirmed by email every 30 days or they expire.</p>
+          <p style="margin-bottom:0;"><strong style="color:var(--text-primary);">To survive restarts:</strong>
+            settings saved below only live in memory — they're gone the next time GodHand restarts (phone reboot,
+            Termux getting killed, etc.). Set these environment variables before launching instead, and this panel
+            will load and enable them automatically on every start:</p>
+          <pre style="margin:8px 0 0; padding:10px 12px; background:var(--bg-inset); border:1px solid var(--border-subtle); border-radius:8px; font-family:'JetBrains Mono',monospace; font-size:0.78rem; white-space:pre-wrap; color:var(--text-primary);">GODHAND_DDNS_PROVIDER=duckdns          # or: noip
+GODHAND_DDNS_DOMAIN=pet-my              # or a full No-IP hostname
+GODHAND_DDNS_TOKEN=&lt;duckdns token&gt;      # DuckDNS only
+GODHAND_DDNS_USERNAME=&lt;no-ip username&gt; # No-IP only
+GODHAND_DDNS_PASSWORD=&lt;no-ip password&gt; # No-IP only
+GODHAND_DDNS_INTERVAL_MINUTES=5         # optional, default 5
+GODHAND_DDNS_ENABLED=1                  # optional, default on when the above are set</pre>
+        </div>
+      </details>
       <div class="row">
         <select id="ddns-provider" onchange="onDdnsProviderChange()">
           <option value="duckdns">DuckDNS</option>
@@ -3881,17 +3950,26 @@ def api_ddns_set_config():
     except (TypeError, ValueError):
         return jsonify({'success': False, 'error': 'interval_minutes must be a number'})
     with STATE_LOCK:
+        # Credentials are only overwritten when a new value is submitted, so
+        # re-saving just the domain/interval doesn't blank out a token or
+        # password the UI never re-populates -- but that means a *first* save
+        # with no credentials at all would otherwise go through as "success"
+        # and only fail later, confusingly, when an update actually runs.
+        new_token = data.get('token', '').strip() if data.get('token') else STATE['ddns'].get('token')
+        new_username = data.get('username', '').strip() if data.get('username') else STATE['ddns'].get('username')
+        new_password = data.get('password') if data.get('password') else STATE['ddns'].get('password')
+        if provider == 'duckdns' and not new_token:
+            return jsonify({'success': False, 'error': 'DuckDNS token is required'})
+        if provider == 'noip' and not (new_username and new_password):
+            return jsonify({'success': False, 'error': 'No-IP username and password are required'})
         STATE['ddns']['provider'] = provider
         STATE['ddns']['domain'] = domain
         STATE['ddns']['interval_minutes'] = interval
         if provider == 'duckdns':
-            if data.get('token'):
-                STATE['ddns']['token'] = data['token'].strip()
+            STATE['ddns']['token'] = new_token
         else:
-            if data.get('username'):
-                STATE['ddns']['username'] = data['username'].strip()
-            if data.get('password'):
-                STATE['ddns']['password'] = data['password'].strip()
+            STATE['ddns']['username'] = new_username
+            STATE['ddns']['password'] = new_password
     add_log('info', f'DDNS configured: {provider} / {domain}')
     return jsonify({'success': True})
 
@@ -3901,8 +3979,14 @@ def api_ddns_toggle():
     data = request.json or {}
     enabled = bool(data.get('enabled'))
     with STATE_LOCK:
-        if enabled and STATE['ddns']['provider'] not in ('duckdns', 'noip'):
-            return jsonify({'success': False, 'error': 'Configure and save DDNS settings first'})
+        cfg = STATE['ddns']
+        if enabled:
+            if cfg['provider'] not in ('duckdns', 'noip'):
+                return jsonify({'success': False, 'error': 'Configure and save DDNS settings first'})
+            if cfg['provider'] == 'duckdns' and not cfg.get('token'):
+                return jsonify({'success': False, 'error': 'DuckDNS token is required -- save it below first'})
+            if cfg['provider'] == 'noip' and not (cfg.get('username') and cfg.get('password')):
+                return jsonify({'success': False, 'error': 'No-IP username and password are required -- save them below first'})
         STATE['ddns']['enabled'] = enabled
     add_log('info', f'DDNS auto-update {"enabled" if enabled else "disabled"}')
     return jsonify({'success': True})
@@ -3913,6 +3997,10 @@ def api_ddns_update_now():
     cfg = get_state('ddns')
     if cfg.get('provider') not in ('duckdns', 'noip'):
         return jsonify({'success': False, 'error': 'DDNS is not configured'})
+    if cfg['provider'] == 'duckdns' and not cfg.get('token'):
+        return jsonify({'success': False, 'error': 'DuckDNS token is required -- save it below first'})
+    if cfg['provider'] == 'noip' and not (cfg.get('username') and cfg.get('password')):
+        return jsonify({'success': False, 'error': 'No-IP username and password are required -- save them below first'})
     ddns_perform_update()
     masked = ddns_config_masked()
     return jsonify({'success': masked.get('last_status') == 'ok', 'status': masked})
@@ -4048,5 +4136,6 @@ if __name__ == '__main__':
         print("WARNING: Not running as root. Some features (raw sockets, iptables) may fail.")
     ensure_tool('iw')
     ensure_tool('iptables')
+    ddns_bootstrap_from_env()
     threading.Thread(target=ddns_supervisor_loop, daemon=True).start()
     app.run(host='0.0.0.0', port=APP_PORT, debug=False, threaded=True)
