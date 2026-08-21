@@ -26,12 +26,15 @@ import textwrap
 import urllib.request
 import urllib.parse
 import base64
+import secrets
 from functools import wraps
 from flask import Flask, request, jsonify, render_template_string, abort
 
 # ---------- configuration ----------
 SECRET = os.environ.get('GODHAND_SECRET', '')
 APP_PORT = int(os.environ.get('GODHAND_PORT', 5000))
+LOGIN_USERNAME = os.environ.get('GODHAND_USERNAME', 'admin')
+LOGIN_PASSWORD = os.environ.get('GODHAND_PASSWORD', '')
 
 # ---------- gateway (DNS/VPN/proxy) configuration ----------
 GATEWAY_DIR = os.path.join(os.environ['PREFIX'], 'etc', 'godhand-gateway') if os.environ.get('PREFIX') else '/etc/godhand-gateway'
@@ -122,19 +125,65 @@ def add_log(level, msg):
     print(f"[{level.upper()}] {msg}")
 
 # ---------- authentication ----------
+VALID_SESSIONS = set()
+SESSIONS_LOCK = threading.Lock()
+
 def require_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        if SECRET:
+        if SECRET or LOGIN_PASSWORD:
             token = request.headers.get('Authorization', '').replace('Bearer ', '')
             if not token:
                 token = request.args.get('token', '')
-            if token != SECRET:
+            with SESSIONS_LOCK:
+                session_ok = token in VALID_SESSIONS
+            if not session_ok and not (SECRET and secrets.compare_digest(token, SECRET)):
                 abort(401, description='Unauthorized')
         return f(*args, **kwargs)
     return decorated
 
 app = Flask(__name__)
+
+# ---------- login (opt-in: only enforced when GODHAND_PASSWORD is set) ----------
+@app.route('/api/login_required', methods=['GET'])
+def api_login_required():
+    # True whenever require_auth would actually gate a request -- keeps this in
+    # lockstep with require_auth's own condition so the login screen never skips
+    # itself for a server that's still going to 401 every API call.
+    return jsonify({'login_required': bool(LOGIN_PASSWORD or SECRET)})
+
+@app.route('/api/login', methods=['POST'])
+def api_login():
+    data = request.json or {}
+    username = data.get('username', '')
+    password = data.get('password', '')
+    if LOGIN_PASSWORD and username == LOGIN_USERNAME and secrets.compare_digest(password, LOGIN_PASSWORD):
+        token = secrets.token_hex(32)
+        with SESSIONS_LOCK:
+            VALID_SESSIONS.add(token)
+        add_log('info', f'Login successful for user {username}')
+        return jsonify({'success': True, 'token': token})
+    # Legacy mode: GODHAND_SECRET alone (no username/password configured) --
+    # the access token doubles as the password so there's still one login
+    # screen instead of a dead end for anyone still using the old flow.
+    if SECRET and secrets.compare_digest(password, SECRET):
+        token = secrets.token_hex(32)
+        with SESSIONS_LOCK:
+            VALID_SESSIONS.add(token)
+        add_log('info', 'Login successful via access token')
+        return jsonify({'success': True, 'token': token})
+    if not LOGIN_PASSWORD and not SECRET:
+        return jsonify({'success': False, 'error': 'Login is not configured on this server'})
+    add_log('warn', f'Failed login attempt for user {username!r}')
+    return jsonify({'success': False, 'error': 'Invalid username or password'})
+
+@app.route('/api/logout', methods=['POST'])
+@require_auth
+def api_logout():
+    token = request.headers.get('Authorization', '').replace('Bearer ', '')
+    with SESSIONS_LOCK:
+        VALID_SESSIONS.discard(token)
+    return jsonify({'success': True})
 
 # ---------- tool management ----------
 _INSTALLED_TOOLS = set()
@@ -1342,10 +1391,165 @@ def index():
 body {
   background: var(--bg-base);
   color: var(--text-primary);
-  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+  -webkit-font-smoothing: antialiased;
   min-height: 100vh;
   display: flex;
   flex-direction: column;
+}
+
+/* ---------- login ---------- */
+.login-screen {
+  position: fixed;
+  inset: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+}
+.login-bg {
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(ellipse 900px 700px at 12% 15%, rgba(56,189,248,0.20), transparent 60%),
+    radial-gradient(ellipse 800px 800px at 88% 80%, rgba(192,132,252,0.16), transparent 60%),
+    radial-gradient(ellipse 1000px 600px at 50% 105%, rgba(129,140,248,0.12), transparent 60%),
+    radial-gradient(ellipse 600px 600px at 75% 8%, rgba(14,165,233,0.14), transparent 60%),
+    linear-gradient(160deg, #060A0F 0%, #0A0F14 45%, #060A0F 100%);
+  animation: login-bg-drift 36s ease-in-out infinite alternate;
+}
+.login-bg::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  background-image:
+    radial-gradient(1.5px 1.5px at 8% 22%, rgba(224,242,254,0.9), transparent),
+    radial-gradient(1px 1px at 18% 68%, rgba(224,242,254,0.7), transparent),
+    radial-gradient(2px 2px at 27% 12%, rgba(224,242,254,0.8), transparent),
+    radial-gradient(1px 1px at 34% 44%, rgba(224,242,254,0.6), transparent),
+    radial-gradient(1.5px 1.5px at 42% 78%, rgba(224,242,254,0.9), transparent),
+    radial-gradient(1px 1px at 51% 30%, rgba(224,242,254,0.5), transparent),
+    radial-gradient(2px 2px at 58% 60%, rgba(224,242,254,0.8), transparent),
+    radial-gradient(1px 1px at 66% 15%, rgba(224,242,254,0.6), transparent),
+    radial-gradient(1.5px 1.5px at 73% 85%, rgba(224,242,254,0.9), transparent),
+    radial-gradient(1px 1px at 81% 38%, rgba(224,242,254,0.6), transparent),
+    radial-gradient(2px 2px at 88% 62%, rgba(224,242,254,0.8), transparent),
+    radial-gradient(1px 1px at 93% 20%, rgba(224,242,254,0.5), transparent),
+    radial-gradient(1.5px 1.5px at 5% 88%, rgba(224,242,254,0.7), transparent),
+    radial-gradient(1px 1px at 63% 92%, rgba(224,242,254,0.5), transparent),
+    radial-gradient(1.5px 1.5px at 97% 78%, rgba(224,242,254,0.7), transparent);
+  opacity: 0.5;
+}
+@keyframes login-bg-drift {
+  0% { transform: scale(1) translate(0, 0); }
+  100% { transform: scale(1.04) translate(-1.5%, -1%); }
+}
+.login-card {
+  position: relative;
+  z-index: 1;
+  width: 90%;
+  max-width: 380px;
+  padding: 40px 32px;
+  background: rgba(17, 24, 32, 0.55);
+  backdrop-filter: blur(24px) saturate(160%);
+  -webkit-backdrop-filter: blur(24px) saturate(160%);
+  border: 1px solid rgba(255,255,255,0.12);
+  border-radius: 24px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.4), 0 1px 0 rgba(255,255,255,0.08) inset;
+  text-align: center;
+  animation: login-card-in 0.5s cubic-bezier(0.16, 1, 0.3, 1);
+}
+@keyframes login-card-in {
+  from { opacity: 0; transform: translateY(12px) scale(0.98); }
+  to { opacity: 1; transform: translateY(0) scale(1); }
+}
+.login-logo {
+  width: 56px;
+  height: 56px;
+  margin: 0 auto 16px;
+  border-radius: 16px;
+  background: linear-gradient(135deg, #0EA5E9, #38BDF8);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #04121C;
+  font-weight: 700;
+  font-size: 26px;
+  box-shadow: 0 4px 16px rgba(56,189,248,0.35);
+}
+.login-title {
+  font-size: 1.6rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  margin-bottom: 2px;
+}
+.login-subtitle {
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+  margin-bottom: 28px;
+}
+.login-field { margin-bottom: 14px; }
+.login-field input {
+  width: 100%;
+  background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.12);
+  color: var(--text-primary);
+  border-radius: 12px;
+  padding: 14px 16px;
+  font-size: 1rem;
+  font-family: inherit;
+  transition: border 0.2s, box-shadow 0.2s, background 0.2s;
+}
+.login-field input::placeholder { color: var(--text-disabled); }
+.login-field input:focus {
+  outline: none;
+  border-color: var(--accent-primary);
+  background: rgba(255,255,255,0.09);
+  box-shadow: 0 0 0 4px rgba(56,189,248,0.15);
+}
+.login-btn {
+  position: relative;
+  overflow: hidden;
+  width: 100%;
+  background: linear-gradient(135deg, var(--accent-secondary), var(--accent-primary));
+  color: #04121C;
+  border: none;
+  border-radius: 12px;
+  padding: 14px;
+  font-size: 1rem;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  margin-top: 6px;
+  box-shadow: 0 4px 14px rgba(56,189,248,0.3);
+  transition: transform 0.15s, box-shadow 0.15s;
+}
+.login-btn:hover { transform: translateY(-1px); box-shadow: 0 6px 18px rgba(56,189,248,0.4); }
+.login-btn:active { transform: translateY(0) scale(0.98); }
+.login-btn:disabled { opacity: 0.6; cursor: not-allowed; }
+.login-ripple {
+  position: absolute;
+  border-radius: 50%;
+  background: rgba(255,255,255,0.5);
+  transform: scale(0);
+  animation: login-ripple-anim 0.6s ease-out;
+  pointer-events: none;
+}
+@keyframes login-ripple-anim {
+  to { transform: scale(3); opacity: 0; }
+}
+.login-error {
+  margin-top: 14px;
+  padding: 10px 14px;
+  background: var(--glow-danger);
+  border: 1px solid rgba(248,113,113,0.3);
+  color: var(--danger);
+  border-radius: 10px;
+  font-size: 0.85rem;
+}
+@media (prefers-reduced-motion: reduce) {
+  .login-bg, .login-card { animation: none; }
 }
 header {
   background: var(--bg-elevated);
@@ -1836,11 +2040,34 @@ nav button .icon svg { display: block; }
 </style>
 </head>
 <body>
+<div id="login-screen" class="login-screen" style="display:none;">
+  <div class="login-bg"></div>
+  <div class="login-card">
+    <div class="login-logo">G</div>
+    <h1 class="login-title">GodHand</h1>
+    <p class="login-subtitle">Network Command</p>
+    <form id="login-form" onsubmit="return handleLogin(event)">
+      <div class="login-field">
+        <input type="text" id="login-username" placeholder="Username" autocomplete="username" required>
+      </div>
+      <div class="login-field">
+        <input type="password" id="login-password" placeholder="Password" autocomplete="current-password" required>
+      </div>
+      <button type="submit" class="login-btn" id="login-submit-btn"><span>Log In</span></button>
+      <div id="login-error" class="login-error" style="display:none;"></div>
+    </form>
+  </div>
+</div>
+
+<div id="app-shell">
 <header>
   <a href="#" class="logo">
     <div class="logo-icon">G</div>
     <span>GodHand: Network Command</span>
   </a>
+  <button class="btn-icon" id="logout-btn" onclick="handleLogout()" title="Log out" style="display:none; margin-left:4px;">
+    <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><polyline points="16 17 21 12 16 7"></polyline><line x1="21" y1="12" x2="9" y2="12"></line></svg>
+  </button>
   <div class="status-indicator" id="global-status">
     <span class="status-dot" id="status-dot"></span>
     <span id="status-text">Ready</span>
@@ -2115,6 +2342,7 @@ nav button .icon svg { display: block; }
 </div>
 
 <div class="toast-container" id="toast-container"></div>
+</div>
 
 <script>
 // Global state
@@ -2139,12 +2367,9 @@ async function apiCall(endpoint, method='GET', data=null) {
   if (data) opts.body = JSON.stringify(data);
   const res = await fetch('/api/' + endpoint, opts);
   if (res.status === 401) {
-    const token = prompt('Enter access token:');
-    if (token) {
-      authToken = token;
-      localStorage.setItem('godhand_token', token);
-      return apiCall(endpoint, method, data);
-    }
+    authToken = '';
+    localStorage.removeItem('godhand_token');
+    showLogin();
     throw new Error('Unauthorized');
   }
   return res.json();
@@ -2986,25 +3211,118 @@ function renderAlerts() {
   });
 }
 
-// Init
-document.getElementById('arp-snap-count').textContent = arpHistory.length;
-document.getElementById('watch-whole-network').checked = watchWholeNetwork;
-renderDevices();
-renderAlerts();
-loadInterfaces();
-loadTargets();
-checkPrerequisites();
-pollLogs();
-pollAttackStatus();
-pollTrafficCapture();
-pollBandwidth();
-refreshGatewayStatus();
-loadDdnsConfig();
-setInterval(pollLogs, 2000);
-setInterval(pollAttackStatus, 2000);
-setInterval(pollTrafficCapture, 1500);
-setInterval(pollBandwidth, 2000);
-setInterval(refreshGatewayStatus, 4000);
+// Login gate
+let appInitialized = false;
+function addRipple(btn, event) {
+  const rect = btn.getBoundingClientRect();
+  const ripple = document.createElement('span');
+  const size = Math.max(rect.width, rect.height);
+  ripple.className = 'login-ripple';
+  ripple.style.width = ripple.style.height = size + 'px';
+  ripple.style.left = (event.clientX - rect.left - size / 2) + 'px';
+  ripple.style.top = (event.clientY - rect.top - size / 2) + 'px';
+  btn.appendChild(ripple);
+  setTimeout(() => ripple.remove(), 600);
+}
+function showLogin() {
+  document.getElementById('login-screen').style.display = 'flex';
+  document.getElementById('app-shell').style.display = 'none';
+  document.getElementById('login-password').value = '';
+  document.getElementById('login-username').focus();
+}
+function showApp() {
+  document.getElementById('login-screen').style.display = 'none';
+  document.getElementById('app-shell').style.display = 'block';
+  document.getElementById('logout-btn').style.display = authToken ? 'inline-flex' : 'none';
+  if (!appInitialized) {
+    appInitialized = true;
+    initApp();
+  }
+}
+async function handleLogin(event) {
+  event.preventDefault();
+  const btn = document.getElementById('login-submit-btn');
+  addRipple(btn, event);
+  const username = document.getElementById('login-username').value.trim();
+  const password = document.getElementById('login-password').value;
+  const errorBox = document.getElementById('login-error');
+  errorBox.style.display = 'none';
+  btn.disabled = true;
+  try {
+    const res = await fetch('/api/login', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password }),
+    });
+    const data = await res.json();
+    if (data.success) {
+      authToken = data.token;
+      localStorage.setItem('godhand_token', authToken);
+      showApp();
+    } else {
+      errorBox.textContent = data.error || 'Login failed';
+      errorBox.style.display = 'block';
+    }
+  } catch (e) {
+    errorBox.textContent = 'Could not reach the server';
+    errorBox.style.display = 'block';
+  }
+  btn.disabled = false;
+  return false;
+}
+async function handleLogout() {
+  try { await apiCall('logout', 'POST'); } catch (e) {}
+  authToken = '';
+  localStorage.removeItem('godhand_token');
+  showLogin();
+}
+async function checkLoginRequired() {
+  try {
+    const res = await fetch('/api/login_required');
+    const data = await res.json();
+    if (!data.login_required) {
+      showApp();
+      return;
+    }
+    if (authToken) {
+      const testRes = await fetch('/api/state', { headers: { 'Authorization': 'Bearer ' + authToken } });
+      if (testRes.status !== 401) {
+        showApp();
+        return;
+      }
+      authToken = '';
+      localStorage.removeItem('godhand_token');
+    }
+    showLogin();
+  } catch (e) {
+    // Fail open on network error -- don't brick local access to a self-hosted tool
+    // just because the login-required check itself couldn't be reached.
+    showApp();
+  }
+}
+
+// Init (runs once, after login succeeds or when login isn't required)
+function initApp() {
+  document.getElementById('arp-snap-count').textContent = arpHistory.length;
+  document.getElementById('watch-whole-network').checked = watchWholeNetwork;
+  renderDevices();
+  renderAlerts();
+  loadInterfaces();
+  loadTargets();
+  checkPrerequisites();
+  pollLogs();
+  pollAttackStatus();
+  pollTrafficCapture();
+  pollBandwidth();
+  refreshGatewayStatus();
+  loadDdnsConfig();
+  setInterval(pollLogs, 2000);
+  setInterval(pollAttackStatus, 2000);
+  setInterval(pollTrafficCapture, 1500);
+  setInterval(pollBandwidth, 2000);
+  setInterval(refreshGatewayStatus, 4000);
+}
+checkLoginRequired();
 </script>
 </body>
 </html>
