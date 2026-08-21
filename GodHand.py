@@ -855,15 +855,29 @@ def set_monitor(iface, enable=True, raise_on_fail=False):
         return False
 
 def check_monitor_support(iface):
-    """Check if monitor mode is supported by the interface/driver."""
+    """Check if monitor mode is supported by the interface/driver.
+
+    Resolves the specific phy backing `iface` and inspects its advertised
+    "Supported interface modes" -- never actually switches modes, so a
+    routine capability check cannot itself drop the Wi-Fi connection. This
+    used to fall back to flipping the interface into monitor mode and back
+    just to test it, and to a blanket `iw phy` dump (every radio on the
+    system, not just this one) for the initial check -- both fixed here.
+    """
     try:
-        # Use iw phy to list capabilities
-        out = subprocess.check_output(['iw', 'phy'], text=True)
-        if 'monitor' in out.lower():
-            return True
-        # Fallback: attempt to set and revert quickly
-        return set_monitor(iface, True) and set_monitor(iface, False)
-    except:
+        dev_info = subprocess.check_output(
+            ['iw', 'dev', iface, 'info'], stderr=subprocess.DEVNULL, text=True, timeout=5)
+        m = re.search(r'^\s*wiphy (\d+)', dev_info, re.MULTILINE)
+        if not m:
+            return False
+        phy = f'phy{m.group(1)}'
+        phy_info = subprocess.check_output(
+            ['iw', 'phy', phy, 'info'], stderr=subprocess.DEVNULL, text=True, timeout=5)
+        modes_match = re.search(r'Supported interface modes:\s*\n((?:\s+\*.*\n?)+)', phy_info)
+        if not modes_match:
+            return False
+        return any(re.match(r'\s*\*\s*monitor\s*$', line) for line in modes_match.group(1).splitlines())
+    except Exception:
         return False
 
 # ---------- native (no-monitor-mode) deauth via AP station-del ----------
@@ -902,7 +916,19 @@ def native_deauth_station(iface, mac, reason_code=2):
         return False
 
 def deauth_capability(iface):
-    """What mechanism kick_client/start_attack_deauth will actually use for this interface, honestly."""
+    """What mechanism kick_client/start_attack_deauth will actually use for this interface, honestly.
+
+    There is no nl80211/iw primitive for a managed-mode (client) interface to
+    forge a frame at a third-party device while staying associated -- iw's own
+    command surface confirms it (mgmt dump frame is receive-only, mpath probe
+    is mesh-specific, vendor send is an opaque per-driver channel, and station
+    del only reaches entries in this interface's own station table, which in
+    client mode is just the AP itself). So there are exactly three honest
+    outcomes: this interface is itself an AP (native station-del works), the
+    driver genuinely advertises monitor mode (real frame injection works), or
+    neither -- in which case the ARP-poisoning fallback is the best available
+    substitute, not a real deauth.
+    """
     iface_type = get_iface_type(iface)
     if iface_type == 'AP':
         return {'method': 'native', 'iface_type': iface_type, 'ap_station_count': len(list_ap_stations(iface))}
@@ -3339,7 +3365,7 @@ async function refreshDeauthCapability() {
     } else if (res.method === 'monitor') {
       box.innerHTML = `<span class="badge warning">Monitor mode</span> Interface is ${res.iface_type} — Kick / Deauth Flood will switch it to monitor mode and use frame injection.`;
     } else if (res.method === 'arp_fallback') {
-      box.innerHTML = `<span class="badge warning">ARP fallback</span> ${res.iface_type} interface has no monitor mode/injection support (typical for a phone's built-in Wi-Fi) — Kick / Deauth Flood will fall back to ARP-based disconnection instead. This cuts network access rather than sending a true 802.11 deauth frame, and is less durable.`;
+      box.innerHTML = `<span class="badge warning">ARP fallback</span> ${res.iface_type} interface has no monitor mode/injection support (typical for a phone's built-in Wi-Fi, and there's no netlink shortcut around it — a client interface can only forge frames at itself, not a third party) — Kick / Deauth Flood will fall back to ARP-based disconnection instead. This cuts network access rather than sending a true 802.11 deauth frame, and is less durable.`;
     } else {
       box.innerHTML = `<span class="badge danger">Unavailable</span> Interface is ${res.iface_type}, doesn't support monitor mode, and no gateway is set for the ARP-based fallback — Kick / Deauth Flood can't function yet. Set a gateway on the Settings tab.`;
     }
