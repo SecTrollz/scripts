@@ -1518,22 +1518,41 @@ body {
   0% { transform: scale(1) translate(0, 0); }
   100% { transform: scale(1.04) translate(-1.5%, -1%); }
 }
-.login-hand {
+.login-bokeh {
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(circle 90px at 82% 18%, rgba(224,242,254,0.55), rgba(56,189,248,0.25) 45%, transparent 72%),
+    radial-gradient(circle 55px at 70% 10%, rgba(186,230,253,0.4), transparent 70%),
+    radial-gradient(circle 130px at 30% 14%, rgba(56,189,248,0.22), transparent 72%),
+    radial-gradient(circle 40px at 92% 40%, rgba(224,242,254,0.35), transparent 70%),
+    radial-gradient(circle 22px at 60% 30%, rgba(224,242,254,0.5), transparent 75%),
+    radial-gradient(circle 60px at 45% 60%, rgba(56,189,248,0.18), transparent 72%),
+    radial-gradient(circle 18px at 75% 62%, rgba(224,242,254,0.4), transparent 75%);
+}
+.login-hand, .login-scanlines {
   position: absolute;
   left: -8%;
   bottom: -10%;
   width: min(66vw, 720px);
-  aspect-ratio: 500 / 620;
+  aspect-ratio: 550 / 620;
   z-index: 0;
   pointer-events: none;
 }
+.login-scanlines {
+  background:
+    linear-gradient(180deg, transparent 42%, rgba(224,242,254,0.10) 43%, transparent 44%),
+    linear-gradient(180deg, transparent 54%, rgba(224,242,254,0.14) 54.6%, transparent 55.2%),
+    linear-gradient(180deg, transparent 61%, rgba(224,242,254,0.08) 61.5%, transparent 62%);
+  mix-blend-mode: screen;
+}
 @media (max-width: 768px) {
-  .login-hand {
+  .login-hand, .login-scanlines {
     width: 82vw;
     left: -10%;
     bottom: -4%;
-    opacity: 0.85;
   }
+  .login-hand { opacity: 0.85; }
 }
 .login-card {
   position: relative;
@@ -2161,7 +2180,8 @@ nav button .icon svg { display: block; }
 <body>
 <div id="login-screen" class="login-screen" style="display:none;">
   <div class="login-bg"></div>
-  <svg class="login-hand" viewBox="0 0 500 620" preserveAspectRatio="xMinYMax meet" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+  <div class="login-bokeh"></div>
+  <svg class="login-hand" viewBox="-50 0 550 620" preserveAspectRatio="xMinYMax meet" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
     <defs>
       <linearGradient id="handGrad" x1="0%" y1="100%" x2="70%" y2="0%">
         <stop offset="0%" stop-color="#0B3A57" stop-opacity="0.35"/>
@@ -2186,19 +2206,29 @@ nav button .icon svg { display: block; }
       <g filter="url(#handSoftGlow)">
         <g opacity="0.45" filter="url(#handWideGlow)" fill="#38BDF8">
           <path d="M 130 585 C 95 575 75 540 80 495 C 78 460 90 430 95 415 C 85 390 78 355 95 325 L 108 305 C 108 305 130 300 145 300 C 165 288 190 280 210 278 C 232 280 250 288 265 300 L 272 310 C 290 330 300 360 298 395 C 300 430 295 470 290 500 C 288 540 270 570 240 583 C 210 590 165 592 130 585 Z"/>
-          <g transform="translate(95,415) rotate(-72)"><rect x="-19" y="-108" width="38" height="108" rx="19"/></g>
+          <g transform="translate(118,378) rotate(-42)"><rect x="-21" y="-105" width="42" height="105" rx="21"/></g>
         </g>
         <path fill="url(#handGrad)" d="M 130 585 C 95 575 75 540 80 495 C 78 460 90 430 95 415 C 85 390 78 355 95 325 L 108 305 C 108 305 130 300 145 300 C 165 288 190 280 210 278 C 232 280 250 288 265 300 L 272 310 C 290 330 300 360 298 395 C 300 430 295 470 290 500 C 288 540 270 570 240 583 C 210 590 165 592 130 585 Z"/>
-        <g transform="translate(95,415) rotate(-72)"><rect x="-19" y="-108" width="38" height="108" rx="19" fill="url(#handGrad)"/></g>
-        <g transform="translate(120,300) rotate(-20)"><rect x="-16" y="-125" width="32" height="128" rx="16" fill="url(#handGrad)"/></g>
-        <g transform="translate(165,282) rotate(-7)"><rect x="-17" y="-155" width="34" height="158" rx="17" fill="url(#handGrad)"/></g>
-        <g transform="translate(212,277) rotate(4)"><rect x="-17" y="-165" width="34" height="168" rx="17" fill="url(#handGrad)"/></g>
-        <g transform="translate(258,288) rotate(15)"><rect x="-16" y="-140" width="32" height="143" rx="16" fill="url(#handGrad)"/></g>
-        <g stroke="#E0F2FE" stroke-width="1.4" fill="none" opacity="0.8">
+        <g transform="translate(118,378) rotate(-42)"><rect x="-21" y="-105" width="42" height="105" rx="21" fill="url(#handGrad)"/></g>
+        <g transform="translate(118,295) rotate(-32)"><rect x="-15" y="-95" width="30" height="98" rx="15" fill="url(#handGrad)"/></g>
+        <g transform="translate(158,278) rotate(-16)"><rect x="-16" y="-118" width="32" height="121" rx="16" fill="url(#handGrad)"/></g>
+        <g transform="translate(205,272) rotate(6)"><rect x="-17" y="-168" width="34" height="171" rx="17" fill="url(#handGrad)"/></g>
+        <g transform="translate(252,282) rotate(24)"><rect x="-16" y="-188" width="32" height="191" rx="16" fill="url(#handGrad)"/></g>
+        <ellipse cx="195" cy="440" rx="95" ry="80" fill="#7DD3FC" opacity="0.16"/>
+        <g stroke="#E0F2FE" stroke-width="1.4" fill="none" opacity="0.85">
           <path d="M 130 480 C 160 460 150 420 180 410 C 205 402 200 440 230 440"/>
           <path d="M 150 520 L 150 470 L 190 470"/>
           <path d="M 260 500 C 240 470 260 440 240 415"/>
           <path d="M 210 540 L 250 540 L 250 500"/>
+        </g>
+        <g stroke="#F0F9FF" stroke-width="1" opacity="0.55">
+          <path d="M 165 455 L 165 465"/>
+          <path d="M 173 453 L 173 466"/>
+          <path d="M 181 456 L 181 464"/>
+          <path d="M 189 452 L 189 467"/>
+          <path d="M 197 455 L 197 464"/>
+          <path d="M 205 453 L 205 466"/>
+          <path d="M 213 456 L 213 463"/>
         </g>
         <g fill="#F0F9FF" opacity="0.9">
           <circle cx="180" cy="410" r="3.5"/>
@@ -2206,14 +2236,17 @@ nav button .icon svg { display: block; }
           <circle cx="150" cy="470" r="3"/>
           <circle cx="240" cy="415" r="3"/>
           <circle cx="250" cy="500" r="3"/>
-          <circle cx="76" cy="180" r="4"/>
-          <circle cx="146" cy="125" r="4"/>
-          <circle cx="224" cy="109" r="4"/>
-          <circle cx="295" cy="150" r="4"/>
+          <circle cx="66" cy="212" r="4"/>
+          <circle cx="125" cy="162" r="4"/>
+          <circle cx="223" cy="102" r="4"/>
+          <circle cx="330" cy="108" r="4"/>
         </g>
+        <circle cx="88" cy="470" r="5" fill="#F0F9FF"/>
+        <circle cx="88" cy="470" r="11" fill="#7DD3FC" opacity="0.5"/>
       </g>
     </g>
   </svg>
+  <div class="login-scanlines"></div>
   <div class="login-card">
     <div class="login-logo">G</div>
     <h1 class="login-title">GodHand</h1>
