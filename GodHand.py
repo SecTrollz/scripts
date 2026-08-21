@@ -24,6 +24,8 @@ import tempfile
 import hashlib
 import textwrap
 import urllib.request
+import urllib.parse
+import base64
 from functools import wraps
 from flask import Flask, request, jsonify, render_template_string, abort
 
@@ -63,6 +65,20 @@ STATE = {
     'monitor_log': [],
     'monitor_log_path': None,
     'bandwidth_sample': None,
+    'ddns': {
+        'provider': None,          # 'duckdns' | 'noip'
+        'domain': None,            # duckdns subdomain, or full no-ip hostname
+        'token': None,             # duckdns token
+        'username': None,          # no-ip username
+        'password': None,          # no-ip password
+        'enabled': False,
+        'interval_minutes': 5,
+        'last_ip': None,
+        'last_update': None,
+        'last_status': None,       # 'ok' | 'error' | None
+        'last_message': None,
+    },
+    'ngrok_proc': None,
     'log': [],
     'status': 'Ready'
 }
@@ -182,6 +198,7 @@ def ensure_tool(tool_name, package_name=None):
         'unbound': 'unbound',
         'dnscrypt-proxy': 'dnscrypt-proxy',
         'tinyproxy': 'tinyproxy',
+        'ngrok': 'ngrok',
     }
     pkg = pkg_map.get(package_name, package_name)
     installed = install_package(pkg)
@@ -587,6 +604,111 @@ def start_gateway_proxy():
 def stop_gateway_proxy():
     stop_proc('tinyproxy')
     add_log('info', 'Gateway proxy stopped')
+
+# ---------- gateway: dynamic DNS (DuckDNS / No-IP) ----------
+def ddns_update_duckdns(domain, token):
+    """https://www.duckdns.org/spec.jsp -- plain-text 'OK'/'KO' response."""
+    domain = domain.strip().removesuffix('.duckdns.org')
+    url = ('https://www.duckdns.org/update?domains=' + urllib.parse.quote(domain) +
+           '&token=' + urllib.parse.quote(token) + '&ip=')
+    req = urllib.request.Request(url, headers={'User-Agent': 'GodHand'})
+    with urllib.request.urlopen(req, timeout=10) as r:
+        body = r.read().decode('utf-8', 'ignore').strip()
+    return body.upper().startswith('OK'), body
+
+def ddns_update_noip(hostname, username, password):
+    """No-IP Dynamic Update API -- HTTP Basic Auth, plain-text 'good <ip>'/'nochg <ip>'/error code."""
+    url = 'https://dynupdate.no-ip.com/nic/update?hostname=' + urllib.parse.quote(hostname)
+    req = urllib.request.Request(url, headers={'User-Agent': 'GodHand-DDNS/1.0'})
+    auth = base64.b64encode(f'{username}:{password}'.encode()).decode()
+    req.add_header('Authorization', f'Basic {auth}')
+    with urllib.request.urlopen(req, timeout=10) as r:
+        body = r.read().decode('utf-8', 'ignore').strip()
+    ok = body.split()[0] in ('good', 'nochg') if body else False
+    return ok, body
+
+def ddns_perform_update():
+    cfg = get_state('ddns')
+    provider = cfg.get('provider')
+    if provider not in ('duckdns', 'noip'):
+        return
+    # last_update marks the last *attempt*, success or not -- the supervisor loop uses
+    # it to pace retries to the configured interval, so a failing provider never gets
+    # hammered every 30s (that's how DDNS accounts get rate-limited or flagged for abuse).
+    try:
+        if provider == 'duckdns':
+            ok, msg = ddns_update_duckdns(cfg['domain'], cfg['token'])
+        else:
+            ok, msg = ddns_update_noip(cfg['domain'], cfg['username'], cfg['password'])
+        with STATE_LOCK:
+            if ok:
+                STATE['ddns']['last_ip'] = get_external_ip()
+            STATE['ddns']['last_update'] = time.strftime('%Y-%m-%d %H:%M:%S')
+            STATE['ddns']['last_status'] = 'ok' if ok else 'error'
+            STATE['ddns']['last_message'] = msg
+        add_log('success' if ok else 'error', f'DDNS update ({provider}): {msg}')
+    except Exception as e:
+        with STATE_LOCK:
+            STATE['ddns']['last_update'] = time.strftime('%Y-%m-%d %H:%M:%S')
+            STATE['ddns']['last_status'] = 'error'
+            STATE['ddns']['last_message'] = str(e)
+        add_log('error', f'DDNS update failed: {e}')
+
+def ddns_supervisor_loop():
+    """Background daemon: wakes periodically, updates when enabled and due. Never runs unless enabled."""
+    while True:
+        time.sleep(30)
+        try:
+            cfg = get_state('ddns')
+            if not cfg or not cfg.get('enabled') or cfg.get('provider') not in ('duckdns', 'noip'):
+                continue
+            interval_s = max(60, int(cfg.get('interval_minutes') or 5) * 60)
+            last = cfg.get('last_update')
+            due = True
+            if last:
+                try:
+                    due = (time.time() - time.mktime(time.strptime(last, '%Y-%m-%d %H:%M:%S'))) >= interval_s
+                except:
+                    due = True
+            if due:
+                ddns_perform_update()
+        except Exception as e:
+            add_log('error', f'DDNS supervisor error: {e}')
+
+# ---------- gateway: remote tunnel (ngrok) ----------
+def start_ngrok_tunnel(port, authtoken=None):
+    if not ensure_tool('ngrok'):
+        raise RuntimeError(
+            "ngrok isn't installed and isn't available through this system's package manager "
+            "(it isn't a standard distro package). Install it manually from ngrok.com, run "
+            "'ngrok config add-authtoken <token>' once, then try again."
+        )
+    if authtoken:
+        subprocess.run(['ngrok', 'config', 'add-authtoken', authtoken],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=10)
+    stop_proc('ngrok')
+    time.sleep(0.3)
+    proc = subprocess.Popen(['ngrok', 'http', str(port), '--log=stdout'],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    time.sleep(2)
+    if proc.poll() is not None:
+        err = proc.stderr.read().decode(errors='ignore')[-400:] if proc.stderr else ''
+        raise RuntimeError(f'ngrok failed to start: {err}')
+    return proc
+
+def get_ngrok_public_url():
+    """ngrok exposes its own local status API on 127.0.0.1:4040 while running."""
+    try:
+        req = urllib.request.Request('http://127.0.0.1:4040/api/tunnels', headers={'User-Agent': 'GodHand'})
+        with urllib.request.urlopen(req, timeout=3) as r:
+            data = json.loads(r.read().decode())
+        tunnels = data.get('tunnels', [])
+        for t in tunnels:
+            if t.get('proto') == 'https':
+                return t.get('public_url')
+        return tunnels[0].get('public_url') if tunnels else None
+    except:
+        return None
 
 # ---------- monitor mode ----------
 def set_monitor(iface, enable=True, raise_on_fail=False):
@@ -1810,6 +1932,52 @@ nav button .icon svg { display: block; }
         <div>HTTP proxy: <strong id="gw-proxy-target">—</strong></div>
       </div>
     </div>
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; flex-wrap:wrap; gap:8px;">
+        <h2 style="margin:0;">Dynamic DNS</h2>
+        <span id="ddns-badge"></span>
+      </div>
+      <p class="sub">Keep a hostname pointed at this network's current public IP — DuckDNS or No-IP.</p>
+      <div class="row">
+        <select id="ddns-provider" onchange="onDdnsProviderChange()">
+          <option value="duckdns">DuckDNS</option>
+          <option value="noip">No-IP</option>
+        </select>
+        <input type="text" id="ddns-domain" placeholder="Hostname (e.g. pet-my, or sucka.sytes.net for No-IP)">
+      </div>
+      <div class="row" id="ddns-duckdns-fields">
+        <input type="text" id="ddns-token" placeholder="DuckDNS token">
+      </div>
+      <div class="row" id="ddns-noip-fields" style="display:none;">
+        <input type="text" id="ddns-username" placeholder="No-IP username">
+        <input type="password" id="ddns-password" placeholder="No-IP password">
+      </div>
+      <div class="row">
+        <input type="number" id="ddns-interval" value="5" min="1" placeholder="Update every N minutes">
+        <button class="btn secondary" onclick="saveDdnsConfig()">Save</button>
+        <button class="btn secondary" onclick="ddnsUpdateNow()">Update now</button>
+      </div>
+      <label class="row" style="align-items:center; cursor:pointer;">
+        <input type="checkbox" id="ddns-enabled" onchange="toggleDdnsEnabled()">
+        Auto-update on the interval above
+      </label>
+      <div id="ddns-status" class="status-message">Not configured.</div>
+    </div>
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; flex-wrap:wrap; gap:8px;">
+        <h2 style="margin:0;">Remote tunnel (ngrok)</h2>
+        <span id="ngrok-badge"></span>
+      </div>
+      <p class="sub">Reach this UI from outside your network without router port-forwarding — useful when your ISP has locked down admin access to your own gateway.</p>
+      <div class="row">
+        <input type="text" id="ngrok-authtoken" placeholder="ngrok authtoken (leave blank if already configured)">
+      </div>
+      <div class="row">
+        <button class="btn" onclick="startNgrok()">Start tunnel</button>
+        <button class="btn secondary" onclick="stopNgrok()">Stop</button>
+      </div>
+      <div id="ngrok-status" class="status-message">Not running.</div>
+    </div>
   </div>
 
   <div id="tab-recon" class="tab-content">
@@ -2127,6 +2295,12 @@ async function pollTrafficCapture() {
   } catch(e) {}
 }
 
+function escapeHtml(s) {
+  const div = document.createElement('div');
+  div.textContent = s == null ? '' : String(s);
+  return div.innerHTML;
+}
+
 // Live bandwidth
 function formatBps(bps) {
   if (bps > 1024 * 1024) return (bps / 1024 / 1024).toFixed(2) + ' MB/s';
@@ -2194,6 +2368,8 @@ async function refreshGatewayStatus() {
       ? `Running on port ${res.proxy.port}. Point other devices' HTTP proxy at ${res.local_ip}:${res.proxy.port}.`
       : 'Not running.';
   } catch(e) {}
+  refreshDdnsStatus();
+  refreshNgrokStatus();
 }
 async function startGatewayDns() {
   showToast('Starting DNS privacy stack...', 'success');
@@ -2236,6 +2412,113 @@ async function stopGatewayProxy() {
   const res = await apiCall('gateway/proxy/stop', 'POST');
   showToast(res.status, 'success');
   refreshGatewayStatus();
+}
+
+// Dynamic DNS
+function onDdnsProviderChange() {
+  const isDuck = document.getElementById('ddns-provider').value === 'duckdns';
+  document.getElementById('ddns-duckdns-fields').style.display = isDuck ? 'flex' : 'none';
+  document.getElementById('ddns-noip-fields').style.display = isDuck ? 'none' : 'flex';
+}
+async function loadDdnsConfig() {
+  try {
+    const res = await apiCall('ddns/config');
+    if (!res.success) return;
+    const cfg = res.config;
+    if (cfg.provider) document.getElementById('ddns-provider').value = cfg.provider;
+    onDdnsProviderChange();
+    document.getElementById('ddns-domain').value = cfg.domain || '';
+    document.getElementById('ddns-interval').value = cfg.interval_minutes || 5;
+    document.getElementById('ddns-enabled').checked = !!cfg.enabled;
+    if (cfg.username) document.getElementById('ddns-username').value = cfg.username;
+  } catch(e) {}
+}
+async function saveDdnsConfig() {
+  const provider = document.getElementById('ddns-provider').value;
+  const body = {
+    provider,
+    domain: document.getElementById('ddns-domain').value.trim(),
+    interval_minutes: parseInt(document.getElementById('ddns-interval').value, 10) || 5,
+  };
+  if (provider === 'duckdns') {
+    body.token = document.getElementById('ddns-token').value.trim();
+  } else {
+    body.username = document.getElementById('ddns-username').value.trim();
+    body.password = document.getElementById('ddns-password').value;
+  }
+  const res = await apiCall('ddns/config', 'POST', body);
+  showToast(res.success ? 'DDNS settings saved' : res.error, res.success ? 'success' : 'error');
+  refreshDdnsStatus();
+}
+async function toggleDdnsEnabled() {
+  const enabled = document.getElementById('ddns-enabled').checked;
+  const res = await apiCall('ddns/toggle', 'POST', { enabled });
+  if (!res.success) {
+    document.getElementById('ddns-enabled').checked = false;
+    showToast(res.error, 'error');
+    return;
+  }
+  showToast(enabled ? 'DDNS auto-update enabled' : 'DDNS auto-update disabled', 'success');
+}
+async function ddnsUpdateNow() {
+  showToast('Updating DDNS...', 'success');
+  const res = await apiCall('ddns/update_now', 'POST');
+  showToast(res.success ? 'DDNS updated' : (res.error || 'DDNS update failed'), res.success ? 'success' : 'error');
+  refreshDdnsStatus();
+}
+async function refreshDdnsStatus() {
+  try {
+    const res = await apiCall('ddns/config');
+    if (!res.success) return;
+    const cfg = res.config;
+    const badge = document.getElementById('ddns-badge');
+    const status = document.getElementById('ddns-status');
+    if (!cfg.provider) {
+      badge.innerHTML = '';
+      status.textContent = 'Not configured.';
+      return;
+    }
+    badge.innerHTML = `<span class="badge ${cfg.enabled ? 'success' : 'info'}">${cfg.enabled ? 'Auto-update on' : 'Auto-update off'}</span>`;
+    if (cfg.last_update) {
+      status.innerHTML = `<span class="badge ${cfg.last_status === 'ok' ? 'success' : 'danger'}">${escapeHtml(cfg.last_status)}</span> ${escapeHtml(cfg.domain)} → ${escapeHtml(cfg.last_ip || '?')} at ${escapeHtml(cfg.last_update)} — ${escapeHtml(cfg.last_message || '')}`;
+    } else {
+      status.textContent = `${cfg.provider} configured for ${cfg.domain}, not updated yet.`;
+    }
+  } catch(e) {}
+}
+
+// Remote tunnel (ngrok)
+async function startNgrok() {
+  const state = await apiCall('state');
+  if (!state.auth_enabled) {
+    const proceed = confirm(
+      'No access token is configured for this UI (GODHAND_SECRET is unset). ' +
+      'Anyone with the public ngrok URL will be able to control this tool and your network. ' +
+      'Start the tunnel anyway?'
+    );
+    if (!proceed) return;
+  }
+  const authtoken = document.getElementById('ngrok-authtoken').value.trim();
+  showToast('Starting ngrok tunnel...', 'success');
+  const res = await apiCall('ngrok/start', 'POST', { authtoken });
+  showToast(res.success ? (res.url ? `Tunnel live: ${res.url}` : 'Tunnel started') : res.error, res.success ? 'success' : 'error');
+  refreshNgrokStatus();
+}
+async function stopNgrok() {
+  const res = await apiCall('ngrok/stop', 'POST');
+  showToast(res.status, 'success');
+  refreshNgrokStatus();
+}
+async function refreshNgrokStatus() {
+  try {
+    const res = await apiCall('ngrok/status');
+    if (!res.success) return;
+    document.getElementById('ngrok-badge').innerHTML =
+      `<span class="badge ${res.running ? 'success' : 'danger'}">${res.running ? 'Running' : 'Stopped'}</span>`;
+    document.getElementById('ngrok-status').innerHTML = res.running
+      ? (res.url ? `Public URL: <a href="${res.url}" target="_blank" rel="noopener">${res.url}</a>` : 'Running — URL not yet available, refresh in a moment.')
+      : 'Not running.';
+  } catch(e) {}
 }
 
 // Poll attack status
@@ -2716,6 +2999,7 @@ pollAttackStatus();
 pollTrafficCapture();
 pollBandwidth();
 refreshGatewayStatus();
+loadDdnsConfig();
 setInterval(pollLogs, 2000);
 setInterval(pollAttackStatus, 2000);
 setInterval(pollTrafficCapture, 1500);
@@ -2810,7 +3094,8 @@ def api_state():
                 'hosts': STATE['hosts'],
                 'blocked_macs': list(STATE['blocked_macs']),
             },
-            'running_attacks': list(STATE['attack_pids'].keys())
+            'running_attacks': list(STATE['attack_pids'].keys()),
+            'auth_enabled': bool(SECRET),
         })
 
 @app.route('/api/scan', methods=['GET'])
@@ -3018,6 +3303,104 @@ def api_gateway_proxy_stop():
     stop_gateway_proxy()
     return jsonify({'success': True, 'status': 'Proxy stopped'})
 
+def ddns_config_masked():
+    with STATE_LOCK:
+        cfg = dict(STATE['ddns'])
+    if cfg.get('token'):
+        cfg['token'] = '••••' + cfg['token'][-4:]
+    if cfg.get('password'):
+        cfg['password'] = '••••'
+    return cfg
+
+@app.route('/api/ddns/config', methods=['GET'])
+@require_auth
+def api_ddns_get_config():
+    return jsonify({'success': True, 'config': ddns_config_masked()})
+
+@app.route('/api/ddns/config', methods=['POST'])
+@require_auth
+def api_ddns_set_config():
+    data = request.json or {}
+    provider = data.get('provider')
+    if provider not in ('duckdns', 'noip'):
+        return jsonify({'success': False, 'error': 'provider must be duckdns or noip'})
+    domain = (data.get('domain') or '').strip()
+    if not domain:
+        return jsonify({'success': False, 'error': 'Hostname/domain is required'})
+    try:
+        interval = max(1, int(data.get('interval_minutes', 5)))
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'interval_minutes must be a number'})
+    with STATE_LOCK:
+        STATE['ddns']['provider'] = provider
+        STATE['ddns']['domain'] = domain
+        STATE['ddns']['interval_minutes'] = interval
+        if provider == 'duckdns':
+            if data.get('token'):
+                STATE['ddns']['token'] = data['token'].strip()
+        else:
+            if data.get('username'):
+                STATE['ddns']['username'] = data['username'].strip()
+            if data.get('password'):
+                STATE['ddns']['password'] = data['password'].strip()
+    add_log('info', f'DDNS configured: {provider} / {domain}')
+    return jsonify({'success': True})
+
+@app.route('/api/ddns/toggle', methods=['POST'])
+@require_auth
+def api_ddns_toggle():
+    data = request.json or {}
+    enabled = bool(data.get('enabled'))
+    with STATE_LOCK:
+        if enabled and STATE['ddns']['provider'] not in ('duckdns', 'noip'):
+            return jsonify({'success': False, 'error': 'Configure and save DDNS settings first'})
+        STATE['ddns']['enabled'] = enabled
+    add_log('info', f'DDNS auto-update {"enabled" if enabled else "disabled"}')
+    return jsonify({'success': True})
+
+@app.route('/api/ddns/update_now', methods=['POST'])
+@require_auth
+def api_ddns_update_now():
+    cfg = get_state('ddns')
+    if cfg.get('provider') not in ('duckdns', 'noip'):
+        return jsonify({'success': False, 'error': 'DDNS is not configured'})
+    ddns_perform_update()
+    masked = ddns_config_masked()
+    return jsonify({'success': masked.get('last_status') == 'ok', 'status': masked})
+
+@app.route('/api/ngrok/start', methods=['POST'])
+@require_auth
+def api_ngrok_start():
+    data = request.json or {}
+    authtoken = (data.get('authtoken') or '').strip()
+    port = data.get('port') or APP_PORT
+    try:
+        proc = start_ngrok_tunnel(port, authtoken or None)
+        with STATE_LOCK:
+            STATE['ngrok_proc'] = proc
+        time.sleep(1.5)
+        url = get_ngrok_public_url()
+        add_log('success', f'ngrok tunnel started' + (f': {url}' if url else ' (URL not yet available)'))
+        return jsonify({'success': True, 'url': url})
+    except Exception as e:
+        add_log('error', f'ngrok start failed: {e}')
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/ngrok/stop', methods=['POST'])
+@require_auth
+def api_ngrok_stop():
+    stop_proc('ngrok')
+    with STATE_LOCK:
+        STATE['ngrok_proc'] = None
+    add_log('info', 'ngrok tunnel stopped')
+    return jsonify({'success': True})
+
+@app.route('/api/ngrok/status', methods=['GET'])
+@require_auth
+def api_ngrok_status():
+    running = proc_running('ngrok')
+    return jsonify({'success': True, 'running': running, 'url': get_ngrok_public_url() if running else None})
+
 @app.route('/api/check_reachability', methods=['GET'])
 @require_auth
 def api_check_reachability():
@@ -3116,4 +3499,5 @@ if __name__ == '__main__':
         print("WARNING: Not running as root. Some features (raw sockets, iptables) may fail.")
     ensure_tool('iw')
     ensure_tool('iptables')
+    threading.Thread(target=ddns_supervisor_loop, daemon=True).start()
     app.run(host='0.0.0.0', port=APP_PORT, debug=False, threaded=True)
