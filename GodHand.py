@@ -1056,6 +1056,43 @@ tr:hover td { background: rgba(255,255,255,0.02); }
   text-align: center;
   font-size: 0.9rem;
 }
+.empty-inline {
+  color: var(--text-secondary);
+  font-size: 0.85rem;
+}
+.chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 4px 0 20px;
+}
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: var(--bg-inset);
+  border: 1px solid var(--border-subtle);
+  border-radius: 20px;
+  padding: 5px 6px 5px 12px;
+  font-size: 0.85rem;
+}
+.chip-ip {
+  color: var(--text-primary);
+  font-family: 'JetBrains Mono', monospace;
+  margin-right: 2px;
+}
+.chip-action {
+  background: none;
+  border: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  padding: 5px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.chip-action:hover { background: var(--glow-accent); color: var(--accent-primary); }
 .btn-icon {
   background: none;
   border: none;
@@ -1068,6 +1105,8 @@ tr:hover td { background: rgba(255,255,255,0.02); }
   min-height: 40px;
 }
 .btn-icon:hover { background: var(--glow-accent); color: var(--accent-primary); }
+.btn-icon svg { vertical-align: middle; }
+nav button .icon svg { display: block; }
 .log-container {
   background: var(--bg-inset);
   border: 1px solid var(--border-subtle);
@@ -1205,109 +1244,17 @@ tr:hover td { background: rgba(255,255,255,0.02); }
 </header>
 
 <nav id="main-nav">
-  <button class="tab-btn active" data-tab="attacks"><span class="icon">🎯</span> Attacks</button>
-  <button class="tab-btn" data-tab="targets"><span class="icon">📋</span> Targets</button>
-  <button class="tab-btn" data-tab="hosts"><span class="icon">📡</span> Hosts</button>
-  <button class="tab-btn" data-tab="devicewatch"><span class="icon">📊</span> Device Watch</button>
-  <button class="tab-btn" data-tab="settings"><span class="icon">⚙️</span> Settings</button>
-  <button class="tab-btn" data-tab="detector"><span class="icon">🛡️</span> Detector</button>
-  <button class="tab-btn" data-tab="logs"><span class="icon">📜</span> Logs</button>
+  <button class="tab-btn active" data-tab="settings"><span class="icon"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg></span> Settings</button>
+  <button class="tab-btn" data-tab="recon"><span class="icon"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg></span> Recon</button>
+  <button class="tab-btn" data-tab="attacks"><span class="icon"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><circle cx="12" cy="12" r="6"></circle><circle cx="12" cy="12" r="2"></circle></svg></span> Attacks</button>
+  <button class="tab-btn" data-tab="monitor"><span class="icon"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg></span> Monitor</button>
 </nav>
 
 <main>
-  <div id="tab-attacks" class="tab-content active">
-    <div class="card">
-      <h2>Choose your weapon</h2>
-      <p class="sub">Select an attack, set targets, then press Start.</p>
-      <div class="weapon-grid" id="weapon-grid">
-        <div class="weapon-btn active" data-w="1"><span class="num">1</span><span class="label">ARP Freeze</span></div>
-        <div class="weapon-btn" data-w="2"><span class="num">2</span><span class="label">Deauth Flood</span></div>
-        <div class="weapon-btn" data-w="3"><span class="num">3</span><span class="label">SYN Flood</span></div>
-        <div class="weapon-btn" data-w="4"><span class="num">4</span><span class="label">DHCP Storm</span></div>
-        <div class="weapon-btn" data-w="5"><span class="num">5</span><span class="label">Traffic Capture</span></div>
-      </div>
-      <div style="display:flex; gap:10px; flex-wrap:wrap;">
-        <button class="btn big" id="start-btn" onclick="confirmStartAttack()">▶ Start</button>
-        <button class="btn big secondary" id="stop-btn" onclick="confirmStopAttack()" disabled>⏹ Stop</button>
-      </div>
-      <div id="attack-status" class="status-message">Status: Ready</div>
-    </div>
-    <div class="card">
-      <h2>Quick actions</h2>
-      <div class="row">
-        <button class="btn" onclick="kickSelected()">👢 Kick client</button>
-        <button class="btn" onclick="toggleBlock()">🔒 Block/Unblock</button>
-        <button class="btn secondary" onclick="refreshHosts()">🔄 Rescan LAN</button>
-      </div>
-    </div>
-  </div>
-
-  <div id="tab-targets" class="tab-content">
-    <div class="card">
-      <h2>Your targets</h2>
-      <p class="sub">Add IPs from discovered hosts or type manually.</p>
-      <div class="row">
-        <input type="text" id="target-ip" placeholder="IP address">
-        <button class="btn" onclick="addTarget()">Add</button>
-      </div>
-      <div class="table-responsive">
-        <table id="target-table">
-          <thead><tr><th>IP</th><th>MAC</th><th></th></tr></thead>
-          <tbody id="target-body"></tbody>
-        </table>
-      </div>
-      <div class="empty" id="target-empty">No targets added.</div>
-    </div>
-  </div>
-
-  <div id="tab-hosts" class="tab-content">
-    <div class="card">
-      <h2>Discovered hosts</h2>
-      <p class="sub">Scan the LAN to populate this list. Check boxes to bulk add.</p>
-      <div class="row">
-        <button class="btn" id="scan-btn" onclick="refreshHosts()">🔄 Scan now</button>
-        <button class="btn secondary" onclick="bulkAddTargets()">Add selected to targets</button>
-        <span id="scan-spinner" style="display:none;"><span class="spinner"></span> Scanning...</span>
-      </div>
-      <div class="table-responsive">
-        <table id="host-table">
-          <thead><tr><th><input type="checkbox" id="select-all-hosts" onchange="toggleAllHosts()"></th><th>IP</th><th>MAC</th><th>Reachability</th><th>Action</th></tr></thead>
-          <tbody id="host-body"></tbody>
-        </table>
-      </div>
-      <div class="empty" id="host-empty">No hosts discovered. Press "Scan now".</div>
-    </div>
-  </div>
-
-  <div id="tab-devicewatch" class="tab-content">
-    <div class="card">
-      <h2>Add a device</h2>
-      <p class="sub">Track hosts on your LAN. Server-side ping is used.</p>
-      <div class="row">
-        <input type="text" id="dev-name" placeholder="Label">
-        <input type="text" id="dev-ip" placeholder="IP address">
-        <button class="btn" onclick="addDevice()">Add</button>
-      </div>
-    </div>
-    <div class="card">
-      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
-        <h2 style="margin:0;">Tracked devices</h2>
-        <button class="btn secondary" onclick="checkAllDevices()">Check all</button>
-      </div>
-      <div class="table-responsive">
-        <table id="dev-table">
-          <thead><tr><th>Label</th><th>IP</th><th>Status</th><th>Latency</th><th></th></tr></thead>
-          <tbody></tbody>
-        </table>
-      </div>
-      <div class="empty" id="dev-empty">No devices yet. Add one above.</div>
-    </div>
-  </div>
-
-  <div id="tab-settings" class="tab-content">
+  <div id="tab-settings" class="tab-content active">
     <div class="card">
       <h2>Interface & gateway</h2>
-      <p class="sub">Set your Wi‑Fi interface and gateway IP.</p>
+      <p class="sub">Start here — set your Wi‑Fi interface and gateway IP before scanning or attacking.</p>
       <div class="row">
         <select id="iface-select"></select>
         <button class="btn" onclick="setInterface()">Set interface</button>
@@ -1324,7 +1271,75 @@ tr:hover td { background: rgba(255,255,255,0.02); }
     </div>
   </div>
 
-  <div id="tab-detector" class="tab-content">
+  <div id="tab-recon" class="tab-content">
+    <div class="card">
+      <h2>Discover & target hosts</h2>
+      <p class="sub">Scan the LAN, then select hosts to target — or add an IP directly if it wasn't discovered.</p>
+      <div class="row">
+        <button class="btn" id="scan-btn" onclick="refreshHosts()"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-3px; margin-right:4px;"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>Scan now</button>
+        <button class="btn secondary" onclick="bulkAddTargets()">Add selected to targets</button>
+        <span id="scan-spinner" style="display:none;"><span class="spinner"></span> Scanning...</span>
+      </div>
+      <div class="row">
+        <input type="text" id="target-ip" placeholder="Add IP manually" style="flex-basis:100%;">
+      </div>
+      <div class="row">
+        <button class="btn secondary" onclick="addTarget()">Add target</button>
+        <button class="btn secondary" onclick="kickTypedIP()"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-3px; margin-right:4px;"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="8.5" cy="7" r="4"></circle><line x1="18" y1="8" x2="23" y2="13"></line><line x1="23" y1="8" x2="18" y2="13"></line></svg>Kick</button>
+        <button class="btn secondary" onclick="blockTypedIP()"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-3px; margin-right:4px;"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>Block</button>
+      </div>
+      <p class="sub" style="margin-top:-8px;">Kick/Block act on the typed IP directly — no need to add it as a target first.</p>
+      <p class="sub" style="margin-bottom:8px;">Current targets — attacks run against these:</p>
+      <div class="chip-row" id="target-chips"></div>
+      <div class="table-responsive">
+        <table id="host-table">
+          <thead><tr><th><input type="checkbox" id="select-all-hosts" onchange="toggleAllHosts()"></th><th>IP</th><th>MAC</th><th>Reachability</th><th>Action</th></tr></thead>
+          <tbody id="host-body"></tbody>
+        </table>
+      </div>
+      <div class="empty" id="host-empty">No hosts discovered. Press "Scan now".</div>
+    </div>
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+        <h2 style="margin:0;">Tracked devices</h2>
+        <button class="btn secondary" onclick="checkAllDevices()">Check all</button>
+      </div>
+      <p class="sub">Watch specific hosts long-term, independent of scan results.</p>
+      <div class="row">
+        <input type="text" id="dev-name" placeholder="Label">
+        <input type="text" id="dev-ip" placeholder="IP address">
+        <button class="btn" onclick="addDevice()">Add</button>
+      </div>
+      <div class="table-responsive">
+        <table id="dev-table">
+          <thead><tr><th>Label</th><th>IP</th><th>Status</th><th>Latency</th><th></th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div class="empty" id="dev-empty">No devices yet. Add one above.</div>
+    </div>
+  </div>
+
+  <div id="tab-attacks" class="tab-content">
+    <div class="card">
+      <h2>Choose your weapon</h2>
+      <p class="sub">Select an attack, make sure targets are set on the Recon tab, then press Start.</p>
+      <div class="weapon-grid" id="weapon-grid">
+        <div class="weapon-btn active" data-w="1"><span class="num">1</span><span class="label">ARP Freeze</span></div>
+        <div class="weapon-btn" data-w="2"><span class="num">2</span><span class="label">Deauth Flood</span></div>
+        <div class="weapon-btn" data-w="3"><span class="num">3</span><span class="label">SYN Flood</span></div>
+        <div class="weapon-btn" data-w="4"><span class="num">4</span><span class="label">DHCP Storm</span></div>
+        <div class="weapon-btn" data-w="5"><span class="num">5</span><span class="label">Traffic Capture</span></div>
+      </div>
+      <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        <button class="btn big" id="start-btn" onclick="confirmStartAttack()">▶ Start</button>
+        <button class="btn big secondary" id="stop-btn" onclick="confirmStopAttack()" disabled>⏹ Stop</button>
+      </div>
+      <div id="attack-status" class="status-message">Status: Ready</div>
+    </div>
+  </div>
+
+  <div id="tab-monitor" class="tab-content">
     <div class="card">
       <h2>Paste an ARP snapshot</h2>
       <p class="sub">Run <code>arp -a</code> and paste output below. Detects MAC changes.</p>
@@ -1348,9 +1363,6 @@ tr:hover td { background: rgba(255,255,255,0.02); }
       <div id="alerts"></div>
       <div class="empty" id="alerts-empty">No anomalies detected yet.</div>
     </div>
-  </div>
-
-  <div id="tab-logs" class="tab-content">
     <div class="card">
       <h2>Activity log (server-side)</h2>
       <p class="sub">All actions are logged on the server.</p>
@@ -1581,8 +1593,8 @@ function renderHosts() {
         ${isTarget 
           ? `<button class="btn-icon" onclick="removeTargetByIP('${h.ip}')" title="Remove target">✕</button>`
           : `<button class="btn-icon" onclick="addTargetByIP('${h.ip}')" title="Add target">＋</button>`}
-        <button class="btn-icon" onclick="kickIP('${h.ip}')" title="Kick">👢</button>
-        <button class="btn-icon" onclick="toggleBlockIP('${h.ip}')" title="Block">🔒</button>
+        <button class="btn-icon" onclick="kickIP('${h.ip}')" title="Kick"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="8.5" cy="7" r="4"></circle><line x1="18" y1="8" x2="23" y2="13"></line><line x1="23" y1="8" x2="18" y2="13"></line></svg></button>
+        <button class="btn-icon" onclick="toggleBlockIP('${h.ip}')" title="Block"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg></button>
       </td>
     `;
     tbody.appendChild(tr);
@@ -1648,20 +1660,22 @@ async function addTarget() {
 async function loadTargets() {
   const res = await apiCall('state');
   currentTargets = res.state.targets || [];
-  const tbody = document.getElementById('target-body');
-  const empty = document.getElementById('target-empty');
-  tbody.innerHTML = '';
-  empty.style.display = currentTargets.length ? 'none' : 'block';
+  const box = document.getElementById('target-chips');
+  box.innerHTML = '';
+  if (!currentTargets.length) {
+    box.innerHTML = '<span class="empty-inline">No targets yet — scan below or add an IP manually.</span>';
+    return;
+  }
   currentTargets.forEach(ip => {
-    const host = currentHosts.find(h => h.ip === ip);
-    const mac = host ? host.mac : '—';
-    const tr = document.createElement('tr');
-    tr.innerHTML = `
-      <td data-label="IP">${ip}</td>
-      <td data-label="MAC">${mac}</td>
-      <td data-label=""><button class="btn-icon" onclick="removeTargetByIP('${ip}')">✕</button></td>
+    const chip = document.createElement('span');
+    chip.className = 'chip';
+    chip.innerHTML = `
+      <span class="chip-ip">${ip}</span>
+      <button class="chip-action" onclick="kickIP('${ip}')" title="Kick"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="8.5" cy="7" r="4"></circle><line x1="18" y1="8" x2="23" y2="13"></line><line x1="23" y1="8" x2="18" y2="13"></line></svg></button>
+      <button class="chip-action" onclick="toggleBlockIP('${ip}')" title="Block"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg></button>
+      <button class="chip-action" onclick="removeTargetByIP('${ip}')" title="Remove target">✕</button>
     `;
-    tbody.appendChild(tr);
+    box.appendChild(chip);
   });
 }
 
@@ -1710,13 +1724,15 @@ async function toggleBlockIP(ip) {
   const res = await apiCall('block', 'POST', { ip });
   showToast(res.status, res.success ? 'success' : 'error');
 }
-function kickSelected() {
-  const ip = prompt('Enter IP to kick:');
-  if (ip) kickIP(ip);
+function kickTypedIP() {
+  const ip = document.getElementById('target-ip').value.trim();
+  if (!ip) { showToast('Enter an IP first', 'warning'); return; }
+  kickIP(ip);
 }
-function toggleBlock() {
-  const ip = prompt('Enter IP to block/unblock:');
-  if (ip) toggleBlockIP(ip);
+function blockTypedIP() {
+  const ip = document.getElementById('target-ip').value.trim();
+  if (!ip) { showToast('Enter an IP first', 'warning'); return; }
+  toggleBlockIP(ip);
 }
 
 // Device Watch
