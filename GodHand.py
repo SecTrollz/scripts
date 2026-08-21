@@ -36,6 +36,21 @@ APP_PORT = int(os.environ.get('GODHAND_PORT', 5000))
 LOGIN_USERNAME = os.environ.get('GODHAND_USERNAME', 'admin')
 LOGIN_PASSWORD = os.environ.get('GODHAND_PASSWORD', '')
 
+# This tool can scan, deauth, and MITM devices on the network it runs from --
+# it must never be reachable with no credential at all. If the operator hasn't
+# set one, generate a one-off password rather than silently running open.
+AUTO_GENERATED_PASSWORD = False
+if not LOGIN_PASSWORD and not SECRET:
+    LOGIN_PASSWORD = secrets.token_urlsafe(12)
+    AUTO_GENERATED_PASSWORD = True
+    print('=' * 64)
+    print('  GODHAND: no GODHAND_PASSWORD/GODHAND_SECRET set -- generated one')
+    print(f'    username: {LOGIN_USERNAME}')
+    print(f'    password: {LOGIN_PASSWORD}')
+    print('  This password changes every restart. Set GODHAND_USERNAME and')
+    print('  GODHAND_PASSWORD yourself to keep a stable login.')
+    print('=' * 64)
+
 # ---------- gateway (DNS/VPN/proxy) configuration ----------
 GATEWAY_DIR = os.path.join(os.environ['PREFIX'], 'etc', 'godhand-gateway') if os.environ.get('PREFIX') else '/etc/godhand-gateway'
 GW_UNBOUND_CONF = os.path.join(GATEWAY_DIR, 'unbound.conf')
@@ -2169,7 +2184,7 @@ nav button .icon svg { display: block; }
   </div>
 </div>
 
-<div id="app-shell">
+<div id="app-shell" style="display:none;">
 <header>
   <a href="#" class="logo">
     <div class="logo-icon">G</div>
@@ -3503,9 +3518,10 @@ async function checkLoginRequired() {
     }
     showLogin();
   } catch (e) {
-    // Fail open on network error -- don't brick local access to a self-hosted tool
-    // just because the login-required check itself couldn't be reached.
-    showApp();
+    // Fail closed: a password always exists now (auto-generated if the operator
+    // didn't set one), so there is no configuration where showing the app
+    // instead of the login screen is the safe choice.
+    showLogin();
   }
 }
 
@@ -3621,7 +3637,7 @@ def api_state():
                 'blocked_macs': list(STATE['blocked_macs']),
             },
             'running_attacks': list(STATE['attack_pids'].keys()),
-            'auth_enabled': bool(SECRET),
+            'auth_enabled': bool(SECRET or LOGIN_PASSWORD),
         })
 
 @app.route('/api/scan', methods=['GET'])
