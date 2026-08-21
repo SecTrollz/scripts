@@ -80,7 +80,6 @@ STATE = {
     'attack_pids': {},
     'attack_status': {},
     'blocked_macs': set(),
-    'monitor_log': [],
     'monitor_entries': [],
     'monitor_log_path': None,
     'bandwidth_sample': None,
@@ -1244,10 +1243,12 @@ def compute_traffic_stats():
             b['bytes'] += e.get('len', 0)
         # The service port is conventionally the lower of the two -- using dp alone
         # would mislabel response packets (their dp is the remote's ephemeral port).
-        key = (e['proto'], min(e['sp'], e['dp']))
-        p = ports.setdefault(key, {'count': 0, 'bytes': 0})
-        p['count'] += 1
-        p['bytes'] += e.get('len', 0)
+        # ICMP has no ports at all, so it doesn't belong in a port breakdown.
+        if 'sp' in e and 'dp' in e:
+            key = (e['proto'], min(e['sp'], e['dp']))
+            p = ports.setdefault(key, {'count': 0, 'bytes': 0})
+            p['count'] += 1
+            p['bytes'] += e.get('len', 0)
     top_talkers = sorted(
         ({'host': h, 'count': v['count'], 'bytes': v['bytes']} for h, v in hosts.items()),
         key=lambda x: -x['bytes'])[:8]
@@ -1276,20 +1277,23 @@ def start_attack_monitor(targets, port, iface):
     if not set_monitor(iface, True, raise_on_fail=False):
         add_log('warn', 'Monitor mode could not be enabled; capture may be incomplete')
     with STATE_LOCK:
-        STATE['monitor_log'] = []
         STATE['monitor_entries'] = []
     # Use a writable temp directory
     tmpdir = tempfile.gettempdir()
     log_path = os.path.join(tmpdir, f"godhand_monitor_{int(time.time())}.log")
-    # Captures ALL TCP/UDP traffic to/from the targets (not just one port) --
-    # a single-port filter would defeat the point of a top-ports breakdown.
+    # Captures ALL TCP/UDP/ICMP traffic to/from the targets (not just one port) --
+    # a single-port filter would defeat the point of a top-ports breakdown. IPv4
+    # only, and assumes no IP options (20-byte header) -- covers the overwhelming
+    # majority of home-LAN traffic without the complexity of a full IHL/IPv6 parser.
     script = textwrap.dedent(f"""
         import socket, struct, select, time, sys, json
         IFACE = '{iface}'
         TARGETS = set({targets})
-        PROTO_NAMES = {{6: 'tcp', 17: 'udp'}}
+        PROTO_NAMES = {{6: 'tcp', 17: 'udp', 1: 'icmp'}}
+        ICMP_TYPES = {{0: 'echo-reply', 3: 'dest-unreachable', 8: 'echo-request', 11: 'time-exceeded'}}
         sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
         sock.bind((IFACE, 0))
+        pkt_no = 0
         while True:
             r, _, _ = select.select([sock], [], [], 0.5)
             if not r:
@@ -1306,9 +1310,27 @@ def start_attack_monitor(targets, port, iface):
             proto = PROTO_NAMES.get(data[23])
             if proto is None:
                 continue
-            sp, dp = struct.unpack('!HH', data[34:38])
             length = struct.unpack('!H', data[16:18])[0]
-            print(json.dumps({{'t': time.time(), 'src': src_ip, 'dst': dst_ip, 'sp': sp, 'dp': dp, 'proto': proto, 'len': length}}))
+            pkt_no += 1
+            entry = {{'no': pkt_no, 't': time.time(), 'src': src_ip, 'dst': dst_ip, 'proto': proto, 'len': length}}
+            if proto in ('tcp', 'udp'):
+                sp, dp = struct.unpack('!HH', data[34:38])
+                entry['sp'] = sp
+                entry['dp'] = dp
+                if proto == 'tcp' and len(data) >= 48:
+                    flag_byte = data[47]
+                    flags = []
+                    if flag_byte & 0x02: flags.append('SYN')
+                    if flag_byte & 0x10: flags.append('ACK')
+                    if flag_byte & 0x01: flags.append('FIN')
+                    if flag_byte & 0x04: flags.append('RST')
+                    if flag_byte & 0x08: flags.append('PSH')
+                    if flag_byte & 0x20: flags.append('URG')
+                    entry['flags'] = flags
+            elif proto == 'icmp':
+                icmp_type = data[34]
+                entry['icmp_type'] = ICMP_TYPES.get(icmp_type, f'type-{{icmp_type}}')
+            print(json.dumps(entry))
             sys.stdout.flush()
     """)
     fd, path = tempfile.mkstemp(suffix='.py')
@@ -1335,20 +1357,16 @@ def start_attack_monitor(targets, port, iface):
                     last_pos = lf.tell()
                     if new_lines:
                         entries = []
-                        texts = []
                         for line in new_lines:
                             try:
                                 e = json.loads(line)
                             except ValueError:
                                 continue
+                            e['dir'] = 'out' if e['src'] in targets else 'in'
                             entries.append(e)
-                            arrow = '->' if e['src'] in targets else '<-'
-                            other_port = e['dp'] if arrow == '->' else e['sp']
-                            texts.append(f"{e['src']} {arrow} {e['dst']}:{other_port} ({e['proto']}, {e['len']}B)\n")
                         if entries:
                             with STATE_LOCK:
                                 STATE['monitor_entries'] = (STATE['monitor_entries'] + entries)[-500:]
-                                STATE['monitor_log'] = (STATE['monitor_log'] + texts)[-100:]
             except:
                 pass
             time.sleep(0.5)
@@ -2560,8 +2578,14 @@ GODHAND_DDNS_ENABLED=1                  # optional, default on when the above ar
       <div class="empty" id="traffic-ports-empty">No traffic captured yet.</div>
     </div>
     <div class="card">
-      <h2>Raw connection feed</h2>
-      <div class="log-container" id="traffic-container" style="display:none;"></div>
+      <h2>Live packet feed</h2>
+      <p class="sub">Every IPv4 TCP/UDP/ICMP packet to or from your targets, newest at the bottom -- like a live Wireshark capture scoped to this device.</p>
+      <div class="table-responsive" style="max-height:380px; overflow-y:auto;">
+        <table id="traffic-packets-table" style="display:none; font-family:'JetBrains Mono',monospace; font-size:0.78rem;">
+          <thead><tr><th>No.</th><th>Time</th><th>Dir</th><th>Source</th><th>Destination</th><th>Proto</th><th>Length</th><th>Info</th></tr></thead>
+          <tbody id="traffic-packets-body"></tbody>
+        </table>
+      </div>
       <div class="empty" id="traffic-empty">Not capturing. Select weapon 5 on the Attacks tab and press Start.</div>
     </div>
     <div class="card">
@@ -2776,18 +2800,54 @@ function clearServerLogs() {
 }
 
 // Live traffic capture
+function formatPacketInfo(e) {
+  if (e.proto === 'tcp') {
+    const flags = e.flags && e.flags.length ? ` [${e.flags.join(', ')}]` : '';
+    return `${e.sp} → ${e.dp}${flags} Len=${e.len}`;
+  }
+  if (e.proto === 'udp') {
+    return `${e.sp} → ${e.dp} Len=${e.len}`;
+  }
+  if (e.proto === 'icmp') {
+    return `${e.icmp_type || 'icmp'} Len=${e.len}`;
+  }
+  return `Len=${e.len}`;
+}
+function formatPacketRow(e) {
+  const time = new Date(e.t * 1000);
+  const hh = String(time.getHours()).padStart(2, '0');
+  const mm = String(time.getMinutes()).padStart(2, '0');
+  const ss = String(time.getSeconds()).padStart(2, '0');
+  const ms = String(time.getMilliseconds()).padStart(3, '0');
+  const badgeClass = e.proto === 'tcp' ? 'info' : e.proto === 'udp' ? 'success' : 'warning';
+  const dirArrow = e.dir === 'out' ? '↑' : '↓';
+  return `
+    <tr>
+      <td data-label="No.">${e.no}</td>
+      <td data-label="Time">${hh}:${mm}:${ss}.${ms}</td>
+      <td data-label="Dir">${dirArrow}</td>
+      <td data-label="Source">${escapeHtml(e.src)}</td>
+      <td data-label="Destination">${escapeHtml(e.dst)}</td>
+      <td data-label="Proto"><span class="badge ${badgeClass}">${e.proto.toUpperCase()}</span></td>
+      <td data-label="Length">${e.len}</td>
+      <td data-label="Info">${escapeHtml(formatPacketInfo(e))}</td>
+    </tr>
+  `;
+}
 async function pollTrafficCapture() {
   try {
     const res = await apiCall('monitor_log');
-    const container = document.getElementById('traffic-container');
+    const table = document.getElementById('traffic-packets-table');
+    const body = document.getElementById('traffic-packets-body');
     const empty = document.getElementById('traffic-empty');
-    if (res.lines && res.lines.length) {
+    if (res.entries && res.entries.length) {
       empty.style.display = 'none';
-      container.style.display = 'block';
-      container.innerHTML = res.lines.map(l => `<div class="log-entry"><span class="msg">${l}</span></div>`).join('');
-      container.scrollTop = container.scrollHeight;
+      table.style.display = 'table';
+      body.innerHTML = res.entries.map(formatPacketRow).join('');
+      const wrap = table.closest('.table-responsive');
+      if (wrap) wrap.scrollTop = wrap.scrollHeight;
     } else {
-      container.style.display = 'none';
+      table.style.display = 'none';
       empty.style.display = 'block';
       empty.textContent = res.capturing
         ? 'Capturing... waiting for matching traffic.'
@@ -2795,8 +2855,9 @@ async function pollTrafficCapture() {
     }
     const attacksStatus = document.getElementById('attacks-traffic-status');
     if (attacksStatus) {
+      const n = res.entries ? res.entries.length : 0;
       attacksStatus.textContent = res.capturing
-        ? `Capturing — ${res.lines.length} recent connection(s) logged. See the Monitor tab for the full analysis panel.`
+        ? `Capturing — ${n} recent packet(s) logged. See the Monitor tab for the full analysis panel.`
         : 'Not capturing.';
     }
   } catch(e) {}
@@ -3671,7 +3732,7 @@ function initApp() {
   loadDdnsConfig();
   setInterval(pollLogs, 2000);
   setInterval(pollAttackStatus, 2000);
-  setInterval(pollTrafficCapture, 1500);
+  setInterval(pollTrafficCapture, 1000);
   setInterval(pollBandwidth, 2000);
   setInterval(refreshGatewayStatus, 4000);
 }
@@ -3882,8 +3943,8 @@ def api_attack_status():
 @app.route('/api/monitor_log', methods=['GET'])
 @require_auth
 def api_monitor_log():
-    lines = STATE.get('monitor_log', [])
-    return jsonify({'lines': lines[-100:], 'capturing': 5 in STATE['attack_pids']})
+    entries = STATE.get('monitor_entries', [])
+    return jsonify({'entries': entries[-150:], 'capturing': 5 in STATE['attack_pids']})
 
 @app.route('/api/traffic_stats', methods=['GET'])
 @require_auth
