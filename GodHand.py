@@ -1339,6 +1339,80 @@ def start_attack_monitor(targets, port, iface):
         TARGETS = set({targets})
         PROTO_NAMES = {{6: 'tcp', 17: 'udp', 1: 'icmp'}}
         ICMP_TYPES = {{0: 'echo-reply', 3: 'dest-unreachable', 8: 'echo-request', 11: 'time-exceeded'}}
+        HTTP_METHODS = (b'GET ', b'POST ', b'PUT ', b'HEAD ', b'DELETE ', b'OPTIONS ', b'PATCH ', b'CONNECT ')
+
+        def parse_http(payload):
+            try:
+                if len(payload) < 4:
+                    return None
+                head = payload[:16]
+                if not (head.startswith(HTTP_METHODS) or head.startswith(b'HTTP/1.')):
+                    return None
+                end = payload.find(b'\\r\\n')
+                if end == -1:
+                    end = payload.find(b'\\n')
+                if end == -1 or end > 200:
+                    return None
+                line = payload[:end].decode('ascii', 'replace').strip()
+                return line or None
+            except Exception:
+                return None
+
+        def parse_dns_query(payload):
+            try:
+                if len(payload) < 13:
+                    return None
+                pos = 12
+                labels = []
+                while pos < len(payload):
+                    length = payload[pos]
+                    if length == 0:
+                        break
+                    if length & 0xC0:
+                        break
+                    pos += 1
+                    labels.append(payload[pos:pos + length].decode('ascii', 'replace'))
+                    pos += length
+                return '.'.join(labels) if labels else None
+            except Exception:
+                return None
+
+        def parse_tls_sni(payload):
+            # TLS record (Handshake) -> Handshake (ClientHello) -> extensions -> server_name (type 0x0000)
+            try:
+                if len(payload) < 6 or payload[0] != 0x16 or payload[5] != 0x01:
+                    return None
+                pos = 9 + 2 + 32  # skip record(5)+handshake-hdr(4), client_version(2), random(32)
+                if pos >= len(payload):
+                    return None
+                pos += 1 + payload[pos]  # session_id
+                if pos + 2 > len(payload):
+                    return None
+                cipher_len = struct.unpack('!H', payload[pos:pos + 2])[0]
+                pos += 2 + cipher_len
+                if pos >= len(payload):
+                    return None
+                pos += 1 + payload[pos]  # compression methods
+                if pos + 2 > len(payload):
+                    return None
+                ext_total_len = struct.unpack('!H', payload[pos:pos + 2])[0]
+                pos += 2
+                ext_end = min(pos + ext_total_len, len(payload))
+                while pos + 4 <= ext_end:
+                    ext_type, ext_len = struct.unpack('!HH', payload[pos:pos + 4])
+                    pos += 4
+                    if ext_type == 0x0000:
+                        sni_pos = pos + 2 + 1  # server_name_list len(2) + name_type(1)
+                        if sni_pos + 2 > len(payload):
+                            return None
+                        name_len = struct.unpack('!H', payload[sni_pos:sni_pos + 2])[0]
+                        start = sni_pos + 2
+                        return payload[start:start + name_len].decode('ascii', 'replace') or None
+                    pos += ext_len
+            except Exception:
+                return None
+            return None
+
         sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
         sock.bind((IFACE, 0))
         pkt_no = 0
@@ -1375,6 +1449,21 @@ def start_attack_monitor(targets, port, iface):
                     if flag_byte & 0x08: flags.append('PSH')
                     if flag_byte & 0x20: flags.append('URG')
                     entry['flags'] = flags
+                    tcp_header_len = max(5, data[46] >> 4) * 4
+                    payload_start = 34 + tcp_header_len
+                    if len(data) > payload_start:
+                        payload = data[payload_start:]
+                        http_line = parse_http(payload)
+                        if http_line:
+                            entry['http_info'] = http_line
+                        else:
+                            sni = parse_tls_sni(payload)
+                            if sni:
+                                entry['tls_sni'] = sni
+                elif proto == 'udp' and (sp == 53 or dp == 53) and len(data) > 42:
+                    query = parse_dns_query(data[42:])
+                    if query:
+                        entry['dns_query'] = query
             elif proto == 'icmp':
                 icmp_type = data[34]
                 entry['icmp_type'] = ICMP_TYPES.get(icmp_type, f'type-{{icmp_type}}')
@@ -2931,10 +3020,15 @@ function clearServerLogs() {
 function formatPacketInfo(e) {
   if (e.proto === 'tcp') {
     const flags = e.flags && e.flags.length ? ` [${e.flags.join(', ')}]` : '';
-    return `${e.sp} → ${e.dp}${flags} Len=${e.len}`;
+    let base = `${e.sp} → ${e.dp}${flags} Len=${e.len}`;
+    if (e.http_info) base += ` — ${e.http_info}`;
+    else if (e.tls_sni) base += ` — TLS SNI: ${e.tls_sni}`;
+    return base;
   }
   if (e.proto === 'udp') {
-    return `${e.sp} → ${e.dp} Len=${e.len}`;
+    let base = `${e.sp} → ${e.dp} Len=${e.len}`;
+    if (e.dns_query) base += ` — DNS query: ${e.dns_query}`;
+    return base;
   }
   if (e.proto === 'icmp') {
     return `${e.icmp_type || 'icmp'} Len=${e.len}`;
