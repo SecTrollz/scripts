@@ -1518,6 +1518,23 @@ body {
   0% { transform: scale(1) translate(0, 0); }
   100% { transform: scale(1.04) translate(-1.5%, -1%); }
 }
+.login-hand {
+  position: absolute;
+  left: -8%;
+  bottom: -10%;
+  width: min(66vw, 720px);
+  aspect-ratio: 500 / 620;
+  z-index: 0;
+  pointer-events: none;
+}
+@media (max-width: 768px) {
+  .login-hand {
+    width: 82vw;
+    left: -10%;
+    bottom: -4%;
+    opacity: 0.85;
+  }
+}
 .login-card {
   position: relative;
   z-index: 1;
@@ -2144,6 +2161,59 @@ nav button .icon svg { display: block; }
 <body>
 <div id="login-screen" class="login-screen" style="display:none;">
   <div class="login-bg"></div>
+  <svg class="login-hand" viewBox="0 0 500 620" preserveAspectRatio="xMinYMax meet" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
+    <defs>
+      <linearGradient id="handGrad" x1="0%" y1="100%" x2="70%" y2="0%">
+        <stop offset="0%" stop-color="#0B3A57" stop-opacity="0.35"/>
+        <stop offset="45%" stop-color="#38BDF8" stop-opacity="0.55"/>
+        <stop offset="100%" stop-color="#BAE6FD" stop-opacity="0.85"/>
+      </linearGradient>
+      <radialGradient id="palmGlow" cx="50%" cy="50%" r="50%">
+        <stop offset="0%" stop-color="#E0F2FE" stop-opacity="0.9"/>
+        <stop offset="40%" stop-color="#38BDF8" stop-opacity="0.5"/>
+        <stop offset="100%" stop-color="#38BDF8" stop-opacity="0"/>
+      </radialGradient>
+      <filter id="handSoftGlow" x="-60%" y="-60%" width="220%" height="220%">
+        <feGaussianBlur stdDeviation="7" result="blur"/>
+        <feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge>
+      </filter>
+      <filter id="handWideGlow" x="-100%" y="-100%" width="300%" height="300%">
+        <feGaussianBlur stdDeviation="18"/>
+      </filter>
+    </defs>
+    <g transform="rotate(-30 210 340)">
+      <ellipse cx="210" cy="360" rx="230" ry="230" fill="url(#palmGlow)"/>
+      <g filter="url(#handSoftGlow)">
+        <g opacity="0.45" filter="url(#handWideGlow)" fill="#38BDF8">
+          <path d="M 130 585 C 95 575 75 540 80 495 C 78 460 90 430 95 415 C 85 390 78 355 95 325 L 108 305 C 108 305 130 300 145 300 C 165 288 190 280 210 278 C 232 280 250 288 265 300 L 272 310 C 290 330 300 360 298 395 C 300 430 295 470 290 500 C 288 540 270 570 240 583 C 210 590 165 592 130 585 Z"/>
+          <g transform="translate(95,415) rotate(-72)"><rect x="-19" y="-108" width="38" height="108" rx="19"/></g>
+        </g>
+        <path fill="url(#handGrad)" d="M 130 585 C 95 575 75 540 80 495 C 78 460 90 430 95 415 C 85 390 78 355 95 325 L 108 305 C 108 305 130 300 145 300 C 165 288 190 280 210 278 C 232 280 250 288 265 300 L 272 310 C 290 330 300 360 298 395 C 300 430 295 470 290 500 C 288 540 270 570 240 583 C 210 590 165 592 130 585 Z"/>
+        <g transform="translate(95,415) rotate(-72)"><rect x="-19" y="-108" width="38" height="108" rx="19" fill="url(#handGrad)"/></g>
+        <g transform="translate(120,300) rotate(-20)"><rect x="-16" y="-125" width="32" height="128" rx="16" fill="url(#handGrad)"/></g>
+        <g transform="translate(165,282) rotate(-7)"><rect x="-17" y="-155" width="34" height="158" rx="17" fill="url(#handGrad)"/></g>
+        <g transform="translate(212,277) rotate(4)"><rect x="-17" y="-165" width="34" height="168" rx="17" fill="url(#handGrad)"/></g>
+        <g transform="translate(258,288) rotate(15)"><rect x="-16" y="-140" width="32" height="143" rx="16" fill="url(#handGrad)"/></g>
+        <g stroke="#E0F2FE" stroke-width="1.4" fill="none" opacity="0.8">
+          <path d="M 130 480 C 160 460 150 420 180 410 C 205 402 200 440 230 440"/>
+          <path d="M 150 520 L 150 470 L 190 470"/>
+          <path d="M 260 500 C 240 470 260 440 240 415"/>
+          <path d="M 210 540 L 250 540 L 250 500"/>
+        </g>
+        <g fill="#F0F9FF" opacity="0.9">
+          <circle cx="180" cy="410" r="3.5"/>
+          <circle cx="230" cy="440" r="3"/>
+          <circle cx="150" cy="470" r="3"/>
+          <circle cx="240" cy="415" r="3"/>
+          <circle cx="250" cy="500" r="3"/>
+          <circle cx="76" cy="180" r="4"/>
+          <circle cx="146" cy="125" r="4"/>
+          <circle cx="224" cy="109" r="4"/>
+          <circle cx="295" cy="150" r="4"/>
+        </g>
+      </g>
+    </g>
+  </svg>
   <div class="login-card">
     <div class="login-logo">G</div>
     <h1 class="login-title">GodHand</h1>
