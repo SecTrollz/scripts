@@ -42,6 +42,7 @@ STATE = {
     'blocked_macs': set(),
     'monitor_log': [],
     'monitor_log_path': None,
+    'bandwidth_sample': None,
     'log': [],
     'status': 'Ready'
 }
@@ -157,6 +158,7 @@ def ensure_tool(tool_name, package_name=None):
         'dhcpig': 'dhcpig',
         'iw': 'iw',
         'iptables': 'iptables',
+        'nmap': 'nmap',
     }
     pkg = pkg_map.get(package_name, package_name)
     installed = install_package(pkg)
@@ -260,6 +262,63 @@ def server_tcp_connect(ip, port, timeout=1):
         return result == 0
     except:
         return False
+
+# ---------- nmap recon ----------
+def parse_nmap_output(output):
+    ports = []
+    in_table = False
+    for line in output.splitlines():
+        if line.startswith('PORT'):
+            in_table = True
+            continue
+        if not in_table:
+            continue
+        stripped = line.strip()
+        if not stripped or stripped.startswith('Nmap done'):
+            break
+        m = re.match(r'^(\d+)/(tcp|udp)\s+(\S+)\s+(\S+)\s*(.*)$', stripped)
+        if m:
+            ports.append({
+                'port': int(m.group(1)),
+                'protocol': m.group(2),
+                'state': m.group(3),
+                'service': m.group(4),
+                'version': m.group(5).strip(),
+            })
+    return ports
+
+def run_nmap_scan(ip, full=False):
+    if not re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', ip):
+        raise ValueError('Invalid IP')
+    if not ensure_tool('nmap'):
+        raise RuntimeError('nmap is not installed and could not be installed automatically')
+    cmd = ['nmap', '-sS', '-sV', '-T4', '-Pn']
+    cmd += ['-p-'] if full else ['-F', '--version-intensity', '2']
+    cmd += [ip]
+    timeout = 900 if full else 180
+    try:
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f'Nmap scan timed out after {timeout}s')
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f'Nmap exited with an error: {e.output.strip()[-300:]}')
+    return parse_nmap_output(out)
+
+# ---------- bandwidth ----------
+def get_iface_bytes(iface):
+    try:
+        with open('/proc/net/dev') as f:
+            for line in f:
+                if ':' not in line:
+                    continue
+                name, data = line.split(':', 1)
+                if name.strip() != iface:
+                    continue
+                fields = data.split()
+                return int(fields[0]), int(fields[8])
+    except:
+        pass
+    return None
 
 # ---------- monitor mode ----------
 def set_monitor(iface, enable=True, raise_on_fail=False):
@@ -855,6 +914,19 @@ header {
   50% { opacity: 0.3; }
   100% { opacity: 1; }
 }
+.spinner {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  border: 2px solid var(--border-strong);
+  border-top-color: var(--accent-primary);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  vertical-align: -3px;
+}
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
 nav {
   background: var(--bg-elevated);
   border-bottom: 1px solid var(--border-subtle);
@@ -1144,6 +1216,49 @@ nav button .icon svg { display: block; }
 }
 .modal h3 { margin-bottom: 12px; }
 .modal p { color: var(--text-secondary); margin-bottom: 20px; }
+.modal.wide { max-width: 640px; max-height: 80vh; overflow-y: auto; }
+.bw-legend {
+  display: flex;
+  gap: 24px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+  font-size: 0.9rem;
+}
+.bw-key {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-secondary);
+}
+.bw-key strong {
+  color: var(--text-primary);
+  font-family: 'JetBrains Mono', monospace;
+  font-weight: 600;
+  margin-left: 2px;
+}
+.bw-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.bw-swatch.dash { border-radius: 2px; }
+.sparkline {
+  width: 100%;
+  height: 56px;
+  display: block;
+  background: var(--bg-inset);
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+}
+.sparkline polyline {
+  fill: none;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+#bw-spark-rx { stroke: var(--accent-primary); }
+#bw-spark-tx { stroke: var(--warning); stroke-dasharray: 5 4; }
 .toast-container {
   position: fixed;
   top: 20px;
@@ -1269,6 +1384,19 @@ nav button .icon svg { display: block; }
       </div>
       <div id="settings-status" class="status-message">Current: IFACE: none, GW: none, PORT: 80</div>
     </div>
+    <div class="card">
+      <h2>Live bandwidth</h2>
+      <p class="sub">Throughput on the selected interface, sampled every 2s.</p>
+      <div class="bw-legend">
+        <span class="bw-key"><span class="bw-swatch" style="background:var(--accent-primary);"></span>Download <strong id="bw-rx">—</strong></span>
+        <span class="bw-key"><span class="bw-swatch dash" style="background:var(--warning);"></span>Upload <strong id="bw-tx">—</strong></span>
+      </div>
+      <svg id="bw-spark" viewBox="0 0 300 56" preserveAspectRatio="none" class="sparkline">
+        <polyline id="bw-spark-rx" points=""></polyline>
+        <polyline id="bw-spark-tx" points=""></polyline>
+      </svg>
+      <div class="empty" id="bw-empty">Set an interface above to see live throughput.</div>
+    </div>
   </div>
 
   <div id="tab-recon" class="tab-content">
@@ -1278,6 +1406,7 @@ nav button .icon svg { display: block; }
       <div class="row">
         <button class="btn" id="scan-btn" onclick="refreshHosts()"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-3px; margin-right:4px;"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>Scan now</button>
         <button class="btn secondary" onclick="bulkAddTargets()">Add selected to targets</button>
+        <button class="btn secondary" onclick="addSelectedToWatch()">Add selected to watch</button>
         <span id="scan-spinner" style="display:none;"><span class="spinner"></span> Scanning...</span>
       </div>
       <div class="row">
@@ -1304,12 +1433,16 @@ nav button .icon svg { display: block; }
         <h2 style="margin:0;">Tracked devices</h2>
         <button class="btn secondary" onclick="checkAllDevices()">Check all</button>
       </div>
-      <p class="sub">Watch specific hosts long-term, independent of scan results.</p>
+      <p class="sub">Watch specific hosts long-term, independent of scan results — or watch every host on the network.</p>
       <div class="row">
         <input type="text" id="dev-name" placeholder="Label">
         <input type="text" id="dev-ip" placeholder="IP address">
         <button class="btn" onclick="addDevice()">Add</button>
       </div>
+      <label class="row" style="align-items:center; cursor:pointer;">
+        <input type="checkbox" id="watch-whole-network" onchange="toggleWatchWholeNetwork()">
+        Watch the whole network (auto-add every host found by a scan)
+      </label>
       <div class="table-responsive">
         <table id="dev-table">
           <thead><tr><th>Label</th><th>IP</th><th>Status</th><th>Latency</th><th></th></tr></thead>
@@ -1336,6 +1469,12 @@ nav button .icon svg { display: block; }
         <button class="btn big secondary" id="stop-btn" onclick="confirmStopAttack()" disabled>⏹ Stop</button>
       </div>
       <div id="attack-status" class="status-message">Status: Ready</div>
+    </div>
+    <div class="card">
+      <h2>Live traffic capture</h2>
+      <p class="sub">Connections seen while weapon 5 (Traffic Capture) is running, updated live.</p>
+      <div class="log-container" id="traffic-container" style="display:none;"></div>
+      <div class="empty" id="traffic-empty">Not capturing. Select weapon 5 and press Start to see live traffic here.</div>
     </div>
   </div>
 
@@ -1383,6 +1522,16 @@ nav button .icon svg { display: block; }
   </div>
 </div>
 
+<div id="nmap-modal-overlay" class="modal-overlay" style="display:none;">
+  <div class="modal wide">
+    <h3>Nmap scan — <span id="nmap-modal-ip"></span></h3>
+    <div id="nmap-modal-body"></div>
+    <div style="display:flex; gap:10px; justify-content:flex-end; margin-top:16px;">
+      <button class="btn secondary" onclick="closeNmapModal()">Close</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast-container" id="toast-container"></div>
 
 <script>
@@ -1396,6 +1545,9 @@ let arpHistory = JSON.parse(localStorage.getItem('lg_arp_history') || '[]');
 let alerts = JSON.parse(localStorage.getItem('lg_alerts') || '[]');
 let authToken = localStorage.getItem('godhand_token') || '';
 let modalAction = null;
+let watchWholeNetwork = localStorage.getItem('lg_watch_whole_network') === '1';
+let bwRxHistory = [];
+let bwTxHistory = [];
 
 // Helper: API call
 async function apiCall(endpoint, method='GET', data=null) {
@@ -1442,6 +1594,58 @@ function confirmModalAction() {
   closeModal();
 }
 
+// Nmap scan modal
+let nmapTargetIp = null;
+function openNmapModal(ip) {
+  nmapTargetIp = ip;
+  document.getElementById('nmap-modal-ip').textContent = ip;
+  document.getElementById('nmap-modal-body').innerHTML = `
+    <p class="sub">Choose a scan type for <strong>${ip}</strong>:</p>
+    <div class="row">
+      <button class="btn" onclick="runNmapModal(false)">Quick scan (top 100 ports)</button>
+      <button class="btn secondary" onclick="runNmapModal(true)">Full scan (all 65535 ports — slow)</button>
+    </div>
+  `;
+  document.getElementById('nmap-modal-overlay').style.display = 'flex';
+}
+function closeNmapModal() {
+  document.getElementById('nmap-modal-overlay').style.display = 'none';
+  nmapTargetIp = null;
+}
+async function runNmapModal(full) {
+  const ip = nmapTargetIp;
+  const body = document.getElementById('nmap-modal-body');
+  body.innerHTML = `
+    <p class="sub">Running a ${full ? 'full' : 'quick'} scan on ${ip}${full ? ' — this can take several minutes' : ''}...</p>
+    <div style="text-align:center; padding:30px 0;"><span class="spinner"></span></div>
+  `;
+  const res = await apiCall('nmap_scan?ip=' + encodeURIComponent(ip) + '&full=' + (full ? '1' : '0'));
+  if (!res.success) {
+    body.innerHTML = `<p class="sub" style="color:var(--danger);">Scan failed: ${res.error}</p>`;
+    return;
+  }
+  if (!res.ports.length) {
+    body.innerHTML = `<p class="sub">No open ports found on ${ip}.</p>`;
+    return;
+  }
+  const rows = res.ports.map(p => `
+    <tr>
+      <td data-label="Port">${p.port}/${p.protocol}</td>
+      <td data-label="State"><span class="badge ${p.state === 'open' ? 'success' : 'warning'}">${p.state}</span></td>
+      <td data-label="Service">${p.service}</td>
+      <td data-label="Version">${p.version || '—'}</td>
+    </tr>
+  `).join('');
+  body.innerHTML = `
+    <div class="table-responsive">
+      <table>
+        <thead><tr><th>Port</th><th>State</th><th>Service</th><th>Version</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table>
+    </div>
+  `;
+}
+
 // Tabs
 document.querySelectorAll('.tab-btn').forEach(btn => {
   btn.addEventListener('click', () => {
@@ -1485,6 +1689,64 @@ async function pollLogs() {
 }
 function clearServerLogs() {
   apiCall('clear_logs', 'POST').then(pollLogs);
+}
+
+// Live traffic capture
+async function pollTrafficCapture() {
+  try {
+    const res = await apiCall('monitor_log');
+    const container = document.getElementById('traffic-container');
+    const empty = document.getElementById('traffic-empty');
+    if (res.lines && res.lines.length) {
+      empty.style.display = 'none';
+      container.style.display = 'block';
+      container.innerHTML = res.lines.map(l => `<div class="log-entry"><span class="msg">${l}</span></div>`).join('');
+      container.scrollTop = container.scrollHeight;
+    } else {
+      container.style.display = 'none';
+      empty.style.display = 'block';
+      empty.textContent = res.capturing
+        ? 'Capturing... waiting for matching traffic.'
+        : 'Not capturing. Select weapon 5 and press Start to see live traffic here.';
+    }
+  } catch(e) {}
+}
+
+// Live bandwidth
+function formatBps(bps) {
+  if (bps > 1024 * 1024) return (bps / 1024 / 1024).toFixed(2) + ' MB/s';
+  if (bps > 1024) return (bps / 1024).toFixed(1) + ' KB/s';
+  return Math.round(bps) + ' B/s';
+}
+function drawBandwidthSparkline() {
+  const max = Math.max(1, ...bwRxHistory, ...bwTxHistory);
+  const w = 300, h = 56, pad = 4;
+  const toPoints = (arr) => arr.map((v, i) => {
+    const x = arr.length > 1 ? (i / (arr.length - 1)) * w : 0;
+    const y = h - pad - (v / max) * (h - pad * 2);
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(' ');
+  document.getElementById('bw-spark-rx').setAttribute('points', toPoints(bwRxHistory));
+  document.getElementById('bw-spark-tx').setAttribute('points', toPoints(bwTxHistory));
+}
+async function pollBandwidth() {
+  try {
+    const res = await apiCall('bandwidth');
+    const empty = document.getElementById('bw-empty');
+    if (!res.success) {
+      empty.style.display = 'block';
+      empty.textContent = res.error || 'No bandwidth data available.';
+      return;
+    }
+    empty.style.display = 'none';
+    document.getElementById('bw-rx').textContent = formatBps(res.rx_bps) + ' ↓';
+    document.getElementById('bw-tx').textContent = formatBps(res.tx_bps) + ' ↑';
+    bwRxHistory.push(res.rx_bps);
+    bwTxHistory.push(res.tx_bps);
+    if (bwRxHistory.length > 40) bwRxHistory.shift();
+    if (bwTxHistory.length > 40) bwTxHistory.shift();
+    drawBandwidthSparkline();
+  } catch(e) {}
 }
 
 // Poll attack status
@@ -1571,6 +1833,7 @@ async function refreshHosts() {
   if (res.success) {
     currentHosts = res.hosts;
     renderHosts();
+    if (watchWholeNetwork) syncWholeNetworkWatch();
   } else {
     showToast('Scan failed: ' + res.error, 'error');
   }
@@ -1590,9 +1853,10 @@ function renderHosts() {
       <td data-label="MAC">${h.mac}</td>
       <td data-label="Reachability" id="reach-${h.ip}"><span class="badge info">Checking...</span></td>
       <td data-label="Action">
-        ${isTarget 
+        ${isTarget
           ? `<button class="btn-icon" onclick="removeTargetByIP('${h.ip}')" title="Remove target">✕</button>`
           : `<button class="btn-icon" onclick="addTargetByIP('${h.ip}')" title="Add target">＋</button>`}
+        <button class="btn-icon" onclick="openNmapModal('${h.ip}')" title="Nmap scan"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg></button>
         <button class="btn-icon" onclick="kickIP('${h.ip}')" title="Kick"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="8.5" cy="7" r="4"></circle><line x1="18" y1="8" x2="23" y2="13"></line><line x1="23" y1="8" x2="18" y2="13"></line></svg></button>
         <button class="btn-icon" onclick="toggleBlockIP('${h.ip}')" title="Block"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg></button>
       </td>
@@ -1671,6 +1935,7 @@ async function loadTargets() {
     chip.className = 'chip';
     chip.innerHTML = `
       <span class="chip-ip">${ip}</span>
+      <button class="chip-action" onclick="openNmapModal('${ip}')" title="Nmap scan"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg></button>
       <button class="chip-action" onclick="kickIP('${ip}')" title="Kick"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="8.5" cy="7" r="4"></circle><line x1="18" y1="8" x2="23" y2="13"></line><line x1="23" y1="8" x2="18" y2="13"></line></svg></button>
       <button class="chip-action" onclick="toggleBlockIP('${ip}')" title="Block"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg></button>
       <button class="chip-action" onclick="removeTargetByIP('${ip}')" title="Remove target">✕</button>
@@ -1796,6 +2061,43 @@ async function checkDevice(i) {
 function checkAllDevices() {
   devices.forEach((_, i) => checkDevice(i));
 }
+function toggleWatchWholeNetwork() {
+  watchWholeNetwork = document.getElementById('watch-whole-network').checked;
+  localStorage.setItem('lg_watch_whole_network', watchWholeNetwork ? '1' : '0');
+  if (watchWholeNetwork) syncWholeNetworkWatch();
+}
+function syncWholeNetworkWatch() {
+  let added = 0;
+  currentHosts.forEach(h => {
+    if (!devices.some(d => d.ip === h.ip)) {
+      devices.push({ name: '', ip: h.ip, status: null, latency: null });
+      added++;
+    }
+  });
+  if (added) {
+    localStorage.setItem('lg_devices', JSON.stringify(devices));
+    renderDevices();
+    checkAllDevices();
+  }
+}
+function addSelectedToWatch() {
+  const selectedIPs = Array.from(document.querySelectorAll('.host-check:checked')).map(cb => cb.dataset.ip);
+  if (!selectedIPs.length) {
+    showToast('No hosts selected', 'warning');
+    return;
+  }
+  let added = 0;
+  selectedIPs.forEach(ip => {
+    if (!devices.some(d => d.ip === ip)) {
+      devices.push({ name: '', ip, status: null, latency: null });
+      added++;
+    }
+  });
+  localStorage.setItem('lg_devices', JSON.stringify(devices));
+  renderDevices();
+  checkAllDevices();
+  showToast(`Added ${added} device(s) to watch`, 'success');
+}
 
 // ARP Detector
 function parseArpText(text) {
@@ -1890,6 +2192,7 @@ function renderAlerts() {
 
 // Init
 document.getElementById('arp-snap-count').textContent = arpHistory.length;
+document.getElementById('watch-whole-network').checked = watchWholeNetwork;
 renderDevices();
 renderAlerts();
 loadInterfaces();
@@ -1897,8 +2200,12 @@ loadTargets();
 checkPrerequisites();
 pollLogs();
 pollAttackStatus();
+pollTrafficCapture();
+pollBandwidth();
 setInterval(pollLogs, 2000);
 setInterval(pollAttackStatus, 2000);
+setInterval(pollTrafficCapture, 1500);
+setInterval(pollBandwidth, 2000);
 </script>
 </body>
 </html>
@@ -2099,7 +2406,44 @@ def api_attack_status():
 @require_auth
 def api_monitor_log():
     lines = STATE.get('monitor_log', [])
-    return jsonify({'lines': lines[-50:]})
+    return jsonify({'lines': lines[-100:], 'capturing': 5 in STATE['attack_pids']})
+
+@app.route('/api/nmap_scan', methods=['GET'])
+@require_auth
+def api_nmap_scan():
+    ip = request.args.get('ip', '')
+    full = request.args.get('full', '0') == '1'
+    if not re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', ip):
+        return jsonify({'success': False, 'error': 'Invalid IP'})
+    add_log('info', f'Starting nmap {"full" if full else "quick"} scan on {ip}')
+    try:
+        ports = run_nmap_scan(ip, full=full)
+        add_log('success', f'Nmap scan on {ip} complete: {len(ports)} open port(s)')
+        return jsonify({'success': True, 'ip': ip, 'ports': ports})
+    except Exception as e:
+        add_log('error', f'Nmap scan failed on {ip}: {str(e)}')
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/bandwidth', methods=['GET'])
+@require_auth
+def api_bandwidth():
+    iface = get_state('interface')
+    if not iface:
+        return jsonify({'success': False, 'error': 'Interface not set'})
+    counters = get_iface_bytes(iface)
+    if counters is None:
+        return jsonify({'success': False, 'error': f'No stats available for {iface}'})
+    rx_bytes, tx_bytes = counters
+    now = time.time()
+    with STATE_LOCK:
+        prev = STATE.get('bandwidth_sample')
+        STATE['bandwidth_sample'] = {'iface': iface, 'time': now, 'rx': rx_bytes, 'tx': tx_bytes}
+    if not prev or prev['iface'] != iface or now <= prev['time']:
+        return jsonify({'success': True, 'iface': iface, 'rx_bps': 0, 'tx_bps': 0, 'rx_total': rx_bytes, 'tx_total': tx_bytes})
+    dt = now - prev['time']
+    rx_bps = max(0, (rx_bytes - prev['rx']) / dt)
+    tx_bps = max(0, (tx_bytes - prev['tx']) / dt)
+    return jsonify({'success': True, 'iface': iface, 'rx_bps': rx_bps, 'tx_bps': tx_bps, 'rx_total': rx_bytes, 'tx_total': tx_bytes})
 
 @app.route('/api/check_reachability', methods=['GET'])
 @require_auth
@@ -2191,4 +2535,4 @@ if __name__ == '__main__':
         print("WARNING: Not running as root. Some features (raw sockets, iptables) may fail.")
     ensure_tool('iw')
     ensure_tool('iptables')
-    app.run(host='0.0.0.0', port=APP_PORT, debug=False)
+    app.run(host='0.0.0.0', port=APP_PORT, debug=False, threaded=True)
