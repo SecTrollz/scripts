@@ -967,6 +967,91 @@ def udp_checksum(ip_src, ip_dst, udp_segment):
     s += s >> 16
     return ~s & 0xffff
 
+# ---------- custom packet builder ----------
+MAC_RE = re.compile(r'^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$')
+IPV4_RE = re.compile(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$')
+TCP_FLAG_BITS = {'FIN': 0x01, 'SYN': 0x02, 'RST': 0x04, 'PSH': 0x08, 'ACK': 0x10, 'URG': 0x20}
+
+def build_custom_packet(spec):
+    """Construct one raw Ethernet+IP(+TCP/UDP/ICMP) frame from a user-supplied spec
+    and return its bytes. Pure construction, no sending -- reuses the same
+    struct-packing and checksum helpers (ip_checksum/tcp_checksum/udp_checksum)
+    already used by the attack launchers above, just exposed directly instead
+    of only ever running inside a generated flood script.
+    """
+    proto = spec['protocol']
+    src_mac = bytes.fromhex(spec['src_mac'].replace(':', ''))
+    dst_mac = bytes.fromhex(spec['dst_mac'].replace(':', ''))
+    payload = spec.get('payload', b'')
+
+    eth = dst_mac + src_mac + struct.pack('!H', 0x0800)
+
+    if proto == 'tcp':
+        ip_proto = 6
+    elif proto == 'udp':
+        ip_proto = 17
+    elif proto == 'icmp':
+        ip_proto = 1
+    else:  # raw
+        ip_proto = int(spec.get('ip_proto', 253))  # 253/254 are IANA-reserved for experimentation
+
+    if proto == 'tcp':
+        flags_byte = 0
+        for name in spec.get('tcp_flags', []):
+            flags_byte |= TCP_FLAG_BITS.get(name.upper(), 0)
+        tcp_hdr = struct.pack('!HHIIBBHHH',
+                               spec['src_port'], spec['dst_port'],
+                               spec.get('seq', 0), spec.get('ack', 0),
+                               5 << 4, flags_byte, 65535, 0, 0)
+        checksum = tcp_checksum(spec['src_ip'], spec['dst_ip'], tcp_hdr + payload)
+        tcp_hdr = tcp_hdr[:16] + struct.pack('!H', checksum) + tcp_hdr[18:]
+        l4 = tcp_hdr + payload
+    elif proto == 'udp':
+        udp_hdr = struct.pack('!HHHH', spec['src_port'], spec['dst_port'], 8 + len(payload), 0)
+        checksum = udp_checksum(spec['src_ip'], spec['dst_ip'], udp_hdr + payload)
+        udp_hdr = udp_hdr[:6] + struct.pack('!H', checksum) + udp_hdr[8:]
+        l4 = udp_hdr + payload
+    elif proto == 'icmp':
+        icmp_type = spec.get('icmp_type', 8)
+        icmp_code = spec.get('icmp_code', 0)
+        icmp_hdr = struct.pack('!BBHHH', icmp_type, icmp_code, 0, spec.get('icmp_id', 1), spec.get('icmp_seq', 1))
+        checksum = ip_checksum(icmp_hdr + payload)
+        icmp_hdr = icmp_hdr[:2] + struct.pack('!H', checksum) + icmp_hdr[4:]
+        l4 = icmp_hdr + payload
+    else:
+        l4 = payload
+
+    total_len = 20 + len(l4)
+    ttl = spec.get('ttl', 64)
+    ip_hdr_no_checksum = struct.pack('!BBHHHBBH', 0x45, 0, total_len, spec.get('ip_id', 0), 0, ttl, ip_proto, 0) \
+        + socket.inet_aton(spec['src_ip']) + socket.inet_aton(spec['dst_ip'])
+    ip_checksum_val = ip_checksum(ip_hdr_no_checksum)
+    ip_hdr = ip_hdr_no_checksum[:10] + struct.pack('!H', ip_checksum_val) + ip_hdr_no_checksum[12:]
+
+    return eth + ip_hdr + l4
+
+def send_custom_packet(spec, count=1, interval_ms=0):
+    """Send build_custom_packet()'s frame `count` times on spec['iface']. Returns
+    (bytes_sent_total, last_frame_bytes) so the caller can show a hex preview of
+    exactly what went out. `count` is expected to already be caller-clamped to a
+    small number -- this is a crafting/testing tool, not a flood launcher (the
+    Attacks tab's weapons already cover sustained floods, with their own risk
+    gate); sending the same one-off frame more than a couple dozen times isn't
+    what this is for.
+    """
+    frame = build_custom_packet(spec)
+    sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
+    try:
+        sock.bind((spec['iface'], 0))
+        sent = 0
+        for i in range(count):
+            sent += sock.send(frame)
+            if i < count - 1 and interval_ms > 0:
+                time.sleep(interval_ms / 1000.0)
+    finally:
+        sock.close()
+    return sent, frame
+
 # ---------- attack launchers ----------
 def start_attack_arp_freeze(targets, gateway, iface):
     add_log('info', f'Starting ARP Freeze on {iface} for {len(targets)} targets')
@@ -2754,6 +2839,58 @@ GODHAND_DDNS_ENABLED=1                  # optional, default on when the above ar
       <p class="sub">Weapon 5 output — see the <strong>Monitor</strong> tab for the full capture &amp; analysis panel (top talkers, ports, live feed).</p>
       <div id="attacks-traffic-status" class="status-message">Not capturing.</div>
     </div>
+    <div class="card">
+      <h2>Custom packet builder</h2>
+      <p class="sub">Craft and send a raw Ethernet/IP frame yourself — your own MACs, IPs, ports, TCP flags, and payload. Capped at 50 sends per click; for sustained floods use the weapons above instead.</p>
+      <div class="row">
+        <input type="text" id="pkt-dst-ip" placeholder="Destination IP (required)">
+        <input type="text" id="pkt-dst-mac" placeholder="Destination MAC (blank = auto-resolve/broadcast)">
+      </div>
+      <div class="row">
+        <input type="text" id="pkt-src-ip" placeholder="Source IP (blank = this device)">
+        <input type="text" id="pkt-src-mac" placeholder="Source MAC (blank = this device)">
+      </div>
+      <div class="row">
+        <select id="pkt-protocol" onchange="onPacketProtocolChange()">
+          <option value="tcp">TCP</option>
+          <option value="udp">UDP</option>
+          <option value="icmp">ICMP</option>
+          <option value="raw">Raw IP</option>
+        </select>
+        <input type="number" id="pkt-ttl" placeholder="TTL" value="64" min="1" max="255">
+      </div>
+      <div class="row" id="pkt-ports-row">
+        <input type="number" id="pkt-src-port" placeholder="Source port" min="0" max="65535" value="0">
+        <input type="number" id="pkt-dst-port" placeholder="Destination port" min="0" max="65535" value="0">
+      </div>
+      <div class="row" id="pkt-tcp-flags-row">
+        <label style="display:flex; align-items:center; gap:4px; cursor:pointer;"><input type="checkbox" class="pkt-flag" value="SYN" checked> SYN</label>
+        <label style="display:flex; align-items:center; gap:4px; cursor:pointer;"><input type="checkbox" class="pkt-flag" value="ACK"> ACK</label>
+        <label style="display:flex; align-items:center; gap:4px; cursor:pointer;"><input type="checkbox" class="pkt-flag" value="FIN"> FIN</label>
+        <label style="display:flex; align-items:center; gap:4px; cursor:pointer;"><input type="checkbox" class="pkt-flag" value="RST"> RST</label>
+        <label style="display:flex; align-items:center; gap:4px; cursor:pointer;"><input type="checkbox" class="pkt-flag" value="PSH"> PSH</label>
+        <label style="display:flex; align-items:center; gap:4px; cursor:pointer;"><input type="checkbox" class="pkt-flag" value="URG"> URG</label>
+      </div>
+      <div class="row" id="pkt-icmp-row" style="display:none;">
+        <input type="number" id="pkt-icmp-type" placeholder="ICMP type" value="8">
+        <input type="number" id="pkt-icmp-code" placeholder="ICMP code" value="0">
+      </div>
+      <div class="row" id="pkt-rawproto-row" style="display:none;">
+        <input type="number" id="pkt-ip-proto" placeholder="IP protocol number (0-255)" value="253" min="0" max="255">
+      </div>
+      <div class="row">
+        <textarea id="pkt-payload" placeholder="Payload"></textarea>
+      </div>
+      <label class="row" style="align-items:center; cursor:pointer;">
+        <input type="checkbox" id="pkt-payload-hex"> Payload is hex (e.g. deadbeef or de:ad:be:ef)
+      </label>
+      <div class="row">
+        <input type="number" id="pkt-count" placeholder="Send count" value="1" min="1" max="50">
+        <input type="number" id="pkt-interval" placeholder="Interval ms" value="0" min="0" max="5000">
+        <button class="btn" onclick="sendCustomPacket()">Send packet</button>
+      </div>
+      <div id="pkt-result" class="status-message" style="display:none;"></div>
+    </div>
   </div>
 
   <div id="tab-monitor" class="tab-content">
@@ -3465,6 +3602,56 @@ async function refreshDeauthCapability() {
     }
   } catch(e) {}
 }
+
+// Custom packet builder
+function onPacketProtocolChange() {
+  const proto = document.getElementById('pkt-protocol').value;
+  document.getElementById('pkt-ports-row').style.display = (proto === 'tcp' || proto === 'udp') ? 'flex' : 'none';
+  document.getElementById('pkt-tcp-flags-row').style.display = proto === 'tcp' ? 'flex' : 'none';
+  document.getElementById('pkt-icmp-row').style.display = proto === 'icmp' ? 'flex' : 'none';
+  document.getElementById('pkt-rawproto-row').style.display = proto === 'raw' ? 'flex' : 'none';
+}
+async function sendCustomPacket() {
+  const protocol = document.getElementById('pkt-protocol').value;
+  const body = {
+    dst_ip: document.getElementById('pkt-dst-ip').value.trim(),
+    dst_mac: document.getElementById('pkt-dst-mac').value.trim(),
+    src_ip: document.getElementById('pkt-src-ip').value.trim(),
+    src_mac: document.getElementById('pkt-src-mac').value.trim(),
+    protocol,
+    ttl: parseInt(document.getElementById('pkt-ttl').value, 10) || 64,
+    payload: document.getElementById('pkt-payload').value,
+    payload_is_hex: document.getElementById('pkt-payload-hex').checked,
+    count: parseInt(document.getElementById('pkt-count').value, 10) || 1,
+    interval_ms: parseInt(document.getElementById('pkt-interval').value, 10) || 0,
+  };
+  if (protocol === 'tcp' || protocol === 'udp') {
+    body.src_port = parseInt(document.getElementById('pkt-src-port').value, 10) || 0;
+    body.dst_port = parseInt(document.getElementById('pkt-dst-port').value, 10) || 0;
+  }
+  if (protocol === 'tcp') {
+    body.tcp_flags = Array.from(document.querySelectorAll('.pkt-flag:checked')).map(el => el.value);
+  }
+  if (protocol === 'icmp') {
+    body.icmp_type = parseInt(document.getElementById('pkt-icmp-type').value, 10) || 8;
+    body.icmp_code = parseInt(document.getElementById('pkt-icmp-code').value, 10) || 0;
+  }
+  if (protocol === 'raw') {
+    body.ip_proto = parseInt(document.getElementById('pkt-ip-proto').value, 10) || 253;
+  }
+  const box = document.getElementById('pkt-result');
+  box.style.display = 'block';
+  box.textContent = 'Sending...';
+  const res = await apiCall('packet_builder/send', 'POST', body);
+  if (res.success) {
+    box.innerHTML = `<span class="badge success">Sent</span> ${res.sent_count}× ${protocol.toUpperCase()} frame, ${res.frame_bytes}B each ` +
+      `(src ${escapeHtml(res.resolved_src_ip)} / ${escapeHtml(res.resolved_src_mac)} → dst MAC ${escapeHtml(res.resolved_dst_mac)}).` +
+      `<br><span style="font-family:'JetBrains Mono',monospace; font-size:0.78rem; word-break:break-all;">${escapeHtml(res.hex_preview)}</span>`;
+  } else {
+    box.innerHTML = `<span class="badge danger">Failed</span> ${escapeHtml(res.error)}`;
+  }
+}
+
 async function setGateway() {
   const gw = document.getElementById('gateway-input').value.trim();
   if (!gw) return;
@@ -4425,6 +4612,116 @@ def api_deauth_capability():
     if not iface:
         return jsonify({'success': False, 'error': 'Interface not set'})
     return jsonify({'success': True, **deauth_capability(iface)})
+
+@app.route('/api/packet_builder/send', methods=['POST'])
+@require_auth
+def api_packet_builder_send():
+    data = request.json or {}
+    iface = get_state('interface')
+    if not iface:
+        return jsonify({'success': False, 'error': 'Interface not set -- set one on the Settings tab first'})
+
+    dst_ip = (data.get('dst_ip') or '').strip()
+    if not IPV4_RE.match(dst_ip):
+        return jsonify({'success': False, 'error': 'Destination IP is required and must be a valid IPv4 address'})
+    src_ip = (data.get('src_ip') or '').strip()
+    if not src_ip:
+        my_ip, _ = get_my_ip_and_cidr(iface)
+        src_ip = my_ip if my_ip != '0.0.0.0' else None
+    if not src_ip or not IPV4_RE.match(src_ip):
+        return jsonify({'success': False, 'error': 'Source IP is required (could not auto-detect this device\'s IP on the selected interface)'})
+
+    src_mac = (data.get('src_mac') or '').strip()
+    if not src_mac:
+        src_mac = get_mac(iface)
+    if not MAC_RE.match(src_mac):
+        return jsonify({'success': False, 'error': 'Source MAC must look like aa:bb:cc:dd:ee:ff'})
+
+    dst_mac = (data.get('dst_mac') or '').strip()
+    if not dst_mac:
+        resolved = get_gateway_mac(iface, dst_ip)
+        dst_mac = resolved or 'ff:ff:ff:ff:ff:ff'
+    if not MAC_RE.match(dst_mac):
+        return jsonify({'success': False, 'error': 'Destination MAC must look like aa:bb:cc:dd:ee:ff, or leave blank to auto-resolve/broadcast'})
+
+    protocol = data.get('protocol', 'tcp')
+    if protocol not in ('tcp', 'udp', 'icmp', 'raw'):
+        return jsonify({'success': False, 'error': 'protocol must be tcp, udp, icmp, or raw'})
+
+    spec = {
+        'iface': iface, 'src_mac': src_mac, 'dst_mac': dst_mac,
+        'src_ip': src_ip, 'dst_ip': dst_ip, 'protocol': protocol,
+    }
+
+    try:
+        spec['ttl'] = max(1, min(255, int(data.get('ttl', 64))))
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'ttl must be a number 1-255'})
+
+    if protocol in ('tcp', 'udp'):
+        try:
+            spec['src_port'] = int(data.get('src_port', 0))
+            spec['dst_port'] = int(data.get('dst_port', 0))
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'src_port/dst_port must be numbers'})
+        if not (0 <= spec['src_port'] <= 65535 and 0 <= spec['dst_port'] <= 65535):
+            return jsonify({'success': False, 'error': 'Ports must be 0-65535'})
+        if protocol == 'tcp':
+            valid_flags = set(TCP_FLAG_BITS)
+            flags = [f.upper() for f in data.get('tcp_flags', [])]
+            if not all(f in valid_flags for f in flags):
+                return jsonify({'success': False, 'error': f'tcp_flags must be from {sorted(valid_flags)}'})
+            spec['tcp_flags'] = flags
+    elif protocol == 'icmp':
+        try:
+            spec['icmp_type'] = int(data.get('icmp_type', 8))
+            spec['icmp_code'] = int(data.get('icmp_code', 0))
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'icmp_type/icmp_code must be numbers'})
+    else:
+        try:
+            spec['ip_proto'] = int(data.get('ip_proto', 253))
+        except (TypeError, ValueError):
+            return jsonify({'success': False, 'error': 'ip_proto must be a number 0-255'})
+        if not (0 <= spec['ip_proto'] <= 255):
+            return jsonify({'success': False, 'error': 'ip_proto must be 0-255'})
+
+    payload_text = data.get('payload', '') or ''
+    if data.get('payload_is_hex'):
+        try:
+            spec['payload'] = bytes.fromhex(payload_text.replace(' ', '').replace(':', ''))
+        except ValueError:
+            return jsonify({'success': False, 'error': 'Payload is not valid hex'})
+    else:
+        spec['payload'] = payload_text.encode('utf-8', errors='replace')
+    if len(spec['payload']) > 4096:
+        return jsonify({'success': False, 'error': 'Payload too large (max 4096 bytes)'})
+
+    try:
+        count = max(1, min(50, int(data.get('count', 1))))
+        interval_ms = max(0, min(5000, int(data.get('interval_ms', 0))))
+    except (TypeError, ValueError):
+        return jsonify({'success': False, 'error': 'count/interval_ms must be numbers'})
+
+    try:
+        sent, frame = send_custom_packet(spec, count=count, interval_ms=interval_ms)
+    except PermissionError:
+        return jsonify({'success': False, 'error': 'Permission denied opening a raw socket -- this needs root'})
+    except Exception as e:
+        add_log('error', f'Packet builder send failed: {e}')
+        return jsonify({'success': False, 'error': str(e)})
+
+    add_log('success', f'Packet builder: sent {count}x {protocol.upper()} frame ({len(frame)}B) to {dst_ip}')
+    return jsonify({
+        'success': True,
+        'sent_count': count,
+        'frame_bytes': len(frame),
+        'total_bytes': sent,
+        'hex_preview': frame.hex(),
+        'resolved_src_mac': src_mac,
+        'resolved_dst_mac': dst_mac,
+        'resolved_src_ip': src_ip,
+    })
 
 @app.route('/api/kick', methods=['POST'])
 @require_auth
