@@ -1068,6 +1068,8 @@ tr:hover td { background: rgba(255,255,255,0.02); }
   min-height: 40px;
 }
 .btn-icon:hover { background: var(--glow-accent); color: var(--accent-primary); }
+.btn-icon svg { vertical-align: middle; }
+nav button .icon svg { display: block; }
 .log-container {
   background: var(--bg-inset);
   border: 1px solid var(--border-subtle);
@@ -1205,13 +1207,13 @@ tr:hover td { background: rgba(255,255,255,0.02); }
 </header>
 
 <nav id="main-nav">
-  <button class="tab-btn active" data-tab="attacks"><span class="icon">🎯</span> Attacks</button>
-  <button class="tab-btn" data-tab="targets"><span class="icon">📋</span> Targets</button>
-  <button class="tab-btn" data-tab="hosts"><span class="icon">📡</span> Hosts</button>
-  <button class="tab-btn" data-tab="devicewatch"><span class="icon">📊</span> Device Watch</button>
-  <button class="tab-btn" data-tab="settings"><span class="icon">⚙️</span> Settings</button>
-  <button class="tab-btn" data-tab="detector"><span class="icon">🛡️</span> Detector</button>
-  <button class="tab-btn" data-tab="logs"><span class="icon">📜</span> Logs</button>
+  <button class="tab-btn active" data-tab="attacks"><span class="icon"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><circle cx="12" cy="12" r="6"></circle><circle cx="12" cy="12" r="2"></circle></svg></span> Attacks</button>
+  <button class="tab-btn" data-tab="targets"><span class="icon"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line><line x1="8" y1="18" x2="21" y2="18"></line><line x1="3" y1="6" x2="3.01" y2="6"></line><line x1="3" y1="12" x2="3.01" y2="12"></line><line x1="3" y1="18" x2="3.01" y2="18"></line></svg></span> Targets</button>
+  <button class="tab-btn" data-tab="hosts"><span class="icon"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"></rect><rect x="2" y="14" width="20" height="8" rx="2" ry="2"></rect><line x1="6" y1="6" x2="6.01" y2="6"></line><line x1="6" y1="18" x2="6.01" y2="18"></line></svg></span> Hosts</button>
+  <button class="tab-btn" data-tab="devicewatch"><span class="icon"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg></span> Device Watch</button>
+  <button class="tab-btn" data-tab="settings"><span class="icon"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg></span> Settings</button>
+  <button class="tab-btn" data-tab="detector"><span class="icon"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg></span> Detector</button>
+  <button class="tab-btn" data-tab="logs"><span class="icon"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline><line x1="16" y1="13" x2="8" y2="13"></line><line x1="16" y1="17" x2="8" y2="17"></line></svg></span> Logs</button>
 </nav>
 
 <main>
@@ -1235,9 +1237,9 @@ tr:hover td { background: rgba(255,255,255,0.02); }
     <div class="card">
       <h2>Quick actions</h2>
       <div class="row">
-        <button class="btn" onclick="kickSelected()">👢 Kick client</button>
-        <button class="btn" onclick="toggleBlock()">🔒 Block/Unblock</button>
-        <button class="btn secondary" onclick="refreshHosts()">🔄 Rescan LAN</button>
+        <button class="btn" onclick="kickSelected()"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-3px; margin-right:4px;"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="8.5" cy="7" r="4"></circle><line x1="18" y1="8" x2="23" y2="13"></line><line x1="23" y1="8" x2="18" y2="13"></line></svg>Kick client</button>
+        <button class="btn" onclick="toggleBlock()"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-3px; margin-right:4px;"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>Block/Unblock</button>
+        <button class="btn secondary" onclick="refreshHosts()"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-3px; margin-right:4px;"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>Rescan LAN</button>
       </div>
     </div>
   </div>
@@ -1265,7 +1267,7 @@ tr:hover td { background: rgba(255,255,255,0.02); }
       <h2>Discovered hosts</h2>
       <p class="sub">Scan the LAN to populate this list. Check boxes to bulk add.</p>
       <div class="row">
-        <button class="btn" id="scan-btn" onclick="refreshHosts()">🔄 Scan now</button>
+        <button class="btn" id="scan-btn" onclick="refreshHosts()"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-3px; margin-right:4px;"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>Scan now</button>
         <button class="btn secondary" onclick="bulkAddTargets()">Add selected to targets</button>
         <span id="scan-spinner" style="display:none;"><span class="spinner"></span> Scanning...</span>
       </div>
@@ -1581,8 +1583,8 @@ function renderHosts() {
         ${isTarget 
           ? `<button class="btn-icon" onclick="removeTargetByIP('${h.ip}')" title="Remove target">✕</button>`
           : `<button class="btn-icon" onclick="addTargetByIP('${h.ip}')" title="Add target">＋</button>`}
-        <button class="btn-icon" onclick="kickIP('${h.ip}')" title="Kick">👢</button>
-        <button class="btn-icon" onclick="toggleBlockIP('${h.ip}')" title="Block">🔒</button>
+        <button class="btn-icon" onclick="kickIP('${h.ip}')" title="Kick"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="8.5" cy="7" r="4"></circle><line x1="18" y1="8" x2="23" y2="13"></line><line x1="23" y1="8" x2="18" y2="13"></line></svg></button>
+        <button class="btn-icon" onclick="toggleBlockIP('${h.ip}')" title="Block"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg></button>
       </td>
     `;
     tbody.appendChild(tr);
