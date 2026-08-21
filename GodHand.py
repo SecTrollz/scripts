@@ -82,6 +82,8 @@ STATE = {
     'blocked_macs': set(),
     'monitor_entries': [],
     'monitor_log_path': None,
+    'monitor_mode_active': False,  # True only while a weapon has the iface in 802.11 monitor mode
+
     'bandwidth_sample': None,
     'ddns': {
         'provider': None,          # 'duckdns' | 'noip'
@@ -322,7 +324,17 @@ def arp_scan(iface, my_ip, cidr):
     sock.bind((iface, 0))
     sock.setblocking(0)
 
-    hosts = [str(h) for h in net.hosts()]
+    # Cap the sweep so a misconfigured/wide interface CIDR (e.g. a /16 or /8 from
+    # USB tethering or an unusual setup) can't turn into a multi-thousand-host
+    # blast that freezes the phone. A home LAN is a /24 (254 hosts); 4096 covers
+    # up to a /20 while still bounding the worst case.
+    MAX_SCAN_HOSTS = 4096
+    hosts = []
+    for h in net.hosts():
+        hosts.append(str(h))
+        if len(hosts) >= MAX_SCAN_HOSTS:
+            add_log('warn', f'ARP scan capped at {MAX_SCAN_HOSTS} hosts (network {net} is larger); scan the subnet directly for full coverage')
+            break
     for ip in hosts:
         try:
             sock.send(arp_packet(src_mac, my_ip, ip))
@@ -1173,6 +1185,7 @@ def start_attack_deauth(targets, gateway, iface):
         return start_attack_arp_freeze(targets, gateway, iface)
     if not set_monitor(iface, True, raise_on_fail=True):
         raise RuntimeError('Failed to enable monitor mode')
+    update_state('monitor_mode_active', True)
     pids = []
     gateway_mac = get_gateway_mac(iface, STATE['gateway']) if STATE['gateway'] else None
 
@@ -1892,10 +1905,20 @@ def kick_client(ip, mac, iface):
         return True
     if not set_monitor(iface, True, raise_on_fail=True):
         raise RuntimeError('Cannot enable monitor mode')
+    # Any failure past this point must still return the interface to managed mode,
+    # or the phone's Wi-Fi is left stranded in monitor mode (disconnected). Every
+    # error path below resets it before raising, and the success path resets at the
+    # end -- subprocess timeouts are converted to clean errors rather than allowed
+    # to propagate out with the interface still in monitor mode.
     if ensure_tool('aireplay-ng', 'aircrack-ng'):
         cmd = ['aireplay-ng', '-0', '5', '-a', 'FF:FF:FF:FF:FF:FF', '-c', mac, iface]
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+        try:
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+        except subprocess.TimeoutExpired:
+            set_monitor(iface, False)
+            raise RuntimeError('aireplay-ng deauth timed out')
         if res.returncode != 0:
+            set_monitor(iface, False)
             raise RuntimeError('aireplay-ng deauth failed: ' + res.stderr.decode())
     else:
         script = textwrap.dedent(f"""
@@ -1924,9 +1947,15 @@ def kick_client(ip, mac, iface):
         os.close(fd)
         with open(path, 'w') as f:
             f.write(script)
-        res = subprocess.run(['python3', path], stderr=subprocess.PIPE, timeout=10)
+        try:
+            res = subprocess.run(['python3', path], stderr=subprocess.PIPE, timeout=10)
+        except subprocess.TimeoutExpired:
+            os.unlink(path)
+            set_monitor(iface, False)
+            raise RuntimeError('Deauth fallback script timed out')
         os.unlink(path)
         if res.returncode != 0:
+            set_monitor(iface, False)
             raise RuntimeError('Deauth fallback script failed')
     set_monitor(iface, False)
     time.sleep(2)
@@ -2019,6 +2048,24 @@ body {
   display: flex;
   flex-direction: column;
 }
+body.attack-active {
+  background: #8b2323;
+  transition: background 0.3s;
+}
+body.attack-active .btn {
+  background: linear-gradient(135deg, #c44545, #a63636) !important;
+  color: #ffffff;
+}
+body.attack-active .btn:hover {
+  background: linear-gradient(135deg, #d45555, #b64646) !important;
+}
+body.attack-active .btn.secondary {
+  background: transparent;
+  border-color: rgba(255,255,255,0.3);
+}
+body.attack-active .btn.danger {
+  background: linear-gradient(135deg, #d45555, #b64646) !important;
+}
 
 /* ---------- login ---------- */
 .login-screen {
@@ -2070,7 +2117,7 @@ body {
   -webkit-backdrop-filter: blur(24px) saturate(160%);
   border: 1px solid rgba(255,255,255,0.12);
   border-radius: 24px;
-  box-shadow: 0 8px 32px rgba(0,0,0,0.4), 0 1px 0 rgba(255,255,255,0.08) inset;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.4), 0 1px 0 rgba(255,255,255,0.08) inset, inset 0 0 0 1px rgba(0,0,0,0.25);
   text-align: center;
   animation: login-card-in 0.5s cubic-bezier(0.16, 1, 0.3, 1);
 }
@@ -2080,7 +2127,7 @@ body {
 }
 .login-logo {
   display: block;
-  height: 64px;
+  height: 128px;
   width: auto;
   margin: 0 auto 16px;
   object-fit: contain;
@@ -2171,6 +2218,7 @@ header {
   position: sticky;
   top: 0;
   z-index: 100;
+  box-shadow: inset 0 0 0 1px rgba(0,0,0,0.25);
 }
 .logo {
   display: flex;
@@ -2183,7 +2231,7 @@ header {
 }
 .logo-icon {
   display: block;
-  height: 36px;
+  height: 72px;
   width: auto;
   object-fit: contain;
   filter: drop-shadow(0 2px 6px rgba(84,180,236,0.4));
@@ -2234,6 +2282,7 @@ nav {
   overflow-x: auto;
   -webkit-overflow-scrolling: touch;
   padding: 0 8px;
+  box-shadow: inset 0 0 0 1px rgba(0,0,0,0.25);
 }
 nav button {
   background: none;
@@ -2277,7 +2326,7 @@ main {
   border-radius: var(--radius);
   padding: 20px;
   margin-bottom: 16px;
-  box-shadow: var(--shadow);
+  box-shadow: var(--shadow), inset 0 0 0 1px rgba(0,0,0,0.25);
 }
 .card h2 {
   font-size: 1.2rem;
@@ -2507,6 +2556,7 @@ nav button .icon svg { display: block; }
   justify-content: center;
   z-index: 1000;
   backdrop-filter: blur(6px);
+  box-shadow: inset 0 0 0 1px rgba(0,0,0,0.15);
 }
 .modal {
   background: var(--bg-elevated);
@@ -2517,7 +2567,7 @@ nav button .icon svg { display: block; }
   max-width: 400px;
   width: 90%;
   border: 1px solid var(--border-strong);
-  box-shadow: var(--shadow);
+  box-shadow: var(--shadow), inset 0 0 0 1px rgba(0,0,0,0.25);
 }
 .modal h3 { margin-bottom: 12px; }
 .modal p { color: var(--text-secondary); margin-bottom: 20px; }
@@ -2612,7 +2662,7 @@ nav button .icon svg { display: block; }
   display: flex;
   align-items: center;
   gap: 10px;
-  box-shadow: var(--shadow);
+  box-shadow: var(--shadow), inset 0 0 0 1px rgba(0,0,0,0.25);
   animation: slideIn 0.3s;
 }
 .toast.success { border-left: 4px solid var(--success); }
@@ -3738,9 +3788,11 @@ async function pollAttackStatus() {
     document.getElementById('start-btn').disabled = anyRunning;
     document.getElementById('stop-btn').disabled = !anyRunning;
     if (anyRunning) {
+      document.body.classList.add('attack-active');
       const weapons = Object.keys(attackRunning).filter(k => attackRunning[k]);
       updateGlobalStatus('Running: ' + weapons.join(', '), true);
     } else {
+      document.body.classList.remove('attack-active');
       updateGlobalStatus('Ready');
     }
   } catch(e) {}
@@ -4571,8 +4623,13 @@ def api_stop_attack():
             except:
                 pass
             STATE['monitor_log_path'] = None
-    if STATE['interface']:
+    # Only reset monitor mode if a weapon actually put the interface into it
+    # (weapon 2's monitor path). Weapons 3/4/5 and the ARP/native fallbacks never
+    # switch modes, so firing `iw set type managed` on every stop would needlessly
+    # bounce the Wi-Fi association -- exactly the connectivity disruption to avoid.
+    if STATE['interface'] and get_state('monitor_mode_active'):
         set_monitor(STATE['interface'], False)
+        update_state('monitor_mode_active', False)
     add_log('info', 'All attacks stopped')
     return jsonify({'success': True, 'status': 'All attacks stopped'})
 
@@ -4920,6 +4977,8 @@ def api_packet_builder_send():
             spec['icmp_code'] = int(data.get('icmp_code', 0))
         except (TypeError, ValueError):
             return jsonify({'success': False, 'error': 'icmp_type/icmp_code must be numbers'})
+        if not (0 <= spec['icmp_type'] <= 255 and 0 <= spec['icmp_code'] <= 255):
+            return jsonify({'success': False, 'error': 'icmp_type/icmp_code must be 0-255'})
     else:
         try:
             spec['ip_proto'] = int(data.get('ip_proto', 253))
