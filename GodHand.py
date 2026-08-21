@@ -66,6 +66,7 @@ STATE = {
     'attack_status': {},
     'blocked_macs': set(),
     'monitor_log': [],
+    'monitor_entries': [],
     'monitor_log_path': None,
     'bandwidth_sample': None,
     'ddns': {
@@ -1156,40 +1157,99 @@ def start_attack_dhcp_storm(targets, gateway, iface):
         pids.append(proc)
         return pids
 
+COMMON_PORTS = {
+    20: 'FTP-DATA', 21: 'FTP', 22: 'SSH', 23: 'Telnet', 25: 'SMTP', 53: 'DNS',
+    67: 'DHCP', 68: 'DHCP', 80: 'HTTP', 110: 'POP3', 123: 'NTP', 137: 'NetBIOS',
+    138: 'NetBIOS', 139: 'SMB', 143: 'IMAP', 161: 'SNMP', 194: 'IRC', 443: 'HTTPS',
+    445: 'SMB', 465: 'SMTPS', 587: 'SMTP', 993: 'IMAPS', 995: 'POP3S',
+    1194: 'OpenVPN', 1433: 'MSSQL', 1723: 'PPTP', 3306: 'MySQL', 3389: 'RDP',
+    5060: 'SIP', 5222: 'XMPP', 5353: 'mDNS', 5900: 'VNC', 6667: 'IRC',
+    8080: 'HTTP-Alt', 8443: 'HTTPS-Alt', 51820: 'WireGuard',
+}
+
+def port_service_name(port):
+    return COMMON_PORTS.get(port, str(port))
+
+def compute_traffic_stats():
+    with STATE_LOCK:
+        entries = list(STATE['monitor_entries'])
+    if not entries:
+        return {'total': 0, 'unique_hosts': 0, 'total_bytes': 0, 'top_talkers': [], 'top_ports': [], 'timeline': [0] * 30}
+    total_bytes = sum(e.get('len', 0) for e in entries)
+    hosts, ports = {}, {}
+    for e in entries:
+        for h in (e['src'], e['dst']):
+            b = hosts.setdefault(h, {'count': 0, 'bytes': 0})
+            b['count'] += 1
+            b['bytes'] += e.get('len', 0)
+        # The service port is conventionally the lower of the two -- using dp alone
+        # would mislabel response packets (their dp is the remote's ephemeral port).
+        key = (e['proto'], min(e['sp'], e['dp']))
+        p = ports.setdefault(key, {'count': 0, 'bytes': 0})
+        p['count'] += 1
+        p['bytes'] += e.get('len', 0)
+    top_talkers = sorted(
+        ({'host': h, 'count': v['count'], 'bytes': v['bytes']} for h, v in hosts.items()),
+        key=lambda x: -x['bytes'])[:8]
+    top_ports = sorted(
+        ({'proto': proto, 'port': port, 'service': port_service_name(port), 'count': v['count'], 'bytes': v['bytes']}
+         for (proto, port), v in ports.items()),
+        key=lambda x: -x['bytes'])[:8]
+    now = time.time()
+    bucket_seconds, n_buckets = 2, 30
+    timeline = [0] * n_buckets
+    for e in entries:
+        idx = n_buckets - 1 - int((now - e.get('t', now)) // bucket_seconds)
+        if 0 <= idx < n_buckets:
+            timeline[idx] += 1
+    return {
+        'total': len(entries),
+        'unique_hosts': len(hosts),
+        'total_bytes': total_bytes,
+        'top_talkers': top_talkers,
+        'top_ports': top_ports,
+        'timeline': timeline,
+    }
+
 def start_attack_monitor(targets, port, iface):
-    add_log('info', f'Starting Traffic Capture on {iface} for port {port}')
+    add_log('info', f'Starting Traffic Capture on {iface} for {len(targets)} target(s)')
     if not set_monitor(iface, True, raise_on_fail=False):
         add_log('warn', 'Monitor mode could not be enabled; capture may be incomplete')
+    with STATE_LOCK:
+        STATE['monitor_log'] = []
+        STATE['monitor_entries'] = []
     # Use a writable temp directory
     tmpdir = tempfile.gettempdir()
     log_path = os.path.join(tmpdir, f"godhand_monitor_{int(time.time())}.log")
+    # Captures ALL TCP/UDP traffic to/from the targets (not just one port) --
+    # a single-port filter would defeat the point of a top-ports breakdown.
     script = textwrap.dedent(f"""
-        import socket, struct, select, time, sys
+        import socket, struct, select, time, sys, json
         IFACE = '{iface}'
-        TARGETS = {targets}
-        PORT = {port}
+        TARGETS = set({targets})
+        PROTO_NAMES = {{6: 'tcp', 17: 'udp'}}
         sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
-        sock.bind((IFACE,0))
+        sock.bind((IFACE, 0))
         while True:
-            r,_,_ = select.select([sock],[],[],0.5)
-            if r:
-                data = sock.recvfrom(65535)[0]
-                if len(data)<14: continue
-                if struct.unpack('!H',data[12:14])[0] != 0x0800: continue
-                if len(data)<34: continue
-                src_ip = socket.inet_ntoa(data[26:30]); dst_ip = socket.inet_ntoa(data[30:34])
-                proto = data[23]
-                if proto == 6 and len(data)>=54:
-                    sp,dp = struct.unpack('!HH',data[34:38])
-                    if sp==PORT or dp==PORT:
-                        if src_ip in TARGETS: print(f"{{src_ip}} -> {{dst_ip}}:{{dp}}")
-                        elif dst_ip in TARGETS: print(f"{{dst_ip}} <- {{src_ip}}:{{sp}}")
-                elif proto == 17 and len(data)>=42:
-                    sp,dp = struct.unpack('!HH',data[34:38])
-                    if sp==PORT or dp==PORT:
-                        if src_ip in TARGETS: print(f"{{src_ip}} -> {{dst_ip}}:{{dp}}")
-                        elif dst_ip in TARGETS: print(f"{{dst_ip}} <- {{src_ip}}:{{sp}}")
-                sys.stdout.flush()
+            r, _, _ = select.select([sock], [], [], 0.5)
+            if not r:
+                continue
+            data = sock.recvfrom(65535)[0]
+            if len(data) < 38:
+                continue
+            if struct.unpack('!H', data[12:14])[0] != 0x0800:
+                continue
+            src_ip = socket.inet_ntoa(data[26:30])
+            dst_ip = socket.inet_ntoa(data[30:34])
+            if src_ip not in TARGETS and dst_ip not in TARGETS:
+                continue
+            proto = PROTO_NAMES.get(data[23])
+            if proto is None:
+                continue
+            sp, dp = struct.unpack('!HH', data[34:38])
+            length = struct.unpack('!H', data[16:18])[0]
+            print(json.dumps({{'t': time.time(), 'src': src_ip, 'dst': dst_ip, 'sp': sp, 'dp': dp, 'proto': proto, 'len': length}}))
+            sys.stdout.flush()
     """)
     fd, path = tempfile.mkstemp(suffix='.py')
     os.close(fd)
@@ -1214,8 +1274,21 @@ def start_attack_monitor(targets, port, iface):
                     new_lines = lf.readlines()
                     last_pos = lf.tell()
                     if new_lines:
-                        with STATE_LOCK:
-                            STATE['monitor_log'] = (STATE['monitor_log'] + new_lines)[-100:]
+                        entries = []
+                        texts = []
+                        for line in new_lines:
+                            try:
+                                e = json.loads(line)
+                            except ValueError:
+                                continue
+                            entries.append(e)
+                            arrow = '->' if e['src'] in targets else '<-'
+                            other_port = e['dp'] if arrow == '->' else e['sp']
+                            texts.append(f"{e['src']} {arrow} {e['dst']}:{other_port} ({e['proto']}, {e['len']}B)\n")
+                        if entries:
+                            with STATE_LOCK:
+                                STATE['monitor_entries'] = (STATE['monitor_entries'] + entries)[-500:]
+                                STATE['monitor_log'] = (STATE['monitor_log'] + texts)[-100:]
             except:
                 pass
             time.sleep(0.5)
@@ -1952,6 +2025,35 @@ nav button .icon svg { display: block; }
 }
 #bw-spark-rx { stroke: var(--accent-primary); }
 #bw-spark-tx { stroke: var(--warning); stroke-dasharray: 5 4; }
+.stat-row {
+  display: flex;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 16px;
+}
+.stat-tile {
+  flex: 1 1 120px;
+  background: var(--bg-inset);
+  border: 1px solid var(--border-subtle);
+  border-radius: 8px;
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.stat-tile .stat-value {
+  font-size: 1.4rem;
+  font-weight: 700;
+  color: var(--text-primary);
+  font-family: 'JetBrains Mono', monospace;
+}
+.stat-tile .stat-label {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+#traffic-spark-line { stroke: var(--accent-primary); }
 .toast-container {
   position: fixed;
   top: 20px;
@@ -2281,13 +2383,54 @@ nav button .icon svg { display: block; }
     </div>
     <div class="card">
       <h2>Live traffic capture</h2>
-      <p class="sub">Connections seen while weapon 5 (Traffic Capture) is running, updated live.</p>
-      <div class="log-container" id="traffic-container" style="display:none;"></div>
-      <div class="empty" id="traffic-empty">Not capturing. Select weapon 5 and press Start to see live traffic here.</div>
+      <p class="sub">Weapon 5 output — see the <strong>Monitor</strong> tab for the full capture &amp; analysis panel (top talkers, ports, live feed).</p>
+      <div id="attacks-traffic-status" class="status-message">Not capturing.</div>
     </div>
   </div>
 
   <div id="tab-monitor" class="tab-content">
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; flex-wrap:wrap; gap:8px;">
+        <h2 style="margin:0;">Traffic capture &amp; analysis</h2>
+        <span id="traffic-capturing-badge"></span>
+      </div>
+      <p class="sub">Live analysis of traffic to/from your targets — start weapon 5 (Traffic Capture) on the Attacks tab to populate this.</p>
+      <div class="stat-row">
+        <div class="stat-tile"><span class="stat-value" id="traffic-stat-total">0</span><span class="stat-label">Connections</span></div>
+        <div class="stat-tile"><span class="stat-value" id="traffic-stat-hosts">0</span><span class="stat-label">Unique hosts</span></div>
+        <div class="stat-tile"><span class="stat-value" id="traffic-stat-bytes">0 B</span><span class="stat-label">Total data</span></div>
+      </div>
+      <svg id="traffic-spark" viewBox="0 0 300 50" preserveAspectRatio="none" class="sparkline">
+        <polyline id="traffic-spark-line" points=""></polyline>
+      </svg>
+      <p class="sub" style="margin-top:8px; margin-bottom:0;">Connections per 2s, last 60s</p>
+    </div>
+    <div class="card">
+      <h2>Top talkers</h2>
+      <p class="sub">Hosts moving the most data, by total bytes seen.</p>
+      <div class="table-responsive">
+        <table>
+          <thead><tr><th>Host</th><th>Connections</th><th>Data</th></tr></thead>
+          <tbody id="traffic-talkers-body"></tbody>
+        </table>
+      </div>
+      <div class="empty" id="traffic-talkers-empty">No traffic captured yet.</div>
+    </div>
+    <div class="card">
+      <h2>Top ports &amp; services</h2>
+      <div class="table-responsive">
+        <table>
+          <thead><tr><th>Service</th><th>Port</th><th>Protocol</th><th>Connections</th><th>Data</th></tr></thead>
+          <tbody id="traffic-ports-body"></tbody>
+        </table>
+      </div>
+      <div class="empty" id="traffic-ports-empty">No traffic captured yet.</div>
+    </div>
+    <div class="card">
+      <h2>Raw connection feed</h2>
+      <div class="log-container" id="traffic-container" style="display:none;"></div>
+      <div class="empty" id="traffic-empty">Not capturing. Select weapon 5 on the Attacks tab and press Start.</div>
+    </div>
     <div class="card">
       <h2>Paste an ARP snapshot</h2>
       <p class="sub">Run <code>arp -a</code> and paste output below. Detects MAC changes.</p>
@@ -2515,15 +2658,72 @@ async function pollTrafficCapture() {
       empty.style.display = 'block';
       empty.textContent = res.capturing
         ? 'Capturing... waiting for matching traffic.'
-        : 'Not capturing. Select weapon 5 and press Start to see live traffic here.';
+        : 'Not capturing. Select weapon 5 on the Attacks tab and press Start.';
+    }
+    const attacksStatus = document.getElementById('attacks-traffic-status');
+    if (attacksStatus) {
+      attacksStatus.textContent = res.capturing
+        ? `Capturing — ${res.lines.length} recent connection(s) logged. See the Monitor tab for the full analysis panel.`
+        : 'Not capturing.';
     }
   } catch(e) {}
+  refreshTrafficStats();
 }
 
 function escapeHtml(s) {
   const div = document.createElement('div');
   div.textContent = s == null ? '' : String(s);
   return div.innerHTML;
+}
+
+function formatBytes(n) {
+  if (n > 1024 * 1024) return (n / 1024 / 1024).toFixed(2) + ' MB';
+  if (n > 1024) return (n / 1024).toFixed(1) + ' KB';
+  return n + ' B';
+}
+async function refreshTrafficStats() {
+  try {
+    const res = await apiCall('traffic_stats');
+    if (!res.success) return;
+    document.getElementById('traffic-capturing-badge').innerHTML =
+      `<span class="badge ${res.capturing ? 'success' : 'info'}">${res.capturing ? 'Capturing' : 'Idle'}</span>`;
+    document.getElementById('traffic-stat-total').textContent = res.total;
+    document.getElementById('traffic-stat-hosts').textContent = res.unique_hosts;
+    document.getElementById('traffic-stat-bytes').textContent = formatBytes(res.total_bytes);
+
+    const w = 300, h = 50, pad = 3;
+    const max = Math.max(1, ...res.timeline);
+    const points = res.timeline.map((v, i) => {
+      const x = res.timeline.length > 1 ? (i / (res.timeline.length - 1)) * w : 0;
+      const y = h - pad - (v / max) * (h - pad * 2);
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    }).join(' ');
+    document.getElementById('traffic-spark-line').setAttribute('points', points);
+
+    const talkersBody = document.getElementById('traffic-talkers-body');
+    const talkersEmpty = document.getElementById('traffic-talkers-empty');
+    talkersEmpty.style.display = res.top_talkers.length ? 'none' : 'block';
+    talkersBody.innerHTML = res.top_talkers.map(t => `
+      <tr>
+        <td data-label="Host">${escapeHtml(t.host)}</td>
+        <td data-label="Connections">${t.count}</td>
+        <td data-label="Data">${formatBytes(t.bytes)}</td>
+      </tr>
+    `).join('');
+
+    const portsBody = document.getElementById('traffic-ports-body');
+    const portsEmpty = document.getElementById('traffic-ports-empty');
+    portsEmpty.style.display = res.top_ports.length ? 'none' : 'block';
+    portsBody.innerHTML = res.top_ports.map(p => `
+      <tr>
+        <td data-label="Service">${escapeHtml(p.service)}</td>
+        <td data-label="Port">${p.port}</td>
+        <td data-label="Protocol">${p.proto.toUpperCase()}</td>
+        <td data-label="Connections">${p.count}</td>
+        <td data-label="Data">${formatBytes(p.bytes)}</td>
+      </tr>
+    `).join('');
+  } catch(e) {}
 }
 
 // Live bandwidth
@@ -3525,6 +3725,13 @@ def api_attack_status():
 def api_monitor_log():
     lines = STATE.get('monitor_log', [])
     return jsonify({'lines': lines[-100:], 'capturing': 5 in STATE['attack_pids']})
+
+@app.route('/api/traffic_stats', methods=['GET'])
+@require_auth
+def api_traffic_stats():
+    stats = compute_traffic_stats()
+    stats['capturing'] = 5 in STATE['attack_pids']
+    return jsonify({'success': True, **stats})
 
 @app.route('/api/nmap_scan', methods=['GET'])
 @require_auth
