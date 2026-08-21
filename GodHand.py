@@ -1405,6 +1405,104 @@ def compute_traffic_stats():
         'timeline': timeline,
     }
 
+HTTP_METHOD_PREFIXES = (b'GET ', b'POST ', b'PUT ', b'HEAD ', b'DELETE ', b'OPTIONS ', b'PATCH ', b'CONNECT ', b'HTTP/1.')
+
+def reassemble_tcp_streams(entries=None):
+    """Reassemble fragmented HTTP requests/responses from captured TCP segments
+    of the same flow by tracking sequence numbers -- a single packet's payload
+    (what http_info/tls_sni already show elsewhere) is often just the first
+    segment; a real response spanning multiple packets needs its bytes
+    stitched together in the right order before it can be parsed as one
+    HTTP message.
+
+    Each direction of each TCP connection is reassembled independently (a
+    request and its response are two different flows here, not one merged
+    conversation), using only in-order segments -- if a gap is ever detected
+    (a segment whose sequence number doesn't pick up where the last one left
+    off), reassembly for that flow stops there rather than guessing at the
+    missing bytes; this is a diagnostic tool, not a full TCP stack, so it
+    never fabricates data it didn't actually capture in order.
+    """
+    if entries is None:
+        with STATE_LOCK:
+            entries = list(STATE['monitor_entries'])
+
+    flows = {}
+    for e in entries:
+        if e.get('proto') != 'tcp' or 'payload_hex' not in e or 'seq' not in e:
+            continue
+        payload = bytes.fromhex(e['payload_hex'])
+        if not payload:
+            continue
+        key = (e['src'], e['sp'], e['dst'], e['dp'])
+        flows.setdefault(key, []).append((e['seq'], payload))
+
+    results = []
+    for (src, sp, dst, dp), segments in flows.items():
+        segments.sort(key=lambda s: s[0])
+        first_seq, first_payload = segments[0]
+        assembled = bytearray(first_payload)
+        next_seq = (first_seq + len(first_payload)) & 0xFFFFFFFF
+        gap_detected = False
+        packet_count = 1
+        for seq, payload in segments[1:]:
+            if seq == next_seq:
+                assembled += payload
+                next_seq = (next_seq + len(payload)) & 0xFFFFFFFF
+                packet_count += 1
+            elif seq < next_seq:
+                continue  # retransmission/overlap of bytes already assembled -- skip, don't duplicate
+            else:
+                gap_detected = True
+                break
+
+        if not bytes(assembled[:16]).startswith(HTTP_METHOD_PREFIXES):
+            continue  # not HTTP -- nothing meaningful to reassemble it into
+
+        result = {
+            'src': src, 'sp': sp, 'dst': dst, 'dp': dp,
+            'packet_count': packet_count, 'total_bytes': len(assembled),
+            'gap_detected': gap_detected,
+        }
+        header_end = assembled.find(b'\r\n\r\n')
+        if header_end == -1:
+            result.update(complete=False, status_line=None, headers={}, body_preview=None, body_truncated=False)
+            results.append(result)
+            continue
+
+        lines = assembled[:header_end].decode('ascii', 'replace').split('\r\n')
+        headers = {}
+        for line in lines[1:]:
+            if ':' in line:
+                k, v = line.split(':', 1)
+                headers[k.strip()] = v.strip()
+        result['status_line'] = lines[0]
+        result['headers'] = headers
+
+        body = bytes(assembled[header_end + 4:])
+        chunked = 'chunked' in headers.get('Transfer-Encoding', '').lower()
+        content_length = headers.get('Content-Length')
+        if chunked:
+            result['complete'] = False
+            result['note'] = 'Transfer-Encoding: chunked -- not decoded, showing raw bytes as received'
+        elif content_length is not None:
+            try:
+                cl = int(content_length)
+                result['complete'] = len(body) >= cl
+                body = body[:cl]
+            except ValueError:
+                result['complete'] = not gap_detected
+        else:
+            result['complete'] = not gap_detected
+
+        body_cap = 2000
+        result['body_truncated'] = len(body) > body_cap
+        result['body_preview'] = body[:body_cap].decode('utf-8', 'replace')
+        results.append(result)
+
+    results.sort(key=lambda r: -r['total_bytes'])
+    return results
+
 def start_attack_monitor(targets, port, iface):
     add_log('info', f'Starting Traffic Capture on {iface} for {len(targets)} target(s)')
     if not set_monitor(iface, True, raise_on_fail=False):
@@ -1525,6 +1623,7 @@ def start_attack_monitor(targets, port, iface):
                 entry['sp'] = sp
                 entry['dp'] = dp
                 if proto == 'tcp' and len(data) >= 48:
+                    entry['seq'] = struct.unpack('!I', data[38:42])[0]
                     flag_byte = data[47]
                     flags = []
                     if flag_byte & 0x02: flags.append('SYN')
@@ -1538,6 +1637,12 @@ def start_attack_monitor(targets, port, iface):
                     payload_start = 34 + tcp_header_len
                     if len(data) > payload_start:
                         payload = data[payload_start:]
+                        # Capped at 2048B/segment -- plenty for HTTP headers plus a
+                        # meaningful chunk of a typical short body, without letting a
+                        # large transfer blow up the capture log. Kept separately from
+                        # http_info/tls_sni below since reassembly needs the raw bytes,
+                        # not just what a single segment's own first line shows.
+                        entry['payload_hex'] = payload[:2048].hex()
                         http_line = parse_http(payload)
                         if http_line:
                             entry['http_info'] = http_line
@@ -2943,6 +3048,12 @@ GODHAND_DDNS_ENABLED=1                  # optional, default on when the above ar
       <div class="empty" id="traffic-empty">Not capturing. Select weapon 5 on the Attacks tab and press Start.</div>
     </div>
     <div class="card">
+      <h2>Reassembled HTTP streams</h2>
+      <p class="sub">Fragmented HTTP requests/responses stitched back together from their TCP segments in sequence order — not just what a single packet's first line shows.</p>
+      <div id="tcp-streams-list"></div>
+      <div class="empty" id="tcp-streams-empty">No HTTP streams reassembled yet.</div>
+    </div>
+    <div class="card">
       <h2>Paste an ARP snapshot</h2>
       <p class="sub">Run <code>arp -a</code> and paste output below. Detects MAC changes.</p>
       <textarea id="arp-input" placeholder="e.g. 192.168.1.1 aa:bb:cc:dd:ee:ff"></textarea>
@@ -3221,6 +3332,7 @@ async function pollTrafficCapture() {
     }
   } catch(e) {}
   refreshTrafficStats();
+  refreshTcpStreams();
 }
 
 function escapeHtml(s) {
@@ -3276,6 +3388,46 @@ async function refreshTrafficStats() {
         <td data-label="Data">${formatBytes(p.bytes)}</td>
       </tr>
     `).join('');
+  } catch(e) {}
+}
+
+function formatStreamBadge(s) {
+  if (s.gap_detected) return '<span class="badge warning">Partial (gap)</span>';
+  if (s.complete) return '<span class="badge success">Complete</span>';
+  return '<span class="badge info">Assembling…</span>';
+}
+async function refreshTcpStreams() {
+  try {
+    const res = await apiCall('tcp_streams');
+    if (!res.success) return;
+    const list = document.getElementById('tcp-streams-list');
+    const empty = document.getElementById('tcp-streams-empty');
+    if (!res.streams.length) {
+      list.innerHTML = '';
+      empty.style.display = 'block';
+      return;
+    }
+    empty.style.display = 'none';
+    list.innerHTML = res.streams.map(s => {
+      const headerLines = Object.entries(s.headers || {}).map(([k, v]) =>
+        `${escapeHtml(k)}: ${escapeHtml(v)}`).join('\n');
+      const note = s.note ? `<div class="empty-inline" style="margin-top:4px;">${escapeHtml(s.note)}</div>` : '';
+      const bodyBlock = s.body_preview
+        ? `<div class="log-container" style="margin-top:8px; white-space:pre-wrap; word-break:break-word;">${escapeHtml(s.body_preview)}${s.body_truncated ? '\n[truncated]' : ''}</div>`
+        : '';
+      return `
+        <div class="status-message" style="text-align:left; margin-bottom:12px;">
+          <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:8px; margin-bottom:6px;">
+            <strong style="font-family:'JetBrains Mono',monospace; font-size:0.85rem;">${escapeHtml(s.src)}:${s.sp} → ${escapeHtml(s.dst)}:${s.dp}</strong>
+            <span>${formatStreamBadge(s)} <span class="empty-inline">${s.packet_count} segment(s), ${formatBytes(s.total_bytes)}</span></span>
+          </div>
+          ${s.status_line ? `<div style="font-family:'JetBrains Mono',monospace; font-weight:600;">${escapeHtml(s.status_line)}</div>` : '<div class="empty-inline">Still assembling headers…</div>'}
+          ${headerLines ? `<div class="log-container" style="margin-top:6px; white-space:pre-wrap;">${headerLines}</div>` : ''}
+          ${note}
+          ${bodyBlock}
+        </div>
+      `;
+    }).join('');
   } catch(e) {}
 }
 
@@ -4368,6 +4520,11 @@ def api_traffic_stats():
     stats = compute_traffic_stats()
     stats['capturing'] = 5 in STATE['attack_pids']
     return jsonify({'success': True, **stats})
+
+@app.route('/api/tcp_streams', methods=['GET'])
+@require_auth
+def api_tcp_streams():
+    return jsonify({'success': True, 'streams': reassemble_tcp_streams()})
 
 @app.route('/api/nmap_scan', methods=['GET'])
 @require_auth
