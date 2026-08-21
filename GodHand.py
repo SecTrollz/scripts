@@ -1370,6 +1370,58 @@ def run_attack(weapon_id, targets, gateway, port, iface):
         return start_attack_monitor(targets, port, iface)
     return None
 
+def assess_attack_risk(weapon_id, targets, gateway, iface):
+    """Return a human-readable risk warning if this attack could disrupt something
+    the operator likely didn't intend to hit, or None if there's nothing to flag.
+
+    This is deliberately conservative (only flags what's foreseeable and concrete --
+    the gateway or this device's own IP in the target list, or an attack that is
+    inherently network-wide) rather than a blanket confirmation on every attack:
+    the goal is an informed choice, not friction for its own sake.
+    """
+    my_ip = None
+    if iface:
+        my_ip, _ = get_my_ip_and_cidr(iface)
+        if my_ip == '0.0.0.0':
+            my_ip = None
+    notes = []
+    if weapon_id == 4:
+        notes.append(
+            "DHCP Storm exhausts the gateway's entire DHCP address pool. Every device on "
+            "this network -- including this one, if its lease needs to renew during the "
+            "attack -- can lose network access until you stop it."
+        )
+    else:
+        if gateway and gateway in targets:
+            notes.append(
+                f"Your target list includes this network's gateway ({gateway}). Attacking "
+                "the gateway directly can cut off internet/LAN access for every device on "
+                "this network, including this one."
+            )
+        elif my_ip and my_ip in targets:
+            notes.append(
+                f"Your target list includes this device's own IP ({my_ip}). This attack "
+                "could disconnect this device itself -- including from the app you're using "
+                "to control it right now."
+            )
+    active_services = []
+    if gateway_dns_status().get('unbound') or gateway_dns_status().get('dnscrypt'):
+        active_services.append('the Gateway DNS stack')
+    if gateway_proxy_status().get('tinyproxy'):
+        active_services.append('the network-wide proxy')
+    if proc_running('ngrok'):
+        active_services.append('the ngrok tunnel')
+    ddns_cfg = get_state('ddns')
+    if ddns_cfg and ddns_cfg.get('enabled'):
+        active_services.append('DDNS auto-update')
+    if active_services:
+        notes.append(
+            'Currently active and depending on this network staying up: ' +
+            ', '.join(active_services) + '. Disrupting the gateway or this device may '
+            'interrupt those too, for anyone relying on them.'
+        )
+    return ' '.join(notes) if notes else None
+
 def kill_attack(pids):
     for proc in pids:
         try:
@@ -2889,15 +2941,23 @@ async function refreshGatewayStatus() {
   refreshNgrokStatus();
 }
 async function startGatewayDns() {
-  showToast('Starting DNS privacy stack...', 'success');
-  const res = await apiCall('gateway/dns/start', 'POST');
-  showToast(res.status || res.error, res.success ? 'success' : 'error');
-  refreshGatewayStatus();
+  openModal('Start DNS privacy stack',
+    'This stops any Unbound or DNSCrypt-proxy process already running on this device, even one you started outside GodHand, and replaces it with a fresh instance. If other devices are already using this host as their DNS server, they will see a few seconds of DNS downtime during the restart. Continue?',
+    async () => {
+      showToast('Starting DNS privacy stack...', 'success');
+      const res = await apiCall('gateway/dns/start', 'POST');
+      showToast(res.status || res.error, res.success ? 'success' : 'error');
+      refreshGatewayStatus();
+    });
 }
 async function stopGatewayDns() {
-  const res = await apiCall('gateway/dns/stop', 'POST');
-  showToast(res.status, 'success');
-  refreshGatewayStatus();
+  openModal('Stop DNS privacy stack',
+    'Any devices on this network currently configured to use this host as their DNS server will lose DNS resolution immediately. Continue?',
+    async () => {
+      const res = await apiCall('gateway/dns/stop', 'POST');
+      showToast(res.status, 'success');
+      refreshGatewayStatus();
+    });
 }
 async function updateGatewayBlocklist() {
   showToast('Fetching blocklist...', 'success');
@@ -2921,14 +2981,22 @@ async function testGatewayDns() {
   box.innerHTML = `<div class="log-container">${rows}</div>`;
 }
 async function startGatewayProxy() {
-  const res = await apiCall('gateway/proxy/start', 'POST');
-  showToast(res.status || res.error, res.success ? 'success' : 'error');
-  refreshGatewayStatus();
+  openModal('Start network-wide proxy',
+    'This stops any tinyproxy process already running on this device, even one you started outside GodHand, and replaces it with a fresh instance. Continue?',
+    async () => {
+      const res = await apiCall('gateway/proxy/start', 'POST');
+      showToast(res.status || res.error, res.success ? 'success' : 'error');
+      refreshGatewayStatus();
+    });
 }
 async function stopGatewayProxy() {
-  const res = await apiCall('gateway/proxy/stop', 'POST');
-  showToast(res.status, 'success');
-  refreshGatewayStatus();
+  openModal('Stop network-wide proxy',
+    'Any devices on this network currently pointed at this host as their HTTP proxy will lose that connection immediately. Continue?',
+    async () => {
+      const res = await apiCall('gateway/proxy/stop', 'POST');
+      showToast(res.status, 'success');
+      refreshGatewayStatus();
+    });
 }
 
 // Dynamic DNS
@@ -3268,20 +3336,23 @@ async function confirmStartAttack() {
     showToast('An attack is already running.', 'warning');
     return;
   }
-  openModal('Start Attack', `Start weapon ${selectedWeapon}?`, async () => {
-    const btn = document.getElementById('start-btn');
-    btn.disabled = true;
-    btn.textContent = 'Starting...';
-    const res = await apiCall('start_attack', 'POST', { weapon: selectedWeapon });
-    btn.disabled = false;
-    btn.textContent = '▶ Start';
-    if (res.success) {
-      showToast('Attack started: ' + res.weapon, 'success');
-      pollAttackStatus();
-    } else {
-      showToast('Failed: ' + res.error, 'error');
-    }
-  });
+  openModal('Start Attack', `Start weapon ${selectedWeapon}?`, () => launchAttack(false));
+}
+async function launchAttack(confirmRisk) {
+  const btn = document.getElementById('start-btn');
+  btn.disabled = true;
+  btn.textContent = 'Starting...';
+  const res = await apiCall('start_attack', 'POST', { weapon: selectedWeapon, confirm_risk: confirmRisk });
+  btn.disabled = false;
+  btn.textContent = '▶ Start';
+  if (res.success) {
+    showToast('Attack started: ' + res.weapon, 'success');
+    pollAttackStatus();
+  } else if (res.requires_confirmation) {
+    openModal('⚠ Risk of network disruption', res.error, () => launchAttack(true));
+  } else {
+    showToast('Failed: ' + res.error, 'error');
+  }
 }
 async function confirmStopAttack() {
   openModal('Stop Attack', 'Stop all running attacks?', async () => {
@@ -3758,6 +3829,12 @@ def api_start_attack():
         return jsonify({'success': False, 'error': 'No targets added'})
     if weapon != 5 and not STATE['gateway']:
         return jsonify({'success': False, 'error': 'Gateway not set'})
+    weapon_names_pre = {1:'ARP Freeze',2:'Deauth Flood',3:'SYN Flood',4:'DHCP Storm',5:'Traffic Capture'}
+    if weapon in (1, 2, 3, 4) and not data.get('confirm_risk'):
+        risk = assess_attack_risk(weapon, STATE['targets'], STATE['gateway'], STATE['interface'])
+        if risk:
+            return jsonify({'success': False, 'requires_confirmation': True,
+                             'error': f'{risk} Start {weapon_names_pre[weapon]} anyway?'})
     if weapon in STATE['attack_pids']:
         kill_attack(STATE['attack_pids'][weapon])
         del STATE['attack_pids'][weapon]
@@ -4015,9 +4092,22 @@ def api_ngrok_start():
         proc = start_ngrok_tunnel(port, authtoken or None)
         with STATE_LOCK:
             STATE['ngrok_proc'] = proc
-        time.sleep(1.5)
-        url = get_ngrok_public_url()
-        add_log('success', f'ngrok tunnel started' + (f': {url}' if url else ' (URL not yet available)'))
+        # The local process starting doesn't mean the tunnel actually came up --
+        # an invalid/expired authtoken or no route to ngrok's servers leaves the
+        # process running but with no public URL ever assigned. Poll for the real
+        # outcome instead of reporting success the moment the process exists.
+        url = None
+        for _ in range(6):
+            time.sleep(1)
+            url = get_ngrok_public_url()
+            if url:
+                break
+        if not url:
+            add_log('error', 'ngrok process started but no tunnel URL was assigned after 6s -- check your authtoken and network')
+            return jsonify({'success': False,
+                             'error': 'ngrok started but never established a public tunnel (no URL after 6s). '
+                                      'Check your authtoken and that this network allows outbound ngrok connections.'})
+        add_log('success', f'ngrok tunnel started: {url}')
         return jsonify({'success': True, 'url': url})
     except Exception as e:
         add_log('error', f'ngrok start failed: {e}')
