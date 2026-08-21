@@ -1281,12 +1281,14 @@ nav button .icon svg { display: block; }
         <span id="scan-spinner" style="display:none;"><span class="spinner"></span> Scanning...</span>
       </div>
       <div class="row">
-        <input type="text" id="target-ip" placeholder="Add IP manually">
-        <button class="btn secondary" onclick="addTarget()">Add target</button>
-        <button class="btn-icon" onclick="kickTypedIP()" title="Kick this IP"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="8.5" cy="7" r="4"></circle><line x1="18" y1="8" x2="23" y2="13"></line><line x1="23" y1="8" x2="18" y2="13"></line></svg></button>
-        <button class="btn-icon" onclick="blockTypedIP()" title="Block/unblock this IP"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg></button>
+        <input type="text" id="target-ip" placeholder="Add IP manually" style="flex-basis:100%;">
       </div>
-      <p class="sub" style="margin-top:-8px;">These act on the typed IP directly — no need to add it as a target first.</p>
+      <div class="row">
+        <button class="btn secondary" onclick="addTarget()">Add target</button>
+        <button class="btn secondary" onclick="kickTypedIP()"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-3px; margin-right:4px;"><path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="8.5" cy="7" r="4"></circle><line x1="18" y1="8" x2="23" y2="13"></line><line x1="23" y1="8" x2="18" y2="13"></line></svg>Kick</button>
+        <button class="btn secondary" onclick="blockTypedIP()"><svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align:-3px; margin-right:4px;"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>Block</button>
+      </div>
+      <p class="sub" style="margin-top:-8px;">Kick/Block act on the typed IP directly — no need to add it as a target first.</p>
       <p class="sub" style="margin-bottom:8px;">Current targets — attacks run against these:</p>
       <div class="chip-row" id="target-chips"></div>
       <div class="table-responsive">
