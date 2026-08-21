@@ -23,12 +23,32 @@ import ipaddress
 import tempfile
 import hashlib
 import textwrap
+import urllib.request
 from functools import wraps
 from flask import Flask, request, jsonify, render_template_string, abort
 
 # ---------- configuration ----------
 SECRET = os.environ.get('GODHAND_SECRET', '')
 APP_PORT = int(os.environ.get('GODHAND_PORT', 5000))
+
+# ---------- gateway (DNS/VPN/proxy) configuration ----------
+GATEWAY_DIR = os.path.join(os.environ['PREFIX'], 'etc', 'godhand-gateway') if os.environ.get('PREFIX') else '/etc/godhand-gateway'
+GW_UNBOUND_CONF = os.path.join(GATEWAY_DIR, 'unbound.conf')
+GW_BLOCKLIST_CONF = os.path.join(GATEWAY_DIR, 'blocklist.conf')
+GW_DNSCRYPT_CONF = os.path.join(GATEWAY_DIR, 'dnscrypt-proxy.toml')
+GW_TINYPROXY_CONF = os.path.join(GATEWAY_DIR, 'tinyproxy.conf')
+GW_DNS_PORT = 5335
+GW_DNSCRYPT_PORT = 5353
+GW_PROXY_PORT = 8888
+DEFAULT_BLOCKED_DOMAINS = [
+    'doubleclick.net', 'googlesyndication.com', 'googleadservices.com',
+    'google-analytics.com', 'adservice.google.com', 'ads.yahoo.com',
+    'adnxs.com', 'scorecardresearch.com', 'facebook.net', 'amazon-adsystem.com',
+    'moatads.com', 'taboola.com', 'outbrain.com', 'criteo.com', 'pubmatic.com',
+    'rubiconproject.com', 'openx.net', 'casalemedia.com', 'adsrvr.org',
+    'bidswitch.net', 'quantserve.com', 'mmstat.com', 'analytics.twitter.com',
+    'branch.io', 'app-measurement.com', 'flurry.com', 'chartbeat.com',
+]
 
 # ---------- global state with thread lock ----------
 STATE = {
@@ -159,6 +179,9 @@ def ensure_tool(tool_name, package_name=None):
         'iw': 'iw',
         'iptables': 'iptables',
         'nmap': 'nmap',
+        'unbound': 'unbound',
+        'dnscrypt-proxy': 'dnscrypt-proxy',
+        'tinyproxy': 'tinyproxy',
     }
     pkg = pkg_map.get(package_name, package_name)
     installed = install_package(pkg)
@@ -320,6 +343,251 @@ def get_iface_bytes(iface):
         pass
     return None
 
+# ---------- gateway: shared helpers ----------
+def proc_running(name):
+    try:
+        return subprocess.run(['pgrep', '-x', name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    except:
+        return False
+
+def stop_proc(name):
+    subprocess.run(['pkill', '-9', '-x', name], stderr=subprocess.DEVNULL)
+
+def get_local_ip():
+    iface = get_state('interface')
+    if iface:
+        ip, _ = get_my_ip_and_cidr(iface)
+        if ip and ip != '0.0.0.0':
+            return ip
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(('8.8.8.8', 80))
+        ip = s.getsockname()[0]
+        s.close()
+        return ip
+    except:
+        return '0.0.0.0'
+
+_EXTERNAL_IP_CACHE = {'ip': None, 'time': 0}
+def get_external_ip():
+    now = time.time()
+    if _EXTERNAL_IP_CACHE['ip'] and now - _EXTERNAL_IP_CACHE['time'] < 300:
+        return _EXTERNAL_IP_CACHE['ip']
+    try:
+        req = urllib.request.Request('https://api.ipify.org', headers={'User-Agent': 'GodHand'})
+        with urllib.request.urlopen(req, timeout=5) as r:
+            ip = r.read().decode().strip()
+        _EXTERNAL_IP_CACHE['ip'] = ip
+        _EXTERNAL_IP_CACHE['time'] = now
+        return ip
+    except:
+        return _EXTERNAL_IP_CACHE['ip'] or 'Unknown'
+
+def simple_dns_query(domain, server='127.0.0.1', port=53, timeout=3):
+    txid = random.randint(0, 65535)
+    header = struct.pack('!HHHHHH', txid, 0x0100, 1, 0, 0, 0)
+    qname = b''.join(struct.pack('B', len(p)) + p.encode() for p in domain.strip('.').split('.')) + b'\x00'
+    question = qname + struct.pack('!HH', 1, 1)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    try:
+        s.sendto(header + question, (server, port))
+        data, _ = s.recvfrom(512)
+    finally:
+        s.close()
+    _, flags, _, ancount = struct.unpack('!HHHH', data[:8])
+    return {'rcode': flags & 0x000F, 'answer_count': ancount}
+
+# ---------- gateway: DNS privacy stack ----------
+def fetch_blocklist_domains():
+    try:
+        req = urllib.request.Request(
+            'https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts',
+            headers={'User-Agent': 'GodHand'})
+        with urllib.request.urlopen(req, timeout=20) as r:
+            text = r.read().decode('utf-8', 'ignore')
+        # Only "0.0.0.0 <domain>" lines are the actual blocklist body; a leading
+        # "127.0.0.1 localhost"-style block is boilerplate, not domains to block.
+        skip = {'0.0.0.0', 'localhost', 'localhost.localdomain', 'local', 'broadcasthost'}
+        domain_re = re.compile(r'^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$')
+        domains = []
+        for line in text.splitlines():
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            parts = line.split()
+            if len(parts) >= 2 and parts[0] == '0.0.0.0':
+                d = parts[1].strip().lower()
+                if d not in skip and domain_re.match(d):
+                    domains.append(d)
+        return domains or list(DEFAULT_BLOCKED_DOMAINS)
+    except Exception as e:
+        add_log('warn', f'Blocklist fetch failed, using built-in list: {e}')
+        return list(DEFAULT_BLOCKED_DOMAINS)
+
+def write_gateway_configs(domains):
+    os.makedirs(GATEWAY_DIR, exist_ok=True)
+    with open(GW_BLOCKLIST_CONF, 'w') as f:
+        for d in domains:
+            f.write(f'local-zone: "{d}." always_nxdomain\n')
+
+    dnscrypt_toml = textwrap.dedent(f"""\
+        listen_addresses = ['127.0.0.1:{GW_DNSCRYPT_PORT}']
+        server_names = ['cloudflare', 'quad9-dnscrypt-ip4-filter-pri']
+        ipv4_servers = true
+        ipv6_servers = false
+        dnscrypt_servers = true
+        doh_servers = true
+        require_dnssec = true
+        require_nolog = true
+        cache = true
+        cache_size = 4096
+        [sources.'public-resolvers']
+        urls = ['https://raw.githubusercontent.com/DNSCrypt/dnscrypt-resolvers/master/v3/public-resolvers.md']
+        cache_file = '{GATEWAY_DIR}/public-resolvers.md'
+        minisign_key = 'RWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3'
+        refresh_delay = 72
+        prefix = ''
+    """)
+    with open(GW_DNSCRYPT_CONF, 'w') as f:
+        f.write(dnscrypt_toml)
+
+    unbound_conf = textwrap.dedent(f"""\
+        server:
+            interface: 0.0.0.0@{GW_DNS_PORT}
+            access-control: 0.0.0.0/0 allow
+            do-ip4: yes
+            do-ip6: no
+            do-udp: yes
+            do-tcp: yes
+            harden-dnssec-stripped: yes
+            qname-minimisation: yes
+            hide-identity: yes
+            hide-version: yes
+            use-caps-for-id: yes
+            cache-min-ttl: 300
+            do-not-query-localhost: no
+            username: ""
+            chroot: ""
+            pidfile: "{GATEWAY_DIR}/unbound.pid"
+            logfile: "{GATEWAY_DIR}/unbound.log"
+            include: "{GW_BLOCKLIST_CONF}"
+        forward-zone:
+            name: "."
+            forward-addr: 127.0.0.1@{GW_DNSCRYPT_PORT}
+    """)
+    with open(GW_UNBOUND_CONF, 'w') as f:
+        f.write(unbound_conf)
+
+def gateway_blocklist_count():
+    try:
+        with open(GW_BLOCKLIST_CONF) as f:
+            return sum(1 for _ in f)
+    except:
+        return 0
+
+def gateway_dns_status():
+    return {
+        'unbound': proc_running('unbound'),
+        'dnscrypt': proc_running('dnscrypt-proxy'),
+        'blocklist_domains': gateway_blocklist_count(),
+    }
+
+def start_gateway_dns():
+    if not ensure_tool('dnscrypt-proxy'):
+        raise RuntimeError('dnscrypt-proxy could not be installed')
+    if not ensure_tool('unbound'):
+        raise RuntimeError('unbound could not be installed')
+    if not os.path.exists(GW_BLOCKLIST_CONF):
+        write_gateway_configs(list(DEFAULT_BLOCKED_DOMAINS))
+    stop_proc('dnscrypt-proxy')
+    stop_proc('unbound')
+    time.sleep(0.3)
+    dnscrypt_proc = subprocess.Popen(['dnscrypt-proxy', '-config', GW_DNSCRYPT_CONF],
+                                      stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    time.sleep(1.5)
+    if dnscrypt_proc.poll() is not None:
+        err = dnscrypt_proc.stderr.read().decode(errors='ignore')[-400:]
+        raise RuntimeError(f'dnscrypt-proxy failed to start: {err}')
+    unbound_proc = subprocess.Popen(['unbound', '-c', GW_UNBOUND_CONF, '-d'],
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    time.sleep(1)
+    if unbound_proc.poll() is not None:
+        err = unbound_proc.stderr.read().decode(errors='ignore')[-400:]
+        stop_proc('dnscrypt-proxy')
+        raise RuntimeError(f'unbound failed to start: {err}')
+    add_log('success', 'Gateway DNS stack started (Unbound + DNSCrypt-proxy)')
+
+def stop_gateway_dns():
+    stop_proc('unbound')
+    stop_proc('dnscrypt-proxy')
+    add_log('info', 'Gateway DNS stack stopped')
+
+def test_gateway_dns():
+    results = {}
+    for domain, expect_block in [('google.com', False), ('doubleclick.net', True)]:
+        try:
+            r = simple_dns_query(domain, '127.0.0.1', GW_DNS_PORT, timeout=3)
+            blocked = r['rcode'] == 3 or r['answer_count'] == 0
+            results[domain] = {'blocked': blocked, 'expected_block': expect_block, 'ok': blocked == expect_block}
+        except Exception as e:
+            results[domain] = {'blocked': None, 'expected_block': expect_block, 'ok': False, 'error': str(e)}
+    return results
+
+# ---------- gateway: VPN detection ----------
+def gateway_vpn_status():
+    wg_active = False
+    try:
+        out = subprocess.check_output(['ip', 'link', 'show', 'wg0'], stderr=subprocess.DEVNULL, text=True)
+        wg_active = 'UP' in out.split('<', 1)[-1].split('>', 1)[0] if '<' in out else False
+    except:
+        pass
+    openvpn_active = proc_running('openvpn')
+    cloudflared_active = proc_running('cloudflared')
+    return {
+        'wireguard': wg_active,
+        'openvpn': openvpn_active,
+        'cloudflared': cloudflared_active,
+        'active': wg_active or openvpn_active or cloudflared_active,
+    }
+
+# ---------- gateway: network-wide proxy ----------
+def write_tinyproxy_conf():
+    os.makedirs(GATEWAY_DIR, exist_ok=True)
+    conf = textwrap.dedent(f"""\
+        Port {GW_PROXY_PORT}
+        Listen 0.0.0.0
+        Timeout 600
+        MaxClients 100
+        Allow 0.0.0.0/0
+        PidFile "{GATEWAY_DIR}/tinyproxy.pid"
+        LogFile "{GATEWAY_DIR}/tinyproxy.log"
+    """)
+    with open(GW_TINYPROXY_CONF, 'w') as f:
+        f.write(conf)
+
+def gateway_proxy_status():
+    return {'tinyproxy': proc_running('tinyproxy'), 'port': GW_PROXY_PORT}
+
+def start_gateway_proxy():
+    if not ensure_tool('tinyproxy'):
+        raise RuntimeError('tinyproxy could not be installed')
+    if not os.path.exists(GW_TINYPROXY_CONF):
+        write_tinyproxy_conf()
+    stop_proc('tinyproxy')
+    time.sleep(0.3)
+    proc = subprocess.Popen(['tinyproxy', '-c', GW_TINYPROXY_CONF, '-d'],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+    time.sleep(1)
+    if proc.poll() is not None:
+        err = proc.stderr.read().decode(errors='ignore')[-400:]
+        raise RuntimeError(f'tinyproxy failed to start: {err}')
+    add_log('success', f'Gateway proxy started on port {GW_PROXY_PORT}')
+
+def stop_gateway_proxy():
+    stop_proc('tinyproxy')
+    add_log('info', 'Gateway proxy stopped')
+
 # ---------- monitor mode ----------
 def set_monitor(iface, enable=True, raise_on_fail=False):
     """Attempt to set monitor mode. Returns True on success, False otherwise."""
@@ -353,6 +621,50 @@ def check_monitor_support(iface):
         return set_monitor(iface, True) and set_monitor(iface, False)
     except:
         return False
+
+# ---------- native (no-monitor-mode) deauth via AP station-del ----------
+# When this device's own Wi-Fi interface is running as an access point (e.g. a
+# rooted-Android hotspot), the kernel can be told to deauth one of ITS OWN
+# connected stations via `iw dev <if> station del <mac> subtype 0xC` -- a real
+# nl80211 primitive, no monitor mode, no packet injection, interface stays
+# fully operational. This does NOT let a client interface forge deauth frames
+# at other devices on a network it merely joined; there is no netlink shortcut
+# for that -- it genuinely requires monitor mode + an injection-capable driver,
+# which is why that path (below) is left untouched.
+def get_iface_type(iface):
+    """Return the current nl80211 interface type (managed, AP, monitor, ...) or None if unknown."""
+    try:
+        out = subprocess.check_output(['iw', 'dev', iface, 'info'], stderr=subprocess.DEVNULL, text=True, timeout=5)
+        m = re.search(r'^\s*type (\S+)', out, re.MULTILINE)
+        return m.group(1) if m else None
+    except:
+        return None
+
+def list_ap_stations(iface):
+    """MAC addresses of stations currently associated to this AP-mode interface."""
+    try:
+        out = subprocess.check_output(['iw', 'dev', iface, 'station', 'dump'], stderr=subprocess.DEVNULL, text=True, timeout=5)
+    except:
+        return []
+    return [m.lower() for m in re.findall(r'^Station ([0-9a-fA-F:]{17})', out, re.MULTILINE)]
+
+def native_deauth_station(iface, mac, reason_code=2):
+    """Send a real kernel-native deauth to an associated station. Only valid when iface is our own AP."""
+    try:
+        res = subprocess.run(['iw', 'dev', iface, 'station', 'del', mac, 'subtype', '0xC', 'reason-code', str(reason_code)],
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=5)
+        return res.returncode == 0
+    except:
+        return False
+
+def deauth_capability(iface):
+    """What mechanism kick_client/start_attack_deauth will actually use for this interface, honestly."""
+    iface_type = get_iface_type(iface)
+    if iface_type == 'AP':
+        return {'method': 'native', 'iface_type': iface_type, 'ap_station_count': len(list_ap_stations(iface))}
+    if check_monitor_support(iface):
+        return {'method': 'monitor', 'iface_type': iface_type}
+    return {'method': 'unavailable', 'iface_type': iface_type}
 
 # ---------- checksum helpers ----------
 def ip_checksum(data):
@@ -442,8 +754,43 @@ def start_attack_arp_freeze(targets, gateway, iface):
         pids.append(proc)
         return pids
 
+def start_attack_deauth_native(targets, iface):
+    """Continuously re-deauth targets that are associated stations on our own AP -- no monitor mode."""
+    stations = set(list_ap_stations(iface))
+    target_macs = []
+    for t_ip in targets:
+        for h in STATE['hosts']:
+            if h['ip'] == t_ip and h['mac'].lower() in stations:
+                target_macs.append(h['mac'])
+                break
+    if not target_macs:
+        raise RuntimeError(f'{iface} is running as an access point, but none of the selected targets are currently associated stations on it.')
+    add_log('info', f'{iface} is in AP mode -- using native kernel deauth flood (station-del), no monitor mode, for {len(target_macs)} station(s)')
+    script = textwrap.dedent(f"""
+        import subprocess, time
+        IFACE = '{iface}'
+        MACS = {target_macs}
+        while True:
+            for mac in MACS:
+                subprocess.run(['iw', 'dev', IFACE, 'station', 'del', mac, 'subtype', '0xC', 'reason-code', '2'],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(1)
+    """)
+    fd, path = tempfile.mkstemp(suffix='.py')
+    os.close(fd)
+    with open(path, 'w') as f:
+        f.write(script)
+    proc = subprocess.Popen(['python3', path], stderr=subprocess.PIPE)
+    time.sleep(0.5)
+    if proc.poll() is not None:
+        raise RuntimeError('Native deauth flood script exited immediately')
+    threading.Thread(target=lambda: (proc.wait(), os.unlink(path)), daemon=True).start()
+    return [proc]
+
 def start_attack_deauth(targets, iface):
     add_log('info', f'Starting Deauth Flood on {iface} for {len(targets)} targets')
+    if get_iface_type(iface) == 'AP':
+        return start_attack_deauth_native(targets, iface)
     # First check if monitor mode is supported
     if not check_monitor_support(iface):
         raise RuntimeError('Monitor mode is not supported on this interface. Deauth attack requires monitor mode and a compatible wireless adapter.')
@@ -733,6 +1080,26 @@ def kill_attack(pids):
 # ---------- kick & block with verification ----------
 def kick_client(ip, mac, iface):
     add_log('info', f'Attempting to kick {ip} ({mac})')
+    iface_type = get_iface_type(iface)
+    if iface_type == 'AP':
+        # This interface is our own access point -- kick the station natively via
+        # the kernel, no monitor mode. Never fall back to monitor mode here: flipping
+        # an AP interface into monitor mode would drop every connected client, not
+        # just this one.
+        if mac.lower() not in list_ap_stations(iface):
+            raise RuntimeError(f'{iface} is running as an access point, but {mac} is not currently an associated station on it.')
+        add_log('info', f'{iface} is in AP mode -- using native kernel deauth (station-del), no monitor mode')
+        if not native_deauth_station(iface, mac):
+            raise RuntimeError(f'Native deauth (station-del) failed for {mac} on {iface}')
+        add_log('success', f'Sent native deauth to {mac}')
+        time.sleep(2)
+        reachable = server_ping(ip, timeout=1)
+        if reachable:
+            add_log('warn', f'Target {ip} is still responding to ping after kick')
+            return False
+        add_log('success', f'Target {ip} is not responding to ping after kick')
+        return True
+
     if not check_monitor_support(iface):
         raise RuntimeError('Monitor mode is not supported on this interface.')
     if not set_monitor(iface, True, raise_on_fail=True):
@@ -1360,6 +1727,7 @@ nav button .icon svg { display: block; }
 
 <nav id="main-nav">
   <button class="tab-btn active" data-tab="settings"><span class="icon"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg></span> Settings</button>
+  <button class="tab-btn" data-tab="gateway"><span class="icon"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><line x1="2" y1="12" x2="22" y2="12"></line><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path></svg></span> Gateway</button>
   <button class="tab-btn" data-tab="recon"><span class="icon"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg></span> Recon</button>
   <button class="tab-btn" data-tab="attacks"><span class="icon"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><circle cx="12" cy="12" r="6"></circle><circle cx="12" cy="12" r="2"></circle></svg></span> Attacks</button>
   <button class="tab-btn" data-tab="monitor"><span class="icon"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg></span> Monitor</button>
@@ -1396,6 +1764,51 @@ nav button .icon svg { display: block; }
         <polyline id="bw-spark-tx" points=""></polyline>
       </svg>
       <div class="empty" id="bw-empty">Set an interface above to see live throughput.</div>
+    </div>
+  </div>
+
+  <div id="tab-gateway" class="tab-content">
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; flex-wrap:wrap; gap:8px;">
+        <h2 style="margin:0;">Privacy DNS stack</h2>
+        <span id="gw-dns-badges"></span>
+      </div>
+      <p class="sub">Unbound (DNSSEC, port 5335) forwards to DNSCrypt-proxy (encrypted upstream + ad/tracker/malware blocklist). Self-contained — no dependency on any pre-existing setup.</p>
+      <div class="row">
+        <button class="btn" onclick="startGatewayDns()">Start DNS stack</button>
+        <button class="btn secondary" onclick="stopGatewayDns()">Stop</button>
+        <button class="btn secondary" onclick="updateGatewayBlocklist()">Update blocklist</button>
+        <button class="btn secondary" onclick="testGatewayDns()">Test resolution</button>
+      </div>
+      <div id="gw-dns-status" class="status-message">Blocklist: 0 domain(s) loaded.</div>
+      <div id="gw-dns-test-result"></div>
+    </div>
+    <div class="card">
+      <h2>VPN</h2>
+      <p class="sub">Detects an active WireGuard, OpenVPN, or Cloudflare tunnel. GodHand doesn't provision VPN credentials for you — set one up separately and it'll show as active here.</p>
+      <div id="gw-vpn-status" class="status-message">Checking...</div>
+    </div>
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; flex-wrap:wrap; gap:8px;">
+        <h2 style="margin:0;">Network-wide proxy</h2>
+        <span id="gw-proxy-badge"></span>
+      </div>
+      <p class="sub">An HTTP/HTTPS proxy other devices on your LAN can point to.</p>
+      <div class="row">
+        <button class="btn" onclick="startGatewayProxy()">Start proxy</button>
+        <button class="btn secondary" onclick="stopGatewayProxy()">Stop</button>
+      </div>
+      <div id="gw-proxy-status" class="status-message">Not running.</div>
+    </div>
+    <div class="card">
+      <h2>Configure other devices</h2>
+      <p class="sub">Point devices on your network at this host to route them through the stack above — no router admin access required.</p>
+      <div class="status-message">
+        <div>Local IP: <strong id="gw-local-ip">—</strong></div>
+        <div>External IP: <strong id="gw-external-ip">—</strong></div>
+        <div>DNS server: <strong id="gw-dns-target">—</strong></div>
+        <div>HTTP proxy: <strong id="gw-proxy-target">—</strong></div>
+      </div>
     </div>
   </div>
 
@@ -1464,6 +1877,7 @@ nav button .icon svg { display: block; }
         <div class="weapon-btn" data-w="4"><span class="num">4</span><span class="label">DHCP Storm</span></div>
         <div class="weapon-btn" data-w="5"><span class="num">5</span><span class="label">Traffic Capture</span></div>
       </div>
+      <div id="deauth-capability" class="status-message">Deauth method: checking...</div>
       <div style="display:flex; gap:10px; flex-wrap:wrap;">
         <button class="btn big" id="start-btn" onclick="confirmStartAttack()">▶ Start</button>
         <button class="btn big secondary" id="stop-btn" onclick="confirmStopAttack()" disabled>⏹ Stop</button>
@@ -1653,6 +2067,7 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
     btn.classList.add('active');
     document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+    if (btn.dataset.tab === 'attacks') refreshDeauthCapability();
   });
 });
 
@@ -1749,6 +2164,80 @@ async function pollBandwidth() {
   } catch(e) {}
 }
 
+// Gateway: DNS/VPN/proxy
+async function refreshGatewayStatus() {
+  try {
+    const res = await apiCall('gateway/status');
+    if (!res.success) return;
+    document.getElementById('gw-local-ip').textContent = res.local_ip;
+    document.getElementById('gw-external-ip').textContent = res.external_ip;
+    document.getElementById('gw-dns-target').textContent = res.local_ip + ':' + 5335;
+    document.getElementById('gw-proxy-target').textContent = res.local_ip + ':' + res.proxy.port;
+
+    document.getElementById('gw-dns-badges').innerHTML = `
+      <span class="badge ${res.dns.unbound ? 'success' : 'danger'}">Unbound ${res.dns.unbound ? 'up' : 'down'}</span>
+      <span class="badge ${res.dns.dnscrypt ? 'success' : 'danger'}">DNSCrypt-proxy ${res.dns.dnscrypt ? 'up' : 'down'}</span>
+    `;
+    document.getElementById('gw-dns-status').textContent = `Blocklist: ${res.dns.blocklist_domains} domain(s) loaded.`;
+
+    const vpnBox = document.getElementById('gw-vpn-status');
+    if (res.vpn.active) {
+      const which = res.vpn.wireguard ? 'WireGuard' : res.vpn.openvpn ? 'OpenVPN' : 'Cloudflare';
+      vpnBox.innerHTML = `<span class="badge success">Active</span> ${which} tunnel detected — full-tunnel privacy.`;
+    } else {
+      vpnBox.innerHTML = `<span class="badge warning">Not detected</span> DNS is private, but your IP is still visible to sites you visit.`;
+    }
+
+    document.getElementById('gw-proxy-badge').innerHTML =
+      `<span class="badge ${res.proxy.tinyproxy ? 'success' : 'danger'}">${res.proxy.tinyproxy ? 'Running' : 'Stopped'}</span>`;
+    document.getElementById('gw-proxy-status').textContent = res.proxy.tinyproxy
+      ? `Running on port ${res.proxy.port}. Point other devices' HTTP proxy at ${res.local_ip}:${res.proxy.port}.`
+      : 'Not running.';
+  } catch(e) {}
+}
+async function startGatewayDns() {
+  showToast('Starting DNS privacy stack...', 'success');
+  const res = await apiCall('gateway/dns/start', 'POST');
+  showToast(res.status || res.error, res.success ? 'success' : 'error');
+  refreshGatewayStatus();
+}
+async function stopGatewayDns() {
+  const res = await apiCall('gateway/dns/stop', 'POST');
+  showToast(res.status, 'success');
+  refreshGatewayStatus();
+}
+async function updateGatewayBlocklist() {
+  showToast('Fetching blocklist...', 'success');
+  const res = await apiCall('gateway/dns/update_blocklist', 'POST');
+  showToast(res.success ? `Blocklist updated: ${res.count} domains` : 'Blocklist update failed', res.success ? 'success' : 'error');
+  refreshGatewayStatus();
+}
+async function testGatewayDns() {
+  const box = document.getElementById('gw-dns-test-result');
+  box.innerHTML = '<span class="spinner"></span> Testing...';
+  const res = await apiCall('gateway/dns/test');
+  const rows = Object.entries(res.results).map(([domain, r]) => {
+    const label = r.error ? `error: ${r.error}` : (r.blocked ? 'blocked' : 'resolved');
+    const mark = !r.error && r.ok ? '✓' : '✗ unexpected';
+    return `
+      <div class="log-entry ${!r.error && r.ok ? 'success' : 'error'}">
+        <span class="msg">${domain}: ${label} ${mark}</span>
+      </div>
+    `;
+  }).join('');
+  box.innerHTML = `<div class="log-container">${rows}</div>`;
+}
+async function startGatewayProxy() {
+  const res = await apiCall('gateway/proxy/start', 'POST');
+  showToast(res.status || res.error, res.success ? 'success' : 'error');
+  refreshGatewayStatus();
+}
+async function stopGatewayProxy() {
+  const res = await apiCall('gateway/proxy/stop', 'POST');
+  showToast(res.status, 'success');
+  refreshGatewayStatus();
+}
+
 // Poll attack status
 async function pollAttackStatus() {
   try {
@@ -1805,6 +2294,30 @@ async function setInterface() {
   const res = await apiCall('set_interface', 'POST', { interface: iface });
   showToast(res.status, res.success ? 'success' : 'error');
   checkPrerequisites();
+  refreshDeauthCapability();
+}
+
+// Honest deauth capability: native (own AP, no monitor mode) vs monitor mode vs unavailable.
+// Deliberately not on a recurring timer -- checking monitor support can itself
+// briefly flip interface mode, so this only runs on the Attacks tab and after
+// the interface changes, not in the background.
+async function refreshDeauthCapability() {
+  const box = document.getElementById('deauth-capability');
+  if (!box) return;
+  try {
+    const res = await apiCall('deauth_capability');
+    if (!res.success) {
+      box.textContent = 'Deauth method: ' + (res.error || 'unknown');
+      return;
+    }
+    if (res.method === 'native') {
+      box.innerHTML = `<span class="badge success">Native</span> ${res.iface_type} interface is your own access point — Kick / Deauth Flood use the kernel's station-del, no monitor mode. ${res.ap_station_count} station(s) currently associated.`;
+    } else if (res.method === 'monitor') {
+      box.innerHTML = `<span class="badge warning">Monitor mode</span> Interface is ${res.iface_type} — Kick / Deauth Flood will switch it to monitor mode and use frame injection.`;
+    } else {
+      box.innerHTML = `<span class="badge danger">Unavailable</span> Interface is ${res.iface_type} and doesn't support monitor mode — Kick / Deauth Flood can't function on this hardware.`;
+    }
+  } catch(e) {}
 }
 async function setGateway() {
   const gw = document.getElementById('gateway-input').value.trim();
@@ -2202,10 +2715,12 @@ pollLogs();
 pollAttackStatus();
 pollTrafficCapture();
 pollBandwidth();
+refreshGatewayStatus();
 setInterval(pollLogs, 2000);
 setInterval(pollAttackStatus, 2000);
 setInterval(pollTrafficCapture, 1500);
 setInterval(pollBandwidth, 2000);
+setInterval(refreshGatewayStatus, 4000);
 </script>
 </body>
 </html>
@@ -2445,6 +2960,64 @@ def api_bandwidth():
     tx_bps = max(0, (tx_bytes - prev['tx']) / dt)
     return jsonify({'success': True, 'iface': iface, 'rx_bps': rx_bps, 'tx_bps': tx_bps, 'rx_total': rx_bytes, 'tx_total': tx_bytes})
 
+@app.route('/api/gateway/status', methods=['GET'])
+@require_auth
+def api_gateway_status():
+    return jsonify({
+        'success': True,
+        'local_ip': get_local_ip(),
+        'external_ip': get_external_ip(),
+        'dns': gateway_dns_status(),
+        'vpn': gateway_vpn_status(),
+        'proxy': gateway_proxy_status(),
+    })
+
+@app.route('/api/gateway/dns/start', methods=['POST'])
+@require_auth
+def api_gateway_dns_start():
+    try:
+        start_gateway_dns()
+        return jsonify({'success': True, 'status': 'DNS privacy stack started'})
+    except Exception as e:
+        add_log('error', f'Gateway DNS start failed: {e}')
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/gateway/dns/stop', methods=['POST'])
+@require_auth
+def api_gateway_dns_stop():
+    stop_gateway_dns()
+    return jsonify({'success': True, 'status': 'DNS privacy stack stopped'})
+
+@app.route('/api/gateway/dns/update_blocklist', methods=['POST'])
+@require_auth
+def api_gateway_update_blocklist():
+    add_log('info', 'Updating gateway blocklist...')
+    domains = fetch_blocklist_domains()
+    write_gateway_configs(domains)
+    add_log('success', f'Blocklist updated: {len(domains)} domains')
+    return jsonify({'success': True, 'count': len(domains)})
+
+@app.route('/api/gateway/dns/test', methods=['GET'])
+@require_auth
+def api_gateway_dns_test():
+    return jsonify({'success': True, 'results': test_gateway_dns()})
+
+@app.route('/api/gateway/proxy/start', methods=['POST'])
+@require_auth
+def api_gateway_proxy_start():
+    try:
+        start_gateway_proxy()
+        return jsonify({'success': True, 'status': f'Proxy started on port {GW_PROXY_PORT}'})
+    except Exception as e:
+        add_log('error', f'Gateway proxy start failed: {e}')
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/gateway/proxy/stop', methods=['POST'])
+@require_auth
+def api_gateway_proxy_stop():
+    stop_gateway_proxy()
+    return jsonify({'success': True, 'status': 'Proxy stopped'})
+
 @app.route('/api/check_reachability', methods=['GET'])
 @require_auth
 def api_check_reachability():
@@ -2455,6 +3028,14 @@ def api_check_reachability():
     reachable = server_ping(ip)
     latency = int((time.time() - start) * 1000) if reachable else None
     return jsonify({'reachable': reachable, 'latency': latency})
+
+@app.route('/api/deauth_capability', methods=['GET'])
+@require_auth
+def api_deauth_capability():
+    iface = get_state('interface')
+    if not iface:
+        return jsonify({'success': False, 'error': 'Interface not set'})
+    return jsonify({'success': True, **deauth_capability(iface)})
 
 @app.route('/api/kick', methods=['POST'])
 @require_auth
