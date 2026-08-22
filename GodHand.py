@@ -6495,6 +6495,106 @@ def api_dev_console():
 
     return jsonify(results)
 
+# ---------- Phase 1.4: Traffic Inspection Layer REST API ----------
+@app.route('/api/https_traffic/start', methods=['POST'])
+@require_auth
+def api_https_traffic_start():
+    """Start HTTPS interception proxy (Phase 1.4)."""
+    global HTTPS_PROXY
+
+    if not HTTPS_PROXY:
+        return jsonify({'success': False, 'error': 'HTTPS proxy not initialized'})
+
+    if HTTPS_PROXY.running:
+        return jsonify({'success': True, 'status': 'already running'})
+
+    try:
+        HTTPS_PROXY.start()
+        add_log('success', 'HTTPS interception proxy started on port 8888')
+        return jsonify({'success': True, 'status': 'started', 'port': 8888})
+    except Exception as e:
+        error_msg = f'Failed to start HTTPS proxy: {str(e)}'
+        add_log('error', error_msg)
+        return jsonify({'success': False, 'error': error_msg}), 500
+
+@app.route('/api/https_traffic/stop', methods=['POST'])
+@require_auth
+def api_https_traffic_stop():
+    """Stop HTTPS interception proxy (Phase 1.4)."""
+    global HTTPS_PROXY
+
+    if not HTTPS_PROXY:
+        return jsonify({'success': False, 'error': 'HTTPS proxy not initialized'})
+
+    if not HTTPS_PROXY.running:
+        return jsonify({'success': True, 'status': 'not running'})
+
+    try:
+        HTTPS_PROXY.stop()
+        add_log('success', 'HTTPS interception proxy stopped')
+        return jsonify({'success': True, 'status': 'stopped'})
+    except Exception as e:
+        error_msg = f'Failed to stop HTTPS proxy: {str(e)}'
+        add_log('error', error_msg)
+        return jsonify({'success': False, 'error': error_msg}), 500
+
+@app.route('/api/https_traffic', methods=['GET'])
+@require_auth
+def api_https_traffic():
+    """Get HTTPS traffic log entries (Phase 1.4).
+
+    Query parameters:
+    - limit: Max entries to return (default 100, max 1000)
+    - hostname_filter: Filter by hostname (substring match)
+    - method_filter: Filter by HTTP method (GET, POST, etc.)
+    - status_filter: Filter by HTTP status code
+
+    Returns:
+        JSON array of traffic entries with fields:
+        - timestamp: ISO 8601 datetime of request
+        - type: 'request' or 'response'
+        - client_ip: Source device IP
+        - hostname: Target hostname (SNI)
+        - method: HTTP method (requests only)
+        - path: Request path (requests only)
+        - status: HTTP status code (responses only)
+        - bytes: Response size in bytes
+    """
+    global HTTPS_PROXY
+
+    if not HTTPS_PROXY:
+        return jsonify({'success': False, 'error': 'HTTPS proxy not initialized', 'entries': []})
+
+    try:
+        limit = min(int(request.args.get('limit', 100)), 1000)
+    except ValueError:
+        limit = 100
+
+    hostname_filter = request.args.get('hostname_filter', '').lower()
+    method_filter = request.args.get('method_filter', '').upper()
+    status_filter = request.args.get('status_filter', '')
+
+    entries = HTTPS_PROXY.get_traffic_log(limit=limit*2)  # Get extra to filter
+
+    # Apply filters
+    filtered = []
+    for entry in entries:
+        if hostname_filter and hostname_filter not in entry.get('hostname', '').lower():
+            continue
+        if method_filter and entry.get('method', '') != method_filter:
+            continue
+        if status_filter and str(entry.get('status', '')) != status_filter:
+            continue
+        filtered.append(entry)
+
+    # Return most recent entries up to limit
+    return jsonify({
+        'success': True,
+        'count': len(filtered),
+        'entries': filtered[:limit],
+        'proxy_running': HTTPS_PROXY.running
+    })
+
 # ---------- bootstrap ----------
 if __name__ == '__main__':
     if os.geteuid() != 0:
