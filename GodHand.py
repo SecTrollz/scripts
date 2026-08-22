@@ -764,7 +764,8 @@ class HTTPManipulator:
                 chunk_end = chunk_start + chunk_size
                 result += data[chunk_start:chunk_end]
                 data = data[chunk_end + 2:]
-            except:
+            except Exception as e:
+                add_log('warn', f'Error decoding chunked transfer encoding at offset {len(result)}: {e}')
                 break
         return result
 
@@ -798,8 +799,8 @@ class HTTPManipulator:
             if headers.get('content-encoding', '').lower() == 'gzip':
                 try:
                     body = gzip.decompress(body)
-                except:
-                    pass
+                except Exception as e:
+                    add_log('warn', f'Failed to decompress gzip body ({len(body)} bytes): {e}')
 
             return {
                 'status_line': status_line,
@@ -946,8 +947,10 @@ class UnlockQueryDetector:
                 device_info['serial'] = data.get('device_id') or data.get('serial') or data.get('device_serial')
                 device_info['carrier'] = data.get('carrier_name') or data.get('carrier')
                 device_info['device_model'] = data.get('device_model') or data.get('model')
-        except:
-            pass
+                if any(device_info.values()):
+                    add_log('dev', f'Extracted device info: IMEI={device_info.get("imei")}, Serial={device_info.get("serial")}, Carrier={device_info.get("carrier")}')
+        except Exception as e:
+            add_log('dev', f'Failed to parse device info from query body: {e}')
 
         return device_info
 
@@ -1358,13 +1361,15 @@ class HTTPSInterceptProxy:
         finally:
             try:
                 client_socket.close()
-            except:
-                pass
+                add_log('dev', f'Closed client socket from {client_addr[0]}')
+            except Exception as e:
+                add_log('warn', f'Error closing client socket: {e}')
             if upstream_socket:
                 try:
                     upstream_socket.close()
-                except:
-                    pass
+                    add_log('dev', 'Closed upstream socket')
+                except Exception as e:
+                    add_log('warn', f'Error closing upstream socket: {e}')
 
     def _forward_traffic(self, client_tls, upstream_tls, hostname: str, client_ip: str):
         """Forward traffic between client and upstream server.
@@ -2212,8 +2217,8 @@ def get_my_ip_and_cidr(iface):
                 parts = line.split()
                 ip_cidr = parts[3]
                 return ip_cidr.split('/')
-    except:
-        pass
+    except Exception as e:
+        add_log('warn', f'Failed to get IP/CIDR for interface {iface}: {e}')
     return ('0.0.0.0', '24')
 
 def get_mac(iface):
@@ -2221,8 +2226,11 @@ def get_mac(iface):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         info = fcntl.ioctl(s.fileno(), 0x8927, struct.pack('256s', iface[:15].encode()))
         s.close()
-        return info[18:24].hex(':')
-    except:
+        mac = info[18:24].hex(':')
+        add_log('dev', f'Retrieved MAC address for {iface}: {mac}')
+        return mac
+    except Exception as e:
+        add_log('warn', f'Failed to get MAC address for {iface}: {e}')
         return '00:00:00:00:00:00'
 
 # ---------- custom socket proxy layer with fallback chain ----------
