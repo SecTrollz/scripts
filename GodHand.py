@@ -34,6 +34,7 @@ import csv
 import ssl
 import gzip
 import fnmatch
+import signal
 from functools import wraps
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
@@ -2888,6 +2889,202 @@ def verify_capabilities_on_startup():
 
     if not caps['has_cap_net_admin']:
         add_log('warn', 'CAP_NET_ADMIN not available; iptables/routing will not work')
+
+# ---------- Process group management (Phase 6: Subprocess Isolation) ----------
+class ProcessGroup:
+    """Manages subprocess lifecycle with resource limits, automatic cleanup, and graceful restart."""
+
+    def __init__(self, name, max_processes=10, timeout_sec=300, memory_limit_mb=None, cpu_limit_percent=None):
+        self.name = name
+        self.max_processes = max_processes
+        self.timeout_sec = timeout_sec
+        self.memory_limit_mb = memory_limit_mb
+        self.cpu_limit_percent = cpu_limit_percent
+        self.processes = []  # List of (proc, start_time, description)
+        self.lock = threading.RLock()
+
+    def spawn(self, cmd, shell=False, description=""):
+        """Spawn subprocess with automatic cleanup on completion."""
+        with self.lock:
+            # Cleanup zombies before spawning new process
+            self._reap_zombies()
+
+            # Check process limit
+            if len(self.processes) >= self.max_processes:
+                add_log('warn', f'ProcessGroup {self.name}: max_processes ({self.max_processes}) reached')
+                return None
+
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    shell=shell,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    preexec_fn=os.setsid if not shell else None,  # Create process group
+                    text=True
+                )
+
+                start_time = time.time()
+                self.processes.append((proc, start_time, description))
+                add_log('dev', f'ProcessGroup {self.name}: spawned {description} (pid={proc.pid})')
+
+                # Spawn reaper daemon thread for this process
+                reaper_thread = threading.Thread(
+                    target=self._reap_process,
+                    args=(proc, start_time, description),
+                    daemon=True
+                )
+                reaper_thread.start()
+
+                return proc
+            except Exception as e:
+                add_log('error', f'ProcessGroup {self.name}: spawn failed for {description}: {e}')
+                return None
+
+    def _reap_process(self, proc, start_time, description):
+        """Reap a single process after timeout or completion."""
+        try:
+            # Wait for process with timeout
+            if proc.wait(timeout=self.timeout_sec) is None:
+                pass  # Process exited normally
+        except subprocess.TimeoutExpired:
+            add_log('warn', f'ProcessGroup {self.name}: {description} (pid={proc.pid}) timeout after {self.timeout_sec}s, terminating')
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                proc.wait(timeout=2)
+            except:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except:
+                    pass
+        except Exception as e:
+            add_log('warn', f'ProcessGroup {self.name}: reap_process error for {description}: {e}')
+        finally:
+            # Remove from process list
+            with self.lock:
+                self.processes = [(p, t, d) for p, t, d in self.processes if p.pid != proc.pid]
+
+    def _reap_zombies(self):
+        """Clean up zombie processes (call with lock held)."""
+        remaining = []
+        for proc, start_time, description in self.processes:
+            if proc.poll() is None:
+                # Still running
+                remaining.append((proc, start_time, description))
+            else:
+                # Exited, already reaped by wait()
+                add_log('dev', f'ProcessGroup {self.name}: reaped {description} (pid={proc.pid}, runtime={time.time()-start_time:.1f}s)')
+
+        self.processes = remaining
+
+    def terminate_all(self, graceful_timeout=2):
+        """Terminate all processes in group (non-blocking)."""
+        with self.lock:
+            if not self.processes:
+                return
+
+            pids_to_kill = [proc.pid for proc, _, _ in self.processes]
+            add_log('info', f'ProcessGroup {self.name}: terminating {len(pids_to_kill)} processes')
+
+            # Spawn async termination thread (non-blocking)
+            terminator = threading.Thread(
+                target=self._terminate_async,
+                args=(pids_to_kill, graceful_timeout),
+                daemon=True
+            )
+            terminator.start()
+
+    def _terminate_async(self, pids_to_kill, graceful_timeout):
+        """Terminate processes asynchronously (runs in daemon thread)."""
+        try:
+            # First pass: SIGTERM
+            for pid in pids_to_kill:
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGTERM)
+                except (ProcessLookupError, OSError):
+                    pass
+
+            # Wait for graceful termination
+            time.sleep(graceful_timeout)
+
+            # Second pass: SIGKILL for stragglers
+            for pid in pids_to_kill:
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass
+
+            # Reap the processes
+            time.sleep(0.1)
+            with self.lock:
+                self._reap_zombies()
+
+            add_log('info', f'ProcessGroup {self.name}: all processes terminated')
+        except Exception as e:
+            add_log('error', f'ProcessGroup {self.name}: error during termination: {e}')
+
+    def get_status(self):
+        """Get status of all processes in group."""
+        with self.lock:
+            self._reap_zombies()
+            status = {
+                'name': self.name,
+                'total': len(self.processes),
+                'processes': [
+                    {
+                        'pid': proc.pid,
+                        'description': desc,
+                        'runtime_sec': time.time() - start_time,
+                        'alive': proc.poll() is None
+                    }
+                    for proc, start_time, desc in self.processes
+                ]
+            }
+            return status
+
+    def is_running(self):
+        """Check if any processes are still running."""
+        with self.lock:
+            self._reap_zombies()
+            return len(self.processes) > 0
+
+# Global process groups for attack management
+attack_process_groups = {
+    'arp_spoofing': ProcessGroup('arp_spoofing', max_processes=20, timeout_sec=600),
+    'traffic_capture': ProcessGroup('traffic_capture', max_processes=10, timeout_sec=1800),
+    'deauth': ProcessGroup('deauth', max_processes=30, timeout_sec=300),
+    'dns_spoof': ProcessGroup('dns_spoof', max_processes=10, timeout_sec=900),
+    'gateway': ProcessGroup('gateway', max_processes=5, timeout_sec=3600),
+}
+
+def spawn_attack_process(group_name, cmd, weapon_id=None, shell=False, description=""):
+    """Spawn subprocess through ProcessGroup and optionally track in attack_pids.
+
+    Args:
+        group_name: Name of ProcessGroup ('arp_spoofing', 'traffic_capture', etc.)
+        cmd: Command to run (string if shell=True, list otherwise)
+        weapon_id: Optional weapon ID to track in STATE['attack_pids'] for stop control
+        shell: Whether to run via shell
+        description: Description for logging
+
+    Returns:
+        Subprocess handle, or None if spawn failed
+    """
+    if group_name not in attack_process_groups:
+        add_log('error', f'Unknown process group: {group_name}')
+        return None
+
+    group = attack_process_groups[group_name]
+    proc = group.spawn(cmd, shell=shell, description=description)
+
+    # Track in attack_pids if weapon_id provided (for existing stop control)
+    if proc and weapon_id is not None:
+        with STATE_LOCK:
+            if weapon_id not in STATE['attack_pids']:
+                STATE['attack_pids'][weapon_id] = []
+            STATE['attack_pids'][weapon_id].append(proc)
+
+    return proc
 
 # ---------- Python DNS forwarder (Unbound fallback) ----------
 class PythonDNSForwarder:
@@ -8920,6 +9117,26 @@ def api_capabilities_restore():
         'message': 'Attempted to restore CAP_NET_RAW capability',
         'capabilities': caps
     })
+
+@app.route('/api/process_groups/status', methods=['GET'])
+@require_auth
+def api_process_groups_status():
+    """Get status of all attack process groups."""
+    status = {}
+    for group_name, group in attack_process_groups.items():
+        status[group_name] = group.get_status()
+    return jsonify({'success': True, 'process_groups': status})
+
+@app.route('/api/process_groups/<group_name>/terminate', methods=['POST'])
+@require_auth
+def api_process_groups_terminate(group_name):
+    """Terminate all processes in a group (non-blocking)."""
+    if group_name not in attack_process_groups:
+        return jsonify({'success': False, 'error': f'Unknown process group: {group_name}'}), 400
+
+    group = attack_process_groups[group_name]
+    group.terminate_all()
+    return jsonify({'success': True, 'message': f'Termination initiated for {group_name}'})
 
 @app.route('/api/https_injection/rules', methods=['GET'])
 @require_auth
