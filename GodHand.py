@@ -114,7 +114,8 @@ STATE = {
     },
     'ngrok_proc': None,
     'log': [],
-    'status': 'Ready'
+    'status': 'Ready',
+    'lan_domains': ['pac.installCA.lan'],  # Domains resolved to local IP for .lan hijacking
 }
 STATE_LOCK = threading.Lock()
 
@@ -1462,8 +1463,11 @@ def fetch_blocklist_domains():
         add_log('warn', f'Blocklist fetch failed, using built-in list: {e}')
         return list(DEFAULT_BLOCKED_DOMAINS)
 
-def write_gateway_configs(domains):
+def write_gateway_configs(domains, lan_domains=None):
     os.makedirs(GATEWAY_DIR, exist_ok=True)
+    if lan_domains is None:
+        lan_domains = ['pac.installCA.lan']
+
     with open(GW_BLOCKLIST_CONF, 'w') as f:
         for d in domains:
             f.write(f'local-zone: "{d}." always_nxdomain\n')
@@ -1489,6 +1493,18 @@ def write_gateway_configs(domains):
     with open(GW_DNSCRYPT_CONF, 'w') as f:
         f.write(dnscrypt_toml)
 
+    # Get local device IP for .lan domain resolution
+    local_ip = get_local_ip()
+
+    # Build local-zone entries for .lan domains
+    lan_zones = []
+    for lan_domain in lan_domains:
+        lan_zones.append(f'            local-zone: "{lan_domain}." static')
+        lan_zones.append(f'            local-data: "{lan_domain}. 300 IN A {local_ip}"')
+        lan_zones.append(f'            local-data-ptr: "{local_ip} 300 IN PTR {lan_domain}."')
+
+    lan_zones_str = '\n'.join(lan_zones) if lan_zones else ''
+
     unbound_conf = textwrap.dedent(f"""\
         server:
             interface: 0.0.0.0@{GW_DNS_PORT}
@@ -1509,6 +1525,7 @@ def write_gateway_configs(domains):
             pidfile: "{GATEWAY_DIR}/unbound.pid"
             logfile: "{GATEWAY_DIR}/unbound.log"
             include: "{GW_BLOCKLIST_CONF}"
+        {lan_zones_str}
         forward-zone:
             name: "."
             forward-addr: 127.0.0.1@{GW_DNSCRYPT_PORT}
@@ -1534,7 +1551,9 @@ def start_gateway_dns():
     if not ensure_tool('unbound'):
         raise RuntimeError('unbound could not be installed')
     if not os.path.exists(GW_BLOCKLIST_CONF):
-        write_gateway_configs(list(DEFAULT_BLOCKED_DOMAINS))
+        with STATE_LOCK:
+            lan_domains = STATE.get('lan_domains', ['pac.installCA.lan'])
+        write_gateway_configs(list(DEFAULT_BLOCKED_DOMAINS), lan_domains=lan_domains)
     stop_proc('dnscrypt-proxy')
     stop_proc('unbound')
     time.sleep(0.3)
@@ -6240,6 +6259,59 @@ def api_gateway_update_blocklist():
 @require_auth
 def api_gateway_dns_test():
     return jsonify({'success': True, 'results': test_gateway_dns()})
+
+@app.route('/api/gateway/dns/lan_domains', methods=['GET'])
+@require_auth
+def api_gateway_list_lan_domains():
+    with STATE_LOCK:
+        lan_domains = list(STATE.get('lan_domains', ['pac.installCA.lan']))
+    return jsonify({'success': True, 'lan_domains': lan_domains})
+
+@app.route('/api/gateway/dns/add_lan_domain', methods=['POST'])
+@require_auth
+def api_gateway_add_lan_domain():
+    data = request.json
+    domain = data.get('domain', '').strip()
+    if not domain:
+        return jsonify({'success': False, 'error': 'Domain required'})
+    if not domain.endswith('.lan'):
+        return jsonify({'success': False, 'error': 'Domain must end with .lan'})
+
+    with STATE_LOCK:
+        if domain not in STATE['lan_domains']:
+            STATE['lan_domains'].append(domain)
+        lan_domains = list(STATE['lan_domains'])
+
+    # Regenerate gateway configs with new domains
+    try:
+        write_gateway_configs(list(DEFAULT_BLOCKED_DOMAINS), lan_domains=lan_domains)
+        add_log('info', f'Added .lan domain: {domain}')
+        return jsonify({'success': True, 'lan_domains': lan_domains})
+    except Exception as e:
+        add_log('error', f'Failed to add .lan domain: {e}')
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/gateway/dns/remove_lan_domain', methods=['POST'])
+@require_auth
+def api_gateway_remove_lan_domain():
+    data = request.json
+    domain = data.get('domain', '').strip()
+    if not domain:
+        return jsonify({'success': False, 'error': 'Domain required'})
+
+    with STATE_LOCK:
+        if domain in STATE['lan_domains']:
+            STATE['lan_domains'].remove(domain)
+        lan_domains = list(STATE['lan_domains'])
+
+    # Regenerate gateway configs without the removed domain
+    try:
+        write_gateway_configs(list(DEFAULT_BLOCKED_DOMAINS), lan_domains=lan_domains)
+        add_log('info', f'Removed .lan domain: {domain}')
+        return jsonify({'success': True, 'lan_domains': lan_domains})
+    except Exception as e:
+        add_log('error', f'Failed to remove .lan domain: {e}')
+        return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/api/gateway/proxy/start', methods=['POST'])
 @require_auth
