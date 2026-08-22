@@ -2046,7 +2046,11 @@ def arp_scan(iface, my_ip, cidr):
     MAX_SCAN_HOSTS = 4096
     hosts = []
     for h in net.hosts():
-        hosts.append(str(h))
+        ip_str = str(h)
+        # CRITICAL: Skip the device's own IP - don't ARP scan yourself
+        if ip_str == my_ip:
+            continue
+        hosts.append(ip_str)
         if len(hosts) >= MAX_SCAN_HOSTS:
             add_log('warn', f'ARP scan capped at {MAX_SCAN_HOSTS} hosts (network {net} is larger); scan the subnet directly for full coverage')
             break
