@@ -1650,6 +1650,143 @@ def reassemble_tcp_streams(entries=None):
     results.sort(key=lambda r: -r['total_bytes'])
     return results
 
+def start_network_port_monitor(port, iface):
+    """Monitor ALL network traffic on a specific port (network-wide listening).
+
+    Unlike start_attack_monitor which filters by specific target IPs, this
+    monitors the entire network for any device using the given port.
+
+    Captures both directions: devices connecting TO that port (server listening)
+    and devices connecting FROM that port (client source port).
+
+    Returns process ID for monitoring.
+    """
+    add_log('info', f'Starting Network-Wide Port Monitor on {iface}:{port}')
+    with STATE_LOCK:
+        STATE['port_monitor_entries'] = []
+
+    tmpdir = tempfile.gettempdir()
+    log_path = os.path.join(tmpdir, f"godhand_port_monitor_{port}_{int(time.time())}.log")
+
+    script = textwrap.dedent(f"""
+        import socket, struct, select, time, sys, json
+        IFACE = '{iface}'
+        PORT = {port}
+        PROTO_NAMES = {{6: 'tcp', 17: 'udp', 1: 'icmp'}}
+
+        # Track devices and connections on this port
+        devices = {{}}  # {{(src_ip, dst_ip): {{'proto': 'tcp', 'packets': N, 'bytes': B, 'last_seen': time}}}}
+
+        sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
+        sock.bind((IFACE, 0))
+        sock.setblocking(0)
+
+        print(f"Port Monitor: Listening for all traffic on port {{PORT}}", file=sys.stderr)
+        pkt_no = 0
+        start_time = time.time()
+
+        while True:
+            r, _, _ = select.select([sock], [], [], 0.5)
+            if not r:
+                # Every 2 seconds, print statistics
+                if pkt_no % 20 == 0:
+                    now = time.time()
+                    elapsed = now - start_time
+                    if elapsed > 0 and devices:
+                        print(f"[{{\int(elapsed)}}s] {{len(devices)}} devices, {{sum(d['packets'] for d in devices.values())}} packets", file=sys.stderr)
+                continue
+
+            try:
+                data = sock.recvfrom(65535)[0]
+                if len(data) < 38:
+                    continue
+
+                # Parse IP header
+                if struct.unpack('!H', data[12:14])[0] != 0x0800:
+                    continue  # Not IPv4
+
+                proto = data[23]
+                if proto not in (6, 17, 1):  # Not TCP, UDP, or ICMP
+                    continue
+
+                src_ip = socket.inet_ntoa(data[26:30])
+                dst_ip = socket.inet_ntoa(data[30:34])
+
+                # Parse ports (TCP/UDP only)
+                src_port = None
+                dst_port = None
+
+                if proto in (6, 17) and len(data) >= 42:  # TCP or UDP
+                    src_port, dst_port = struct.unpack('!HH', data[34:38])
+
+                # Filter: only packets where source OR destination port matches
+                if not ((src_port == PORT) or (dst_port == PORT)):
+                    continue
+
+                # Track this connection
+                key = (src_ip, dst_ip)
+                proto_name = PROTO_NAMES.get(proto, f'proto_{proto}')
+
+                if key not in devices:
+                    devices[key] = {{
+                        'src_ip': src_ip,
+                        'dst_ip': dst_ip,
+                        'src_port': src_port,
+                        'dst_port': dst_port,
+                        'proto': proto_name,
+                        'packets': 0,
+                        'bytes': 0,
+                        'first_seen': time.time(),
+                        'last_seen': time.time(),
+                        'is_outbound': dst_port == PORT  # True if going TO port
+                    }}
+
+                # Update counters
+                pkt_len = struct.unpack('!H', data[16:18])[0]
+                devices[key]['packets'] += 1
+                devices[key]['bytes'] += pkt_len
+                devices[key]['last_seen'] = time.time()
+
+                pkt_no += 1
+
+                # Log entry for UI
+                entry = {{
+                    'no': pkt_no,
+                    't': time.time(),
+                    'src': src_ip,
+                    'dst': dst_ip,
+                    'src_port': src_port or 'N/A',
+                    'dst_port': dst_port or 'N/A',
+                    'proto': proto_name,
+                    'bytes': pkt_len,
+                    'direction': 'outbound' if dst_port == PORT else 'inbound',
+                    'port': PORT
+                }}
+
+                # Write to log file
+                with open('{log_path}', 'a') as f:
+                    f.write(json.dumps(entry) + '\\n')
+
+            except Exception as e:
+                print(f"Error: {{e}}", file=sys.stderr)
+
+        sock.close()
+    """)
+
+    fd, path = tempfile.mkstemp(suffix='.py')
+    os.close(fd)
+    with open(path, 'w') as f:
+        f.write(script)
+
+    proc = subprocess.Popen(['python3', path], stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+    time.sleep(0.5)
+    if proc.poll() is not None:
+        raise RuntimeError(f'Port monitor process exited immediately')
+
+    threading.Thread(target=lambda: (proc.wait(), os.unlink(path)), daemon=True).start()
+    add_log('info', f'Port monitor started (PID {proc.pid}): listening for all traffic on port {port}')
+    return proc
+
 def start_attack_monitor(targets, port, iface):
     add_log('info', f'Starting Traffic Capture on {iface} for {len(targets)} target(s)')
     if not set_monitor(iface, True, raise_on_fail=False):
@@ -4826,6 +4963,77 @@ def api_start_attack():
         return jsonify({'success': True, 'weapon': weapon_names[weapon]})
     except Exception as e:
         add_log('error', f'Attack start failed: {str(e)}')
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/start_network_port_monitor', methods=['POST'])
+@require_auth
+def api_start_network_port_monitor():
+    """Start network-wide monitoring of a specific port (all devices on LAN).
+
+    Unlike weapon 5 (target-specific traffic capture), this monitors the entire
+    network for ANY device using the specified port.
+
+    Request JSON:
+      - port: Port number to monitor (1-65535)
+      - iface: Network interface (auto-filled from current)
+
+    Returns: {success, message, port, duration_seconds}
+    """
+    data = request.json
+    port = data.get('port')
+
+    if not port or not isinstance(port, int) or port < 1 or port > 65535:
+        return jsonify({'success': False, 'error': 'Invalid port (must be 1-65535)'})
+
+    if not STATE['interface']:
+        return jsonify({'success': False, 'error': 'Interface not set'})
+
+    try:
+        # Stop any existing port monitor
+        if 'port_monitor_pid' in STATE:
+            try:
+                os.kill(STATE['port_monitor_pid'], 9)
+            except:
+                pass
+
+        # Start new network port monitor
+        proc = start_network_port_monitor(port, STATE['interface'])
+        STATE['port_monitor_pid'] = proc.pid
+        STATE['port_monitor_port'] = port
+
+        add_log('success', f'Network Port Monitor started on port {port}')
+        return jsonify({
+            'success': True,
+            'message': f'Monitoring all network traffic on port {port}',
+            'port': port,
+            'interface': STATE['interface'],
+            'pid': proc.pid
+        })
+    except Exception as e:
+        add_log('error', f'Network port monitor failed: {str(e)}')
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/stop_network_port_monitor', methods=['POST'])
+@require_auth
+def api_stop_network_port_monitor():
+    """Stop network-wide port monitoring."""
+    try:
+        if 'port_monitor_pid' in STATE:
+            try:
+                os.kill(STATE['port_monitor_pid'], 9)
+            except:
+                pass
+            del STATE['port_monitor_pid']
+
+        if 'port_monitor_port' in STATE:
+            port = STATE['port_monitor_port']
+            del STATE['port_monitor_port']
+            add_log('info', f'Network port monitor on port {port} stopped')
+        else:
+            add_log('info', 'Network port monitor stopped')
+
+        return jsonify({'success': True, 'message': 'Network port monitor stopped'})
+    except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/api/stop_attack', methods=['POST'])
