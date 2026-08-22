@@ -1256,8 +1256,9 @@ class HTTPSInterceptProxy:
             if upstream_socket:
                 try:
                     upstream_socket.close()
-                except:
-                    pass
+                    add_log('dev', 'Closed upstream socket')
+                except Exception as e:
+                    add_log('warn', f'Error closing upstream socket: {e}')
 
         return True
 
@@ -2159,14 +2160,15 @@ def install_package(pkg_name):
 
         cmd = list(pm) + [pkg]
         try:
-            add_log('info', f'Installing {pkg} ...')
+            add_log('info', f'Installing {pkg_name} via {pm[0]} (package: {pkg})...')
             subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if tool_exists(pkg):
                 _INSTALLED_TOOLS.add(pkg_name)
-                add_log('success', f'{pkg_name} installed via {pkg}')
+                add_log('success', f'{pkg_name} installed via {pm[0]} successfully')
                 return True
-        except:
-            add_log('info', f'Failed to install {pkg}, trying alternatives...')
+            add_log('warn', f'Installation completed but {pkg} not found in PATH')
+        except Exception as e:
+            add_log('dev', f'Failed to install {pkg_name} via {pm[0]}: {e} (trying alternatives...)')
             continue
 
     add_log('error', f'Failed to install {pkg_name} (tried: {", ".join(packages_to_try)})')
@@ -2177,9 +2179,15 @@ def tool_exists(name):
     try:
         out = subprocess.check_output(['which', name], stderr=subprocess.DEVNULL, text=True).strip()
         if not out:
+            add_log('dev', f'Tool not found in PATH: {name}')
             return False
-        return os.access(out, os.X_OK)
-    except:
+        if os.access(out, os.X_OK):
+            add_log('dev', f'Tool found and executable: {name} at {out}')
+            return True
+        add_log('warn', f'Tool found but not executable: {name} at {out}')
+        return False
+    except Exception as e:
+        add_log('warn', f'Error checking if tool exists: {name}: {e}')
         return False
 
 def ensure_tool(tool_name, package_name=None):
@@ -2446,8 +2454,9 @@ def arp_scan(iface, my_ip, cidr):
     if sock:
         try:
             sock.close()
-        except:
-            pass
+            add_log('dev', f'Closed ARP scan socket for {iface}')
+        except Exception as e:
+            add_log('warn', f'Error closing ARP scan socket: {e}')
     return results
 
 def get_gateway_mac(iface, gateway_ip):
@@ -2455,9 +2464,12 @@ def get_gateway_mac(iface, gateway_ip):
         out = subprocess.check_output(['ip', 'neigh', 'show', gateway_ip], text=True)
         m = re.search(r'(([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2})', out)
         if m:
-            return m.group(1)
-    except:
-        pass
+            mac = m.group(1)
+            add_log('dev', f'Retrieved gateway MAC for {gateway_ip}: {mac}')
+            return mac
+        add_log('dev', f'No MAC address found for gateway {gateway_ip} in arp output')
+    except Exception as e:
+        add_log('dev', f'Failed to get gateway MAC via ip neigh: {e} (will try ARP scan)')
     my_ip, cidr = get_my_ip_and_cidr(iface)
     hosts = arp_scan(iface, my_ip, cidr)
     for h in hosts:
@@ -2469,8 +2481,10 @@ def server_ping(ip, timeout=1):
     try:
         subprocess.check_output(['ping', '-c', '1', '-W', str(timeout), ip],
                                 stderr=subprocess.DEVNULL, timeout=timeout+1)
+        add_log('dev', f'Ping succeeded for {ip}')
         return True
-    except:
+    except Exception as e:
+        add_log('dev', f'Ping failed for {ip}: {e}')
         return False
 
 def server_tcp_connect(ip, port, timeout=1):
@@ -2479,8 +2493,13 @@ def server_tcp_connect(ip, port, timeout=1):
         s.settimeout(timeout)
         result = s.connect_ex((ip, port))
         s.close()
+        if result == 0:
+            add_log('dev', f'TCP connection succeeded: {ip}:{port}')
+        else:
+            add_log('dev', f'TCP connection failed: {ip}:{port} (error code: {result})')
         return result == 0
-    except:
+    except Exception as e:
+        add_log('warn', f'Error during TCP connect attempt to {ip}:{port}: {e}')
         return False
 
 # ---------- nmap recon ----------
@@ -2535,16 +2554,24 @@ def get_iface_bytes(iface):
                 if name.strip() != iface:
                     continue
                 fields = data.split()
-                return int(fields[0]), int(fields[8])
-    except:
-        pass
+                rx_bytes, tx_bytes = int(fields[0]), int(fields[8])
+                add_log('dev', f'Interface {iface} stats: RX={rx_bytes} bytes, TX={tx_bytes} bytes')
+                return rx_bytes, tx_bytes
+    except Exception as e:
+        add_log('warn', f'Failed to get interface bytes for {iface}: {e}')
     return None
 
 # ---------- gateway: shared helpers ----------
 def proc_running(name):
     try:
-        return subprocess.run(['pgrep', '-x', name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-    except:
+        result = subprocess.run(['pgrep', '-x', name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+        if result:
+            add_log('dev', f'Process found: {name}')
+        else:
+            add_log('dev', f'Process not found: {name}')
+        return result
+    except Exception as e:
+        add_log('warn', f'Error checking if process {name} is running: {e}')
         return False
 
 def stop_proc(name):
@@ -2555,20 +2582,24 @@ def get_local_ip():
     if iface:
         ip, _ = get_my_ip_and_cidr(iface)
         if ip and ip != '0.0.0.0':
+            add_log('dev', f'Local IP from interface {iface}: {ip}')
             return ip
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(('8.8.8.8', 80))
         ip = s.getsockname()[0]
         s.close()
+        add_log('dev', f'Local IP via gateway probe: {ip}')
         return ip
-    except:
+    except Exception as e:
+        add_log('warn', f'Failed to determine local IP: {e}')
         return '0.0.0.0'
 
 _EXTERNAL_IP_CACHE = {'ip': None, 'time': 0}
 def get_external_ip():
     now = time.time()
     if _EXTERNAL_IP_CACHE['ip'] and now - _EXTERNAL_IP_CACHE['time'] < 300:
+        add_log('dev', f'Using cached external IP: {_EXTERNAL_IP_CACHE["ip"]}')
         return _EXTERNAL_IP_CACHE['ip']
     try:
         req = urllib.request.Request('https://api.ipify.org', headers={'User-Agent': 'GodHand'})
@@ -2576,9 +2607,12 @@ def get_external_ip():
             ip = r.read().decode().strip()
         _EXTERNAL_IP_CACHE['ip'] = ip
         _EXTERNAL_IP_CACHE['time'] = now
+        add_log('dev', f'Retrieved external IP from api.ipify.org: {ip}')
         return ip
-    except:
-        return _EXTERNAL_IP_CACHE['ip'] or 'Unknown'
+    except Exception as e:
+        cached = _EXTERNAL_IP_CACHE['ip'] or 'Unknown'
+        add_log('warn', f'Failed to get external IP from api.ipify.org: {e} (using cached: {cached})')
+        return cached
 
 def simple_dns_query(domain, server='127.0.0.1', port=53, timeout=3):
     txid = random.randint(0, 65535)
@@ -2695,8 +2729,11 @@ def write_gateway_configs(domains, lan_domains=None):
 def gateway_blocklist_count():
     try:
         with open(GW_BLOCKLIST_CONF) as f:
-            return sum(1 for _ in f)
-    except:
+            count = sum(1 for _ in f)
+        add_log('dev', f'DNS blocklist contains {count} entries')
+        return count
+    except Exception as e:
+        add_log('warn', f'Failed to count blocklist entries from {GW_BLOCKLIST_CONF}: {e}')
         return 0
 
 def gateway_dns_status():
@@ -2769,8 +2806,9 @@ def gateway_vpn_status():
     try:
         out = subprocess.check_output(['ip', 'link', 'show', 'wg0'], stderr=subprocess.DEVNULL, text=True)
         wg_active = 'UP' in out.split('<', 1)[-1].split('>', 1)[0] if '<' in out else False
-    except:
-        pass
+        add_log('dev', f'WireGuard interface wg0 status: {"UP" if wg_active else "DOWN"}')
+    except Exception as e:
+        add_log('dev', f'WireGuard interface wg0 not found or not accessible: {e}')
     openvpn_active = proc_running('openvpn')
     cloudflared_active = proc_running('cloudflared')
     return {
