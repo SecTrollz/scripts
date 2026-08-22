@@ -6909,6 +6909,12 @@ function exportPacketsCSV() {
 }
 var TRAFFIC_ALL_ENTRIES = [];
 async function pollTrafficCapture() {
+  // Only poll when Monitor tab is active to avoid wasting bandwidth
+  const monitorTab = document.getElementById('tab-monitor');
+  if (!monitorTab || !monitorTab.classList.contains('active')) {
+    return;
+  }
+
   try {
     const res = await apiCall('monitor_log');
     TRAFFIC_ALL_ENTRIES = res.entries || [];
