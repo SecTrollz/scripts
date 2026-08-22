@@ -28,7 +28,7 @@ import urllib.parse
 import base64
 import secrets
 from functools import wraps
-from flask import Flask, request, jsonify, render_template_string, abort
+from flask import Flask, request, jsonify, render_template_string, abort, Response
 
 # ---------- configuration ----------
 SECRET = os.environ.get('GODHAND_SECRET', '')
@@ -399,6 +399,44 @@ except Exception as e:
     CERT_AUTHORITY = None
     CERT_CACHE = None
 
+# ---------- PAC File Server ----------
+def generate_pac_file(proxy_host: str = '127.0.0.1', proxy_port: int = 8888) -> str:
+    """Generate RFC 2496-compliant PAC (Proxy Auto-Config) file.
+
+    The PAC file is JavaScript that browsers execute to determine proxy settings.
+    This implementation routes all HTTP/HTTPS traffic through the MITM proxy.
+
+    Args:
+        proxy_host: IP or hostname of proxy server
+        proxy_port: Port proxy listens on
+
+    Returns:
+        Complete PAC file as JavaScript string
+    """
+    pac_js = f"""
+function FindProxyForURL(url, host) {{
+    // Route all traffic through MITM proxy
+    var proxy = "PROXY {proxy_host}:{proxy_port}";
+
+    // Direct connection for localhost/internal IPs (avoid proxy loops)
+    var localhost = "DIRECT";
+
+    if (shExpMatch(host, "localhost") ||
+        shExpMatch(host, "127.0.0.1") ||
+        shExpMatch(host, "*.local") ||
+        shExpMatch(host, "*.internal") ||
+        isInNet(dnsResolve(host), "192.168.0.0", "255.255.0.0") ||
+        isInNet(dnsResolve(host), "10.0.0.0", "255.0.0.0") ||
+        isInNet(dnsResolve(host), "172.16.0.0", "255.240.0.0")) {{
+        return localhost;
+    }}
+
+    return proxy;
+}}
+"""
+    return pac_js.strip()
+
+
 app = Flask(__name__)
 
 @app.after_request
@@ -454,6 +492,133 @@ def api_logout():
     with SESSIONS_LOCK:
         VALID_SESSIONS.discard(token)
     return jsonify({'success': True})
+
+# ---------- PAC file server (HTTPS interception configuration) ----------
+@app.route('/pac', methods=['GET'])
+def serve_pac_file():
+    """Serve PAC (Proxy Auto-Config) file for browser/device proxy settings.
+
+    Browsers will fetch this file and use it to determine which traffic
+    routes through the MITM proxy (port 8888).
+
+    Access: http://pac.installCA.lan/pac or http://<device-ip>:5000/pac
+    """
+    device_ip = request.host.split(':')[0]
+    pac_content = generate_pac_file(proxy_host=device_ip, proxy_port=8888)
+    return Response(pac_content, mimetype='application/x-ns-proxy-autoconfig')
+
+@app.route('/ca-cert', methods=['GET'])
+def serve_ca_certificate():
+    """Serve CA certificate for manual installation on target devices.
+
+    Devices need to trust the CA certificate before HTTPS interception works.
+    They can download this certificate and install it in their system trust store.
+
+    Access: http://pac.installCA.lan/ca-cert or http://<device-ip>:5000/ca-cert
+    """
+    if not CERT_AUTHORITY:
+        abort(503, description='Certificate infrastructure not initialized')
+
+    cert_path = CERT_AUTHORITY.get_ca_cert_path()
+    try:
+        with open(cert_path, 'r') as f:
+            cert_pem = f.read()
+        return Response(cert_pem, mimetype='application/x-pem-file',
+                       headers={'Content-Disposition': 'attachment; filename="godhand-ca.pem"'})
+    except Exception as e:
+        add_log('error', f'Failed to serve CA certificate: {e}')
+        abort(500, description='Failed to read CA certificate')
+
+@app.route('/pac.installCA.lan', methods=['GET'])
+@app.route('/pac.installCA.lan/pac', methods=['GET'])
+def pac_install_ca_index():
+    """Landing page for .lan domain (pac.installCA.lan).
+
+    Serves the PAC file and explains how to install the CA certificate.
+    The .lan hostname signals to users that they're installing a custom CA.
+
+    Access: http://pac.installCA.lan or http://pac.installCA.lan/pac
+    """
+    if not CERT_AUTHORITY:
+        return 'Certificate infrastructure not initialized', 503
+
+    device_ip = request.host.split(':')[0]
+    pac_url = f'http://{device_ip}:5000/pac'
+    ca_cert_url = f'http://{device_ip}:5000/ca-cert'
+
+    html_content = f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GodHand - Install CA Certificate</title>
+    <style>
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; color: #333; }}
+        .warning {{ background: #fff3cd; border: 1px solid #ffc107; border-radius: 8px; padding: 16px; margin: 20px 0; }}
+        .instructions {{ background: #e7f3ff; border: 1px solid #0066cc; border-radius: 8px; padding: 16px; margin: 20px 0; }}
+        .code {{ background: #f5f5f5; border: 1px solid #ddd; border-radius: 4px; padding: 12px; font-family: monospace; word-break: break-all; }}
+        a {{ color: #0066cc; text-decoration: none; }}
+        a:hover {{ text-decoration: underline; }}
+        h1 {{ color: #0066cc; }}
+    </style>
+</head>
+<body>
+    <h1>GodHand HTTPS Interception</h1>
+
+    <div class="warning">
+        <strong>⚠️ You are about to install a custom Certificate Authority (CA) certificate.</strong><br>
+        This allows the GodHand proxy to intercept and decrypt your HTTPS traffic for inspection.
+    </div>
+
+    <div class="instructions">
+        <h2>Step 1: Download CA Certificate</h2>
+        <p>Download the CA certificate file:</p>
+        <p><a href="{ca_cert_url}" download="godhand-ca.pem">📥 Download CA Certificate (godhand-ca.pem)</a></p>
+    </div>
+
+    <div class="instructions">
+        <h2>Step 2: Configure Your Device</h2>
+        <p><strong>iOS / macOS:</strong></p>
+        <ol>
+            <li>Save the downloaded certificate</li>
+            <li>Settings → General → VPN & Device Management</li>
+            <li>Trust the "GodHand CA" certificate</li>
+            <li>Settings → WiFi → Configure Proxy</li>
+            <li>Select "Automatic" and enter: <code>{pac_url}</code></li>
+        </ol>
+
+        <p><strong>Android:</strong></p>
+        <ol>
+            <li>Settings → Security → Encryption & Credentials → Install Certificate</li>
+            <li>Select the downloaded certificate</li>
+            <li>Settings → WiFi → Long-press your network → Modify → Proxy</li>
+            <li>Select "PAC" and enter: <code>{pac_url}</code></li>
+        </ol>
+
+        <p><strong>Windows:</strong></p>
+        <ol>
+            <li>Double-click the certificate to install it</li>
+            <li>Choose "Install Certificate" → Local Machine</li>
+            <li>Settings → Network → Proxy</li>
+            <li>Enter PAC URL: <code>{pac_url}</code></li>
+        </ol>
+    </div>
+
+    <div class="instructions">
+        <h2>Step 3: Verify</h2>
+        <p>Navigate to any HTTPS website. Traffic should now appear in GodHand's traffic monitor.</p>
+        <p>If you see certificate warnings, the CA certificate wasn't properly installed.</p>
+    </div>
+
+    <div class="warning">
+        <strong>Security Note:</strong> This certificate authority is only for authorized testing on your own network and devices.
+        Only install on devices you own and have permission to test.
+    </div>
+</body>
+</html>
+"""
+    return html_content, 200, {'Content-Type': 'text/html; charset=utf-8'}
 
 # ---------- tool management ----------
 _INSTALLED_TOOLS = set()
