@@ -1587,32 +1587,47 @@ def arp_scan(iface, my_ip, cidr):
         if len(hosts) >= MAX_SCAN_HOSTS:
             add_log('warn', f'ARP scan capped at {MAX_SCAN_HOSTS} hosts (network {net} is larger); scan the subnet directly for full coverage')
             break
-    for ip in hosts:
-        try:
-            sock.send(arp_packet(src_mac, my_ip, ip))
-        except OSError as e:
-            add_log('dev', f'ARP packet send failed for {ip}: {e}')
-            pass
-
-    deadline = time.time() + 4
+    batch_size = 64
+    max_retries = 3
+    global_deadline = time.time() + 8.0
+    unreplied = set(hosts)
+    retry_count = {ip: 0 for ip in hosts}
     seen = {}
-    while time.time() < deadline:
-        try:
-            r, _, _ = select.select([sock], [], [], 0.1)
-            if r:
-                data, _ = sock.recvfrom(65535)
-                if len(data) >= 42 and struct.unpack('!H', data[12:14])[0] == 0x0806:
-                    if struct.unpack('!H', data[20:22])[0] == 2:
-                        sip = socket.inet_ntoa(data[28:32])
-                        smac = data[22:28]
-                        if sip != my_ip and smac != b'\x00' * 6:
-                            mac = smac.hex(':')
-                            if sip not in seen:
-                                seen[sip] = mac
-                                results.append({'ip': sip, 'mac': mac})
-        except OSError as e:
-            add_log('dev', f'ARP receive error: {e}')
-            break
+
+    while unreplied and time.time() < global_deadline:
+        batch = list(unreplied)[:batch_size]
+
+        for ip in batch:
+            try:
+                sock.send(arp_packet(src_mac, my_ip, ip))
+                retry_count[ip] += 1
+            except OSError as e:
+                add_log('dev', f'ARP packet send failed for {ip} (attempt {retry_count[ip]+1}): {e}')
+                unreplied.discard(ip)
+
+        batch_deadline = time.time() + 0.8
+        while time.time() < batch_deadline:
+            try:
+                r, _, _ = select.select([sock], [], [], 0.05)
+                if r:
+                    data, _ = sock.recvfrom(65535)
+                    if len(data) >= 42 and struct.unpack('!H', data[12:14])[0] == 0x0806:
+                        if struct.unpack('!H', data[20:22])[0] == 2:
+                            sip = socket.inet_ntoa(data[28:32])
+                            smac = data[22:28]
+                            if sip != my_ip and smac != b'\x00' * 6:
+                                mac = smac.hex(':')
+                                if sip not in seen:
+                                    seen[sip] = mac
+                                    results.append({'ip': sip, 'mac': mac})
+                                unreplied.discard(sip)
+            except OSError as e:
+                add_log('dev', f'ARP receive error: {e}')
+                break
+
+        time.sleep(0.01)
+
+        unreplied = {ip for ip in unreplied if retry_count.get(ip, 0) < max_retries and time.time() < global_deadline}
 
     if sock:
         try:
@@ -3513,7 +3528,7 @@ def index():
 :root {
   /* palette sampled directly from the login/app background photo (app-bg-photo) */
   --bg-base: #011236;
-  --bg-elevated: rgba(80,80,80,0.45);
+  --bg-elevated: rgba(40,40,45,0.55);
   --bg-inset: rgba(255,255,255,0.05);
   --border-subtle: rgba(255,255,255,0.12);
   --border-strong: rgba(255,255,255,0.22);
