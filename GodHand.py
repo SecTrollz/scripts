@@ -2890,6 +2890,12 @@ def verify_capabilities_on_startup():
     if not caps['has_cap_net_admin']:
         add_log('warn', 'CAP_NET_ADMIN not available; iptables/routing will not work')
 
+    # Verify transparent interceptor availability
+    if TRANSPARENT_INTERCEPTOR.is_available():
+        add_log('success', 'Transparent iptables interception available (Phase 8)')
+    else:
+        add_log('warn', 'Transparent iptables interception not available; iptables or netfilter may be missing')
+
 # ---------- Process group management (Phase 6: Subprocess Isolation) ----------
 class ProcessGroup:
     """Manages subprocess lifecycle with resource limits, automatic cleanup, and graceful restart."""
@@ -3085,6 +3091,265 @@ def spawn_attack_process(group_name, cmd, weapon_id=None, shell=False, descripti
             STATE['attack_pids'][weapon_id].append(proc)
 
     return proc
+
+# ---------- Transparent Intercept via iptables (Phase 8) ----------
+class TransparentInterceptor:
+    """Transparent packet redirection via iptables netfilter rules.
+
+    Enables seamless traffic interception by redirecting packets to local ports
+    without requiring ARP spoofing. Supports TCP/UDP, single targets or network-wide.
+    """
+
+    def __init__(self, name="GODHAND", chain_prefix="GH_"):
+        self.name = name
+        self.chain_prefix = chain_prefix
+        self.active_chains = {}  # {chain_name: {'rules': [...], 'port': port}}
+        self.lock = threading.RLock()
+
+    def is_available(self):
+        """Check if iptables and NAT support are available."""
+        try:
+            result = subprocess.run(
+                ['iptables', '-t', 'nat', '-L'],
+                capture_output=True, timeout=3
+            )
+            return result.returncode == 0
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+
+    def create_chain(self, chain_name, table='nat'):
+        """Create a new iptables chain for rule organization."""
+        try:
+            subprocess.run(
+                ['iptables', '-t', table, '-N', chain_name],
+                capture_output=True, timeout=3, check=False
+            )
+            with self.lock:
+                if chain_name not in self.active_chains:
+                    self.active_chains[chain_name] = {'rules': [], 'table': table}
+            add_log('dev', f'iptables chain created: {chain_name}')
+            return True
+        except Exception as e:
+            add_log('warn', f'Failed to create chain {chain_name}: {e}')
+            return False
+
+    def add_redirect_rule(self, chain_name, protocol='tcp', src_port=None, dst_port=None,
+                         target_port=None, src_ip=None, dst_ip=None, table='nat'):
+        """Add a transparent redirect rule to a chain.
+
+        Args:
+            chain_name: Target chain to add rule to
+            protocol: 'tcp' or 'udp'
+            src_port: Source port filter (optional)
+            dst_port: Destination port to intercept
+            target_port: Local port to redirect to
+            src_ip: Source IP filter (optional)
+            dst_ip: Destination IP filter (optional)
+            table: iptables table ('nat' for REDIRECT, 'mangle' for others)
+
+        Returns:
+            True if rule added successfully
+        """
+        try:
+            cmd = ['iptables', '-t', table, '-A', chain_name, '-p', protocol]
+
+            if src_ip:
+                cmd.extend(['-s', src_ip])
+            if dst_ip:
+                cmd.extend(['-d', dst_ip])
+            if src_port:
+                cmd.extend(['--sport', str(src_port)])
+            if dst_port:
+                cmd.extend(['--dport', str(dst_port)])
+
+            cmd.extend(['-j', 'REDIRECT', '--to-port', str(target_port)])
+
+            subprocess.run(cmd, capture_output=True, timeout=3, check=True)
+
+            with self.lock:
+                if chain_name in self.active_chains:
+                    rule_desc = f'{protocol} {src_ip or "any"}:{src_port or "any"} -> '
+                    rule_desc += f'{dst_ip or "any"}:{dst_port or "any"} -> :{target_port}'
+                    self.active_chains[chain_name]['rules'].append(rule_desc)
+
+            add_log('dev', f'iptables rule added: {chain_name} ({protocol} :{dst_port}->{target_port})')
+            return True
+        except Exception as e:
+            add_log('warn', f'Failed to add redirect rule: {e}')
+            return False
+
+    def add_chain_to_hook(self, chain_name, hook_chain='PREROUTING', table='nat'):
+        """Insert chain into a standard iptables hook (PREROUTING, INPUT, etc).
+
+        Args:
+            chain_name: Custom chain to hook in
+            hook_chain: Standard chain to insert into ('PREROUTING', 'POSTROUTING', 'INPUT')
+            table: iptables table
+
+        Returns:
+            True if insertion successful
+        """
+        try:
+            # Insert at position 1 so it's checked first
+            subprocess.run(
+                ['iptables', '-t', table, '-I', hook_chain, '1', '-j', chain_name],
+                capture_output=True, timeout=3, check=True
+            )
+            add_log('dev', f'iptables hook added: {hook_chain} -> {chain_name}')
+            return True
+        except Exception as e:
+            add_log('warn', f'Failed to hook chain: {e}')
+            return False
+
+    def enable_port_forwarding(self, local_port, forward_port, protocol='tcp'):
+        """Enable kernel-level port forwarding via iptables DNAT.
+
+        Forwards all traffic to local_port to forward_port.
+        Useful for routing gateway/proxy traffic.
+        """
+        try:
+            chain_name = f'{self.chain_prefix}FORWARD_{local_port}'
+            self.create_chain(chain_name)
+
+            cmd = ['iptables', '-t', 'nat', '-A', chain_name,
+                   '-p', protocol, '--dport', str(local_port),
+                   '-j', 'DNAT', '--to-destination', f'127.0.0.1:{forward_port}']
+
+            subprocess.run(cmd, capture_output=True, timeout=3, check=True)
+            self.add_chain_to_hook(chain_name, 'PREROUTING', 'nat')
+
+            add_log('success', f'Port forwarding enabled: {local_port} -> {forward_port}')
+            return True
+        except Exception as e:
+            add_log('warn', f'Port forwarding failed: {e}')
+            return False
+
+    def enable_https_intercept(self, target_ips=None, proxy_port=8888, interface=None):
+        """Enable transparent HTTPS (443) interception to proxy.
+
+        Args:
+            target_ips: List of target IPs to intercept, or None for all traffic
+            proxy_port: Local port running HTTPS proxy
+            interface: Interface to restrict to (optional)
+
+        Returns:
+            Chain name if successful
+        """
+        try:
+            chain_name = f'{self.chain_prefix}HTTPS'
+            self.create_chain(chain_name)
+
+            if target_ips:
+                # Per-target rules
+                for target_ip in target_ips:
+                    self.add_redirect_rule(chain_name, protocol='tcp',
+                                          dst_ip=target_ip, dst_port=443,
+                                          target_port=proxy_port)
+            else:
+                # All traffic
+                self.add_redirect_rule(chain_name, protocol='tcp',
+                                      dst_port=443, target_port=proxy_port)
+
+            self.add_chain_to_hook(chain_name, 'PREROUTING', 'nat')
+
+            n_targets = len(target_ips) if target_ips else "all"
+            add_log('success', f'HTTPS intercept enabled for {n_targets} targets')
+            return chain_name
+        except Exception as e:
+            add_log('error', f'HTTPS intercept setup failed: {e}')
+            return None
+
+    def enable_dns_intercept(self, dns_port=5353, target_ips=None):
+        """Enable transparent DNS (port 53) redirection to custom DNS server.
+
+        Args:
+            dns_port: Local port running DNS server
+            target_ips: Target IPs to intercept (None = all)
+        """
+        try:
+            chain_name = f'{self.chain_prefix}DNS'
+            self.create_chain(chain_name)
+
+            # UDP DNS
+            self.add_redirect_rule(chain_name, protocol='udp',
+                                  dst_port=53, target_port=dns_port)
+            # TCP DNS (less common but support it)
+            self.add_redirect_rule(chain_name, protocol='tcp',
+                                  dst_port=53, target_port=dns_port)
+
+            self.add_chain_to_hook(chain_name, 'PREROUTING', 'nat')
+
+            add_log('success', f'DNS intercept enabled on port {dns_port}')
+            return chain_name
+        except Exception as e:
+            add_log('error', f'DNS intercept setup failed: {e}')
+            return None
+
+    def disable_chain(self, chain_name, table='nat'):
+        """Disable and remove all rules from a chain."""
+        try:
+            # Unhook from standard chains
+            for hook in ['PREROUTING', 'POSTROUTING', 'INPUT', 'OUTPUT']:
+                subprocess.run(
+                    ['iptables', '-t', table, '-D', hook, '-j', chain_name],
+                    capture_output=True, timeout=3, check=False
+                )
+
+            # Flush and delete chain
+            subprocess.run(
+                ['iptables', '-t', table, '-F', chain_name],
+                capture_output=True, timeout=3, check=True
+            )
+            subprocess.run(
+                ['iptables', '-t', table, '-X', chain_name],
+                capture_output=True, timeout=3, check=True
+            )
+
+            with self.lock:
+                if chain_name in self.active_chains:
+                    del self.active_chains[chain_name]
+
+            add_log('dev', f'iptables chain disabled and removed: {chain_name}')
+            return True
+        except Exception as e:
+            add_log('warn', f'Failed to disable chain {chain_name}: {e}')
+            return False
+
+    def cleanup_all(self):
+        """Remove all GODHAND iptables rules and chains."""
+        try:
+            with self.lock:
+                chains_to_remove = list(self.active_chains.keys())
+
+            for chain in chains_to_remove:
+                self.disable_chain(chain)
+
+            add_log('success', 'All iptables rules cleaned up')
+            return True
+        except Exception as e:
+            add_log('error', f'Cleanup failed: {e}')
+            return False
+
+    def get_status(self):
+        """Get status of all active intercept chains."""
+        with self.lock:
+            status = {
+                'available': self.is_available(),
+                'active_chains': len(self.active_chains),
+                'chains': {}
+            }
+
+            for chain_name, chain_info in self.active_chains.items():
+                status['chains'][chain_name] = {
+                    'rules': len(chain_info['rules']),
+                    'table': chain_info.get('table', 'nat'),
+                    'rule_list': chain_info['rules']
+                }
+
+            return status
+
+# Global transparent interceptor instance
+TRANSPARENT_INTERCEPTOR = TransparentInterceptor()
 
 # ---------- Python DNS forwarder (Unbound fallback) ----------
 class PythonDNSForwarder:
@@ -6306,11 +6571,6 @@ GODHAND_DDNS_ENABLED=1                  # optional, default on when the above ar
       </div>
     </div>
     <div class="card">
-      <h2>Live traffic capture</h2>
-      <p class="sub">Weapon 5 output — see the <strong>Monitor</strong> tab for the full capture &amp; analysis panel (top talkers, ports, live feed).</p>
-      <div id="attacks-traffic-status" class="status-message">Not capturing.</div>
-    </div>
-    <div class="card">
       <h2>Custom packet builder</h2>
       <p class="sub">Craft and send a raw Ethernet/IP frame yourself — your own MACs, IPs, ports, TCP flags, and payload. Capped at 50 sends per click; for sustained floods use the weapons above instead.</p>
       <div class="row">
@@ -6438,39 +6698,45 @@ GODHAND_DDNS_ENABLED=1                  # optional, default on when the above ar
       <div class="empty" id="traffic-empty" style="display:none;">Not capturing. Select weapon 5 on the Attacks tab and press Start.</div>
     </div>
     <div class="card">
-      <h2>Reassembled HTTP streams</h2>
-      <p class="sub">Fragmented HTTP requests/responses stitched back together from their TCP segments in sequence order — not just what a single packet's first line shows.</p>
-      <div id="tcp-streams-list"></div>
-      <div class="empty" id="tcp-streams-empty">No HTTP streams reassembled yet.</div>
-    </div>
-    <div class="card">
-      <h2>Paste an ARP snapshot</h2>
-      <p class="sub">Run <code>arp -a</code> and paste output below. Detects MAC changes.</p>
-      <textarea id="arp-input" placeholder="e.g. 192.168.1.1 aa:bb:cc:dd:ee:ff"></textarea>
-      <div class="row" style="margin-top:10px;">
-        <button class="btn" onclick="ingestArp()">Analyze snapshot</button>
-        <button class="btn secondary" onclick="clearArpHistory()">Clear history</button>
+      <h2 style="cursor:pointer; user-select:none;" onclick="toggleAdvancedTools()">▼ Reassembled HTTP streams & Analysis Tools</h2>
+      <div id="advanced-tools-section" style="display:block;">
+        <p class="sub" style="margin-top:0;">Fragmented HTTP requests/responses stitched back together from their TCP segments in sequence order — not just what a single packet's first line shows.</p>
+        <div id="tcp-streams-list"></div>
+        <div class="empty" id="tcp-streams-empty">No HTTP streams reassembled yet.</div>
+
+        <div style="margin-top:20px; padding-top:20px; border-top:1px solid #333;">
+          <h3 style="margin-top:0; font-size:0.95rem; color:#0f0;">Paste an ARP snapshot</h3>
+          <p class="sub">Run <code>arp -a</code> and paste output below. Detects MAC changes.</p>
+          <textarea id="arp-input" placeholder="e.g. 192.168.1.1 aa:bb:cc:dd:ee:ff" style="height:80px;"></textarea>
+          <div class="row" style="margin-top:10px;">
+            <button class="btn" onclick="ingestArp()">Analyze snapshot</button>
+            <button class="btn secondary" onclick="clearArpHistory()">Clear history</button>
+          </div>
+          <p class="sub" style="margin-top:10px;">Snapshots analyzed: <span id="arp-snap-count">0</span></p>
+        </div>
+
+        <div style="margin-top:15px; padding-top:15px; border-top:1px solid #333;">
+          <h3 style="margin-top:0; font-size:0.95rem; color:#0f0;">Paste deauth / frame-count log</h3>
+          <p class="sub">Format: numbers separated by comma or newline.</p>
+          <textarea id="deauth-input" placeholder="2,3,1,4,2,58,61,2,3" style="height:80px;"></textarea>
+          <div class="row" style="margin-top:10px;">
+            <button class="btn" onclick="analyzeDeauth()">Analyze log</button>
+          </div>
+        </div>
+
+        <div style="margin-top:15px; padding-top:15px; border-top:1px solid #333;">
+          <h3 style="margin-top:0; font-size:0.95rem; color:#0f0;">Alerts</h3>
+          <div id="alerts"></div>
+          <div class="empty" id="alerts-empty">No anomalies detected yet.</div>
+        </div>
+
+        <div style="margin-top:15px; padding-top:15px; border-top:1px solid #333;">
+          <h3 style="margin-top:0; font-size:0.95rem; color:#0f0;">Activity log (server-side)</h3>
+          <p class="sub">All actions are logged on the server.</p>
+          <button class="btn secondary" onclick="clearServerLogs()">Clear server log</button>
+          <div class="log-container" id="log-container"></div>
+        </div>
       </div>
-      <p class="sub" style="margin-top:10px;">Snapshots analyzed: <span id="arp-snap-count">0</span></p>
-    </div>
-    <div class="card">
-      <h2>Paste deauth / frame-count log</h2>
-      <p class="sub">Format: numbers separated by comma or newline.</p>
-      <textarea id="deauth-input" placeholder="2,3,1,4,2,58,61,2,3"></textarea>
-      <div class="row" style="margin-top:10px;">
-        <button class="btn" onclick="analyzeDeauth()">Analyze log</button>
-      </div>
-    </div>
-    <div class="card">
-      <h2>Alerts</h2>
-      <div id="alerts"></div>
-      <div class="empty" id="alerts-empty">No anomalies detected yet.</div>
-    </div>
-    <div class="card">
-      <h2>Activity log (server-side)</h2>
-      <p class="sub">All actions are logged on the server.</p>
-      <button class="btn secondary" onclick="clearServerLogs()">Clear server log</button>
-      <div class="log-container" id="log-container"></div>
     </div>
   </div>
 
@@ -6721,6 +6987,19 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
   });
 });
 
+// Advanced Tools Collapsible Section
+function toggleAdvancedTools() {
+  const section = document.getElementById('advanced-tools-section');
+  const h2 = event.target.closest('h2');
+  if (section.style.display === 'none') {
+    section.style.display = 'block';
+    h2.textContent = '▼ Reassembled HTTP streams & Analysis Tools';
+  } else {
+    section.style.display = 'none';
+    h2.textContent = '▶ Reassembled HTTP streams & Analysis Tools';
+  }
+}
+
 // HTTPS Sub-tabs
 function switchHttpsSubtab(subtabName) {
   // Hide all sub-tabs
@@ -6909,6 +7188,12 @@ function exportPacketsCSV() {
 }
 var TRAFFIC_ALL_ENTRIES = [];
 async function pollTrafficCapture() {
+  // Only poll when Monitor tab is active to avoid wasting bandwidth
+  const monitorTab = document.getElementById('tab-monitor');
+  if (!monitorTab || !monitorTab.classList.contains('active')) {
+    return;
+  }
+
   try {
     const res = await apiCall('monitor_log');
     TRAFFIC_ALL_ENTRIES = res.entries || [];
@@ -9137,6 +9422,74 @@ def api_process_groups_terminate(group_name):
     group = attack_process_groups[group_name]
     group.terminate_all()
     return jsonify({'success': True, 'message': f'Termination initiated for {group_name}'})
+
+@app.route('/api/transparent/status', methods=['GET'])
+@require_auth
+def api_transparent_status():
+    """Get transparent interceptor status and active chains."""
+    return jsonify({'success': True, 'transparent': TRANSPARENT_INTERCEPTOR.get_status()})
+
+@app.route('/api/transparent/https/enable', methods=['POST'])
+@require_auth
+def api_transparent_https_enable():
+    """Enable transparent HTTPS interception."""
+    data = request.json or {}
+    target_ips = data.get('target_ips')  # None = all traffic
+    proxy_port = data.get('proxy_port', 8888)
+
+    if not TRANSPARENT_INTERCEPTOR.is_available():
+        return jsonify({'success': False, 'error': 'iptables not available'}), 500
+
+    chain = TRANSPARENT_INTERCEPTOR.enable_https_intercept(target_ips, proxy_port)
+    if chain:
+        return jsonify({'success': True, 'chain': chain, 'message': 'HTTPS interception enabled'})
+    else:
+        return jsonify({'success': False, 'error': 'Failed to enable HTTPS interception'}), 500
+
+@app.route('/api/transparent/https/disable', methods=['POST'])
+@require_auth
+def api_transparent_https_disable():
+    """Disable transparent HTTPS interception."""
+    chain_name = f'{TRANSPARENT_INTERCEPTOR.chain_prefix}HTTPS'
+    if TRANSPARENT_INTERCEPTOR.disable_chain(chain_name):
+        return jsonify({'success': True, 'message': 'HTTPS interception disabled'})
+    else:
+        return jsonify({'success': False, 'error': 'Failed to disable HTTPS interception'}), 500
+
+@app.route('/api/transparent/dns/enable', methods=['POST'])
+@require_auth
+def api_transparent_dns_enable():
+    """Enable transparent DNS redirection."""
+    data = request.json or {}
+    dns_port = data.get('dns_port', 5353)
+
+    if not TRANSPARENT_INTERCEPTOR.is_available():
+        return jsonify({'success': False, 'error': 'iptables not available'}), 500
+
+    chain = TRANSPARENT_INTERCEPTOR.enable_dns_intercept(dns_port)
+    if chain:
+        return jsonify({'success': True, 'chain': chain, 'message': 'DNS interception enabled'})
+    else:
+        return jsonify({'success': False, 'error': 'Failed to enable DNS interception'}), 500
+
+@app.route('/api/transparent/dns/disable', methods=['POST'])
+@require_auth
+def api_transparent_dns_disable():
+    """Disable transparent DNS redirection."""
+    chain_name = f'{TRANSPARENT_INTERCEPTOR.chain_prefix}DNS'
+    if TRANSPARENT_INTERCEPTOR.disable_chain(chain_name):
+        return jsonify({'success': True, 'message': 'DNS interception disabled'})
+    else:
+        return jsonify({'success': False, 'error': 'Failed to disable DNS interception'}), 500
+
+@app.route('/api/transparent/cleanup', methods=['POST'])
+@require_auth
+def api_transparent_cleanup():
+    """Clean up all transparent interceptor rules."""
+    if TRANSPARENT_INTERCEPTOR.cleanup_all():
+        return jsonify({'success': True, 'message': 'All interceptor rules cleaned up'})
+    else:
+        return jsonify({'success': False, 'error': 'Cleanup partially failed'}), 500
 
 @app.route('/api/https_injection/rules', methods=['GET'])
 @require_auth
