@@ -2889,6 +2889,188 @@ def verify_capabilities_on_startup():
     if not caps['has_cap_net_admin']:
         add_log('warn', 'CAP_NET_ADMIN not available; iptables/routing will not work')
 
+# ---------- Python DNS forwarder (Unbound fallback) ----------
+class PythonDNSForwarder:
+    """Lightweight DNS server for hijacking .lan domains and blocking ad/tracking domains."""
+
+    def __init__(self, listen_ip='0.0.0.0', listen_port=53, upstream_servers=None, lan_domains=None, blocked_domains=None):
+        self.listen_ip = listen_ip
+        self.listen_port = listen_port
+        self.upstream_servers = upstream_servers or ['8.8.8.8', '8.8.4.4']
+        self.lan_domains = lan_domains or ['pac.installCA.lan']
+        self.blocked_domains = set(blocked_domains or [])
+        self.socket = None
+        self.running = False
+        self.request_cache = {}  # Simple cache for responses
+
+    def start(self):
+        """Start DNS forwarder in daemon thread."""
+        try:
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.socket.bind((self.listen_ip, self.listen_port))
+            self.running = True
+            add_log('success', f'Python DNS forwarder listening on {self.listen_ip}:{self.listen_port}')
+
+            thread = threading.Thread(target=self._dns_loop, daemon=True)
+            thread.start()
+            return True
+        except OSError as e:
+            add_log('error', f'Failed to start DNS forwarder on port {self.listen_port}: {e}')
+            return False
+
+    def stop(self):
+        """Stop DNS forwarder."""
+        self.running = False
+        try:
+            if self.socket:
+                self.socket.close()
+        except:
+            pass
+        add_log('info', 'DNS forwarder stopped')
+
+    def _dns_loop(self):
+        """Main DNS query handling loop."""
+        while self.running:
+            try:
+                self.socket.settimeout(2)
+                data, addr = self.socket.recvfrom(512)
+                threading.Thread(target=self._handle_query, args=(data, addr), daemon=True).start()
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self.running:
+                    add_log('warn', f'DNS loop error: {e}')
+
+    def _handle_query(self, data, addr):
+        """Handle single DNS query."""
+        try:
+            # Parse DNS query
+            txid = struct.unpack('!H', data[0:2])[0]
+            flags = struct.unpack('!H', data[2:4])[0]
+            qdcount = struct.unpack('!H', data[4:6])[0]
+
+            if not (flags & 0x8000):  # Query, not response
+                # Extract hostname from query
+                hostname = self._extract_hostname(data[12:])
+
+                # Check if .lan domain
+                if any(hostname.endswith(lan) for lan in self.lan_domains):
+                    response = self._build_response(txid, data, hostname, self._get_local_ip())
+                    self.socket.sendto(response, addr)
+                    return
+
+                # Check if blocked domain
+                if hostname.lower() in self.blocked_domains:
+                    response = self._build_nxdomain_response(txid, data, hostname)
+                    self.socket.sendto(response, addr)
+                    return
+
+                # Forward to upstream
+                self._forward_query(data, addr, txid)
+        except Exception as e:
+            add_log('warn', f'DNS query handling error: {e}')
+
+    def _extract_hostname(self, query_section):
+        """Extract hostname from DNS query section."""
+        try:
+            parts = []
+            idx = 0
+            while idx < len(query_section):
+                length = query_section[idx]
+                if length == 0:
+                    break
+                idx += 1
+                parts.append(query_section[idx:idx+length].decode('ascii', errors='ignore'))
+                idx += length
+            return '.'.join(parts)
+        except:
+            return ''
+
+    def _build_response(self, txid, original_query, hostname, local_ip):
+        """Build DNS A record response for .lan domain."""
+        # Response header (copied from query with response flag)
+        header = struct.pack('!HHHHHH', txid, 0x8400, 1, 1, 0, 0)
+
+        # Question section (copy from original)
+        question_start = 12
+        question_end = original_query.index(b'\x00\x01\x00\x01', question_start) + 4 if b'\x00\x01\x00\x01' in original_query[question_start:] else len(original_query)
+        question = original_query[question_start:question_end]
+
+        # Answer section: A record with local IP
+        hostname_bytes = self._encode_hostname(hostname)
+        answer = hostname_bytes + struct.pack('!HHIH', 1, 1, 300, 4)  # Type A, class IN, TTL 300s, length 4
+        answer += socket.inet_aton(local_ip)
+
+        return header + question + answer
+
+    def _build_nxdomain_response(self, txid, original_query, hostname):
+        """Build NXDOMAIN response for blocked domain."""
+        # Response header with NXDOMAIN (rcode=3)
+        header = struct.pack('!HHHHHH', txid, 0x8403, 1, 0, 0, 0)
+
+        # Question section
+        question_start = 12
+        question_end = original_query.index(b'\x00\x01\x00\x01', question_start) + 4 if b'\x00\x01\x00\x01' in original_query[question_start:] else len(original_query)
+        question = original_query[question_start:question_end]
+
+        return header + question
+
+    def _encode_hostname(self, hostname):
+        """Encode hostname to DNS name format."""
+        parts = hostname.rstrip('.').split('.')
+        encoded = b''
+        for part in parts:
+            encoded += struct.pack('!B', len(part)) + part.encode('ascii')
+        encoded += b'\x00'
+        return encoded
+
+    def _get_local_ip(self):
+        """Get device's local IP for .lan responses."""
+        return get_local_ip()
+
+    def _forward_query(self, data, client_addr, txid):
+        """Forward query to upstream DNS server."""
+        for upstream in self.upstream_servers:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.settimeout(3)
+                sock.sendto(data, (upstream, 53))
+                response, _ = sock.recvfrom(512)
+                sock.close()
+                self.socket.sendto(response, client_addr)
+                return
+            except Exception:
+                continue
+
+        # If all upstreams fail, send SERVFAIL
+        header = struct.pack('!HHHHHH', txid, 0x8402, 1, 0, 0, 0)
+        self.socket.sendto(header + data[12:], client_addr)
+
+# Global DNS forwarder instance
+_dns_forwarder = None
+
+def start_python_dns_forwarder(listen_port=53, lan_domains=None, blocked_domains=None):
+    """Start Python DNS forwarder as fallback for Unbound."""
+    global _dns_forwarder
+    if _dns_forwarder and _dns_forwarder.running:
+        add_log('info', 'DNS forwarder already running')
+        return True
+
+    _dns_forwarder = PythonDNSForwarder(
+        listen_port=listen_port,
+        lan_domains=lan_domains or ['pac.installCA.lan'],
+        blocked_domains=blocked_domains or list(DEFAULT_BLOCKED_DOMAINS)
+    )
+    return _dns_forwarder.start()
+
+def stop_python_dns_forwarder():
+    """Stop Python DNS forwarder."""
+    global _dns_forwarder
+    if _dns_forwarder:
+        _dns_forwarder.stop()
+        _dns_forwarder = None
+
 # ---------- gateway: DNS privacy stack ----------
 def fetch_blocklist_domains():
     try:
@@ -8614,6 +8796,49 @@ def api_gateway_remove_lan_domain():
         return jsonify({'success': True, 'lan_domains': lan_domains})
     except Exception as e:
         add_log('error', f'Failed to remove .lan domain: {e}')
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/gateway/dns/python/start', methods=['POST'])
+@require_auth
+def api_python_dns_start():
+    try:
+        lan_domains = STATE.get('lan_domains', ['pac.installCA.lan'])
+        blocked_domains = STATE.get('blocked_domains', list(DEFAULT_BLOCKED_DOMAINS))
+        success = start_python_dns_forwarder(listen_port=53, lan_domains=lan_domains, blocked_domains=blocked_domains)
+        if success:
+            add_log('success', 'Python DNS forwarder started on port 53')
+            return jsonify({'success': True, 'message': 'Python DNS forwarder started'})
+        else:
+            return jsonify({'success': False, 'error': 'Failed to bind port 53; try running as root'})
+    except Exception as e:
+        add_log('error', f'Python DNS forwarder start failed: {e}')
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/gateway/dns/python/stop', methods=['POST'])
+@require_auth
+def api_python_dns_stop():
+    stop_python_dns_forwarder()
+    add_log('info', 'Python DNS forwarder stopped')
+    return jsonify({'success': True, 'message': 'Python DNS forwarder stopped'})
+
+@app.route('/api/gateway/dns/python/fallback', methods=['POST'])
+@require_auth
+def api_python_dns_fallback():
+    """Attempt to start Python DNS forwarder on fallback port if port 53 is unavailable."""
+    try:
+        fallback_port = 5353  # mDNS port as fallback
+        _forwarder = PythonDNSForwarder(
+            listen_port=fallback_port,
+            lan_domains=STATE.get('lan_domains', ['pac.installCA.lan']),
+            blocked_domains=STATE.get('blocked_domains', list(DEFAULT_BLOCKED_DOMAINS))
+        )
+        if _forwarder.start():
+            add_log('warn', f'DNS forwarder running on port {fallback_port} (port 53 unavailable; update client DNS config)')
+            return jsonify({'success': True, 'message': f'DNS forwarder on fallback port {fallback_port}', 'port': fallback_port})
+        else:
+            return jsonify({'success': False, 'error': f'Failed to bind port {fallback_port}'})
+    except Exception as e:
+        add_log('error', f'DNS forwarder fallback failed: {e}')
         return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/api/selinux/status', methods=['GET'])
