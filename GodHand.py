@@ -3007,25 +3007,139 @@ def get_ngrok_public_url():
         return None
 
 # ---------- monitor mode ----------
-def set_monitor(iface, enable=True, raise_on_fail=False):
-    """Attempt to set monitor mode. Returns True on success, False otherwise."""
-    mode = 'monitor' if enable else 'managed'
+# Global state for Wi-Fi restoration
+_wifi_state = {'ssid': None, 'bssid': None, 'freq': None}
+
+def _save_wifi_state(iface):
+    """Save current Wi-Fi network info before switching to monitor mode."""
+    global _wifi_state
     try:
-        subprocess.run(['iw', 'dev', iface, 'set', 'type', mode],
-                       check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
-        if enable:
-            time.sleep(0.5)
-            out = subprocess.check_output(['iw', 'dev', iface, 'info'], text=True)
-            if 'type monitor' not in out:
-                raise RuntimeError(f'Failed to set monitor mode on {iface}')
+        # Try to get current connection info via iw
+        out = subprocess.check_output(['iw', 'dev', iface, 'link'], text=True, stderr=subprocess.PIPE)
+        for line in out.split('\n'):
+            if 'SSID:' in line:
+                _wifi_state['ssid'] = line.split('SSID:')[1].strip()
+            elif 'freq:' in line:
+                _wifi_state['freq'] = line.split('freq:')[1].strip().split()[0]
+        add_log('dev', f'Saved Wi-Fi state: SSID={_wifi_state.get("ssid")}, freq={_wifi_state.get("freq")}')
         return True
-    except subprocess.CalledProcessError as e:
-        if raise_on_fail:
-            raise RuntimeError(f'Monitor mode change failed (exit {e.returncode}). Interface may not support monitor mode.')
+    except:
+        add_log('dev', 'Could not save Wi-Fi state (interface may be disconnected)')
+        return False
+
+def _restore_wifi_state(iface):
+    """Attempt to restore Wi-Fi connection after switching back to managed mode."""
+    global _wifi_state
+    if not _wifi_state.get('ssid'):
+        add_log('dev', 'No saved Wi-Fi state to restore')
+        return False
+
+    try:
+        # Wait a moment for interface to stabilize
+        time.sleep(1)
+
+        # Try nmcli if available (preferred method)
+        try:
+            subprocess.run(['nmcli', 'device', 'wifi', 'connect', _wifi_state['ssid']],
+                         timeout=10, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+            add_log('success', f'Restored Wi-Fi connection to {_wifi_state["ssid"]} via nmcli')
+            return True
+        except:
+            pass
+
+        # Fallback: try wpa_cli reconnect
+        try:
+            subprocess.run(['wpa_cli', '-i', iface, 'reconnect'],
+                         timeout=5, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+            add_log('success', f'Restored Wi-Fi connection to {_wifi_state["ssid"]} via wpa_cli')
+            return True
+        except:
+            pass
+
+        add_log('warn', f'Failed to restore Wi-Fi connection to {_wifi_state["ssid"]} -- manual reconnection may be needed')
         return False
     except Exception as e:
+        add_log('warn', f'Error restoring Wi-Fi: {e}')
+        return False
+
+def set_monitor(iface, enable=True, raise_on_fail=False):
+    """Set monitor mode with proper interface lifecycle management.
+
+    - Enables: save Wi-Fi state → down → set monitor → up
+    - Disables: down → set managed → up → restore Wi-Fi
+    """
+    mode = 'monitor' if enable else 'managed'
+    try:
+        if enable:
+            # Before switching to monitor, save Wi-Fi state
+            _save_wifi_state(iface)
+
+            # Bring interface down
+            add_log('dev', f'Bringing {iface} down before monitor mode switch')
+            subprocess.run(['ip', 'link', 'set', iface, 'down'],
+                         check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE, timeout=5)
+            time.sleep(0.3)
+
+            # Switch to monitor mode
+            add_log('dev', f'Switching {iface} to monitor mode')
+            subprocess.run(['iw', 'dev', iface, 'set', 'type', mode],
+                         check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE, timeout=5)
+
+            # Bring interface back up
+            add_log('dev', f'Bringing {iface} up')
+            subprocess.run(['ip', 'link', 'set', iface, 'up'],
+                         check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE, timeout=5)
+
+            # Verify monitor mode is active
+            time.sleep(0.5)
+            out = subprocess.check_output(['iw', 'dev', iface, 'info'], text=True, timeout=5)
+            if 'type monitor' not in out:
+                raise RuntimeError(f'Failed to set monitor mode on {iface}')
+
+            add_log('success', f'Monitor mode enabled on {iface}')
+            return True
+        else:
+            # Bring interface down
+            add_log('dev', f'Bringing {iface} down before managed mode switch')
+            subprocess.run(['ip', 'link', 'set', iface, 'down'],
+                         check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE, timeout=5)
+            time.sleep(0.3)
+
+            # Switch to managed mode
+            add_log('dev', f'Switching {iface} to managed mode')
+            subprocess.run(['iw', 'dev', iface, 'set', 'type', mode],
+                         check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE, timeout=5)
+
+            # Bring interface back up
+            add_log('dev', f'Bringing {iface} up')
+            subprocess.run(['ip', 'link', 'set', iface, 'up'],
+                         check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE, timeout=5)
+
+            time.sleep(0.5)
+            add_log('success', f'Monitor mode disabled on {iface}, switched to managed')
+
+            # Attempt to restore Wi-Fi connection
+            _restore_wifi_state(iface)
+            return True
+
+    except subprocess.CalledProcessError as e:
+        err = e.stderr.decode(errors='ignore') if e.stderr else str(e)
+        msg = f'Monitor mode change failed (exit {e.returncode}, {err.strip()[-100:]}). Interface may not support monitor mode.'
         if raise_on_fail:
-            raise RuntimeError(str(e))
+            raise RuntimeError(msg)
+        add_log('error', msg)
+        return False
+    except subprocess.TimeoutExpired:
+        msg = f'Monitor mode change timed out on {iface}'
+        if raise_on_fail:
+            raise RuntimeError(msg)
+        add_log('error', msg)
+        return False
+    except Exception as e:
+        msg = f'Monitor mode error: {str(e)}'
+        if raise_on_fail:
+            raise RuntimeError(msg)
+        add_log('error', msg)
         return False
 
 def check_monitor_mode_ioctl(iface):
