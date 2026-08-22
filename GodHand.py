@@ -9,6 +9,7 @@ Run as root.
 
 import os
 import sys
+import stat
 import subprocess
 import time
 import json
@@ -2800,6 +2801,94 @@ def ping(target, count=1, timeout=5):
         # Socket-based ICMP (requires CAP_NET_RAW)
         return _ping_via_socket(target, timeout)
 
+# ---------- capability verification (CAP_NET_RAW, etc.) ----------
+def check_cap_net_raw():
+    """Verify CAP_NET_RAW capability for raw socket operations."""
+    try:
+        sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+        sock.close()
+        return True
+    except (OSError, AttributeError):
+        return False
+
+def check_capabilities():
+    """Check all critical capabilities and cache results."""
+    caps = {
+        'CAP_NET_RAW': check_cap_net_raw(),
+        'CAP_NET_ADMIN': _check_cap_net_admin(),
+        'root': os.geteuid() == 0 if hasattr(os, 'geteuid') else False
+    }
+    return caps
+
+def _check_cap_net_admin():
+    """Verify CAP_NET_ADMIN for iptables/routing operations."""
+    try:
+        # Try to read /proc/net/iptable_filter to verify iptables capability
+        with open('/proc/net/iptable_filter', 'r') as f:
+            f.read(1)
+        return True
+    except (OSError, IOError, FileNotFoundError):
+        return False
+
+def get_capability_status():
+    """Get current capability status for API and logging."""
+    caps = check_capabilities()
+    status = {
+        'has_cap_net_raw': caps['CAP_NET_RAW'],
+        'has_cap_net_admin': caps['CAP_NET_ADMIN'],
+        'is_root': caps['root'],
+        'packet_injection_enabled': caps['CAP_NET_RAW'],
+        'traffic_redirect_enabled': caps['CAP_NET_ADMIN'] and caps['root'],
+        'packet_capture_enabled': caps['CAP_NET_RAW'] or caps['root']
+    }
+    return status
+
+def attempt_capability_restoration():
+    """Try to restore missing CAP_NET_RAW capability."""
+    if check_cap_net_raw():
+        return True  # Already have it
+
+    # Try setcap if available
+    try:
+        python_path = sys.executable
+        result = subprocess.run(
+            ['setcap', 'cap_net_raw+ep', python_path],
+            capture_output=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            add_log('success', f'CAP_NET_RAW restored via setcap on {python_path}')
+            return True
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # Try setuid bit as fallback
+    try:
+        python_path = sys.executable
+        os.chmod(python_path, os.stat(python_path).st_mode | stat.S_ISUID)
+        add_log('warn', f'Applied setuid bit to {python_path} (less secure than setcap)')
+        return True
+    except Exception as e:
+        add_log('warn', f'Could not restore CAP_NET_RAW: {e}')
+        return False
+
+def verify_capabilities_on_startup():
+    """Verify capabilities at startup and log warnings/suggestions."""
+    caps = get_capability_status()
+
+    if not caps['is_root']:
+        add_log('warn', 'Not running as root; packet injection, iptables, and traffic redirection will fail')
+
+    if not caps['has_cap_net_raw']:
+        add_log('warn', 'CAP_NET_RAW not available; packet injection (ARP, deauth) will not work')
+        if attempt_capability_restoration():
+            add_log('success', 'CAP_NET_RAW capability restored')
+        else:
+            add_log('error', 'Could not restore CAP_NET_RAW; run as root or set CAP_NET_RAW manually')
+
+    if not caps['has_cap_net_admin']:
+        add_log('warn', 'CAP_NET_ADMIN not available; iptables/routing will not work')
+
 # ---------- gateway: DNS privacy stack ----------
 def fetch_blocklist_domains():
     try:
@@ -5580,6 +5669,9 @@ nav button .icon svg { display: block; }
     <div id="selinux-warning" class="status-message" style="display:none; border-left-color:var(--warning);">
       <strong>⚠️ SELinux is ENFORCING.</strong> Network operations may be blocked. <button class="btn" onclick="setSelinuxPermissive()" style="margin-left:10px; padding:8px 12px; font-size:0.9rem;">Set Permissive</button> or <button class="btn secondary" onclick="updateSelinuxStatus()" style="margin-left:6px; padding:8px 12px; font-size:0.9rem;">Refresh</button>
     </div>
+    <div id="capabilities-warning" class="status-message" style="display:none; border-left-color:var(--danger);">
+      <strong>⚠️ Critical capability missing:</strong> <span id="capabilities-warning-text">CAP_NET_RAW</span> required for packet injection. <button class="btn" onclick="restoreCapabilities()" style="margin-left:10px; padding:8px 12px; font-size:0.9rem;">Attempt Restore</button> or <button class="btn secondary" onclick="updateCapabilityStatus()" style="margin-left:6px; padding:8px 12px; font-size:0.9rem;">Refresh</button>
+    </div>
     <div class="card">
       <h2>Interface & gateway</h2>
       <p class="sub">Start here — set your Wi‑Fi interface and gateway IP before scanning or attacking.</p>
@@ -6917,6 +7009,54 @@ async function setSelinuxEnforcing() {
   }
 }
 
+// Capability verification
+async function updateCapabilityStatus() {
+  try {
+    const data = await apiCall('capabilities/status');
+    const caps = data.capabilities;
+    const capWarning = document.getElementById('capabilities-warning');
+    const capWarningText = document.getElementById('capabilities-warning-text');
+
+    let hasMissingCapability = false;
+    let missingCaps = [];
+
+    if (!caps.packet_injection_enabled) {
+      hasMissingCapability = true;
+      missingCaps.push('CAP_NET_RAW (packet injection)');
+    }
+
+    if (!caps.traffic_redirect_enabled && !caps.has_cap_net_admin) {
+      hasMissingCapability = true;
+      missingCaps.push('CAP_NET_ADMIN (traffic redirect)');
+    }
+
+    if (capWarning) {
+      if (hasMissingCapability) {
+        capWarning.style.display = 'block';
+        capWarningText.textContent = missingCaps.join(', ');
+      } else {
+        capWarning.style.display = 'none';
+      }
+    }
+  } catch(e) {
+    // Capabilities API not available
+  }
+}
+
+async function restoreCapabilities() {
+  try {
+    const data = await apiCall('capabilities/restore', 'POST');
+    if (data.success) {
+      showToast('Capability restoration attempted', 'success');
+      setTimeout(() => updateCapabilityStatus(), 1000);
+    } else {
+      showToast('Could not restore capabilities automatically; run as root', 'error');
+    }
+  } catch(e) {
+    showToast('Error: ' + e.message, 'error');
+  }
+}
+
 // Interface loading
 async function loadInterfaces() {
   try {
@@ -7529,6 +7669,7 @@ function initApp() {
   loadTargets();
   checkPrerequisites();
   updateSelinuxStatus();
+  updateCapabilityStatus();
   pollLogs();
   pollAttackStatus();
   pollTrafficCapture();
@@ -7541,6 +7682,7 @@ function initApp() {
   setInterval(pollBandwidth, 2000);
   setInterval(refreshGatewayStatus, 4000);
   setInterval(updateSelinuxStatus, 10000);
+  setInterval(updateCapabilityStatus, 10000);
 }
 
 // ========== HTTPS Interception (Phase 1.5) ==========
@@ -8534,6 +8676,25 @@ def api_diagnostics_ping():
     except Exception as e:
         add_log('error', f'Ping diagnostics failed for {target}: {e}')
         return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/capabilities/status', methods=['GET'])
+@require_auth
+def api_capabilities_status():
+    return jsonify({
+        'success': True,
+        'capabilities': get_capability_status()
+    })
+
+@app.route('/api/capabilities/restore', methods=['POST'])
+@require_auth
+def api_capabilities_restore():
+    restored = attempt_capability_restoration()
+    caps = get_capability_status()
+    return jsonify({
+        'success': restored,
+        'message': 'Attempted to restore CAP_NET_RAW capability',
+        'capabilities': caps
+    })
 
 @app.route('/api/https_injection/rules', methods=['GET'])
 @require_auth
@@ -9768,6 +9929,7 @@ if __name__ == '__main__':
     ensure_tool('iw')
     ensure_tool('iptables')
     start_selinux_monitoring()
+    verify_capabilities_on_startup()
     ddns_bootstrap_from_env()
     threading.Thread(target=ddns_supervisor_loop, daemon=True).start()
     app.run(host='0.0.0.0', port=APP_PORT, debug=False, threaded=True)
