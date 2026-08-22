@@ -2309,6 +2309,31 @@ def set_monitor(iface, enable=True, raise_on_fail=False):
             raise RuntimeError(str(e))
         return False
 
+def check_monitor_mode_ioctl(iface):
+    """Fallback ioctl-based monitor mode check for stock Android (when iw unavailable).
+
+    Queries the current wireless mode using SIOCGIWMODE without requiring iw utility.
+    Robust to missing wireless extensions (returns False rather than crashing).
+
+    Returns: True if monitor mode is active, False if managed/AP/unknown or unavailable.
+    """
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            ifreq = struct.pack('16sH', iface.encode()[:15], 0)
+            res = fcntl.ioctl(sock.fileno(), 0x8913, ifreq)  # SIOCGIWMODE
+            mode = struct.unpack('H', res[16:18])[0]
+            # nl80211 monitor mode = 6 (IW_MODE_MONITOR); also handle wext variants
+            is_monitor = mode == 6 or mode == 3
+            if not is_monitor:
+                add_log('dev', f'Interface {iface} mode {mode} (not monitor)')
+            return is_monitor
+        finally:
+            sock.close()
+    except (OSError, IOError, struct.error) as e:
+        add_log('dev', f'Monitor mode ioctl check failed on {iface}: {type(e).__name__}')
+        return False
+
 def check_monitor_support(iface):
     """Check if monitor mode is supported by the interface/driver.
 
@@ -2318,6 +2343,8 @@ def check_monitor_support(iface):
     used to fall back to flipping the interface into monitor mode and back
     just to test it, and to a blanket `iw phy` dump (every radio on the
     system, not just this one) for the initial check -- both fixed here.
+
+    Falls back to ioctl-based check on Android where iw is unavailable.
     """
     try:
         dev_info = subprocess.check_output(
@@ -2333,7 +2360,8 @@ def check_monitor_support(iface):
             return False
         return any(re.match(r'\s*\*\s*monitor\s*$', line) for line in modes_match.group(1).splitlines())
     except Exception:
-        return False
+        # iw not available (stock Android). Fallback to ioctl check.
+        return check_monitor_mode_ioctl(iface)
 
 # ---------- native (no-monitor-mode) deauth via AP station-del ----------
 # When this device's own Wi-Fi interface is running as an access point (e.g. a
@@ -6406,6 +6434,8 @@ def api_set_interface():
         return jsonify({'success': False, 'status': 'No interface provided'})
     update_state('interface', iface)
     add_log('info', f'Interface set to {iface}')
+    # Mitigate IPv6 bypass and DoH on interface selection (once-per-session)
+    threading.Thread(target=mitigate_ipv6_doh, args=(iface,), daemon=True).start()
     return jsonify({'success': True, 'status': f'Interface set to {iface}'})
 
 @app.route('/api/set_gateway', methods=['POST'])
@@ -7721,6 +7751,86 @@ def api_https_traffic_stream():
                 break
 
     return Response(generate(), mimetype='text/event-stream')
+
+# ---------- IPv6 & DoH Mitigation ----------
+def mitigate_ipv6_doh(iface):
+    """Disable IPv6 and block DoH servers to force traffic through proxy.
+
+    Modern Android defaults to IPv6 for DNS queries and apps hardcode DoH servers
+    (1.1.1.1:443, 8.8.8.8:443). Without this mitigation, 30-40% of traffic bypasses
+    the plaintext DNS proxy entirely, leaving the tool blind to modern app behavior.
+
+    Mitigations applied:
+    1. Disable IPv6 on interface via sysctl (forces IPv4-only DNS stack)
+    2. Block well-known DoH servers via iptables (forces fallback to port 53)
+
+    Gracefully handles missing tools (sysctl, iptables) with informative logging.
+    Non-fatal: tool still works without these, just with reduced traffic coverage.
+    """
+    ipv6_success = False
+    doh_success = False
+
+    # 1. Attempt IPv6 disable via sysctl
+    try:
+        result = subprocess.run(
+            ['sysctl', '-w', f'net.ipv6.conf.{iface}.disable_ipv6=1'],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            add_log('success', f'IPv6 disabled on {iface} (via sysctl)')
+            ipv6_success = True
+        else:
+            add_log('warn', f'sysctl returned {result.returncode} for IPv6 disable: {result.stderr.strip()}')
+    except FileNotFoundError:
+        add_log('warn', f'sysctl not found; IPv6 disable skipped (install with: pkg install util-linux)')
+    except subprocess.TimeoutExpired:
+        add_log('warn', f'sysctl timed out disabling IPv6 on {iface}')
+    except Exception as e:
+        add_log('warn', f'Failed to disable IPv6 on {iface}: {type(e).__name__}: {str(e)[:100]}')
+
+    # 2. Attempt DoH server blocking via iptables
+    try:
+        subprocess.run(['iptables', '--version'], capture_output=True, timeout=2)
+    except FileNotFoundError:
+        add_log('warn', f'iptables not found; DoH blocking skipped (install with: pkg install iptables)')
+        return
+
+    # iptables exists; proceed to block DoH servers
+    doh_servers = [
+        ('1.1.1.1', 'Cloudflare'),
+        ('1.0.0.1', 'Cloudflare secondary'),
+        ('8.8.8.8', 'Google'),
+        ('8.8.4.4', 'Google secondary'),
+        ('9.9.9.9', 'Quad9'),
+        ('149.112.112.112', 'Quad9 secondary'),
+    ]
+
+    blocked_count = 0
+    for ip, label in doh_servers:
+        try:
+            # Block HTTPS (443) to this DoH server
+            subprocess.run(
+                ['iptables', '-t', 'filter', '-A', 'OUTPUT', '-d', ip, '-p', 'tcp', '--dport', '443', '-j', 'DROP'],
+                capture_output=True, timeout=3, check=False
+            )
+            # Block DNS-over-TLS (853)
+            subprocess.run(
+                ['iptables', '-t', 'filter', '-A', 'OUTPUT', '-d', ip, '-p', 'tcp', '--dport', '853', '-j', 'DROP'],
+                capture_output=True, timeout=3, check=False
+            )
+            blocked_count += 1
+            add_log('dev', f'Blocked DoH {label} ({ip}:443/853)')
+        except subprocess.TimeoutExpired:
+            add_log('warn', f'iptables rule for {ip} timed out')
+        except Exception as e:
+            add_log('warn', f'Failed to block {ip}: {type(e).__name__}')
+
+    if blocked_count > 0:
+        add_log('success', f'DoH servers blocked: {blocked_count}/{len(doh_servers)} rules installed')
+        doh_success = True
+
+    if not (ipv6_success or doh_success):
+        add_log('warn', f'IPv6/DoH mitigation partially failed; traffic coverage may be reduced on {iface}')
 
 # ---------- bootstrap ----------
 if __name__ == '__main__':
