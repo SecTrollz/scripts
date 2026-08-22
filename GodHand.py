@@ -6306,11 +6306,6 @@ GODHAND_DDNS_ENABLED=1                  # optional, default on when the above ar
       </div>
     </div>
     <div class="card">
-      <h2>Live traffic capture</h2>
-      <p class="sub">Weapon 5 output — see the <strong>Monitor</strong> tab for the full capture &amp; analysis panel (top talkers, ports, live feed).</p>
-      <div id="attacks-traffic-status" class="status-message">Not capturing.</div>
-    </div>
-    <div class="card">
       <h2>Custom packet builder</h2>
       <p class="sub">Craft and send a raw Ethernet/IP frame yourself — your own MACs, IPs, ports, TCP flags, and payload. Capped at 50 sends per click; for sustained floods use the weapons above instead.</p>
       <div class="row">
@@ -6438,39 +6433,45 @@ GODHAND_DDNS_ENABLED=1                  # optional, default on when the above ar
       <div class="empty" id="traffic-empty" style="display:none;">Not capturing. Select weapon 5 on the Attacks tab and press Start.</div>
     </div>
     <div class="card">
-      <h2>Reassembled HTTP streams</h2>
-      <p class="sub">Fragmented HTTP requests/responses stitched back together from their TCP segments in sequence order — not just what a single packet's first line shows.</p>
-      <div id="tcp-streams-list"></div>
-      <div class="empty" id="tcp-streams-empty">No HTTP streams reassembled yet.</div>
-    </div>
-    <div class="card">
-      <h2>Paste an ARP snapshot</h2>
-      <p class="sub">Run <code>arp -a</code> and paste output below. Detects MAC changes.</p>
-      <textarea id="arp-input" placeholder="e.g. 192.168.1.1 aa:bb:cc:dd:ee:ff"></textarea>
-      <div class="row" style="margin-top:10px;">
-        <button class="btn" onclick="ingestArp()">Analyze snapshot</button>
-        <button class="btn secondary" onclick="clearArpHistory()">Clear history</button>
+      <h2 style="cursor:pointer; user-select:none;" onclick="toggleAdvancedTools()">▼ Reassembled HTTP streams & Analysis Tools</h2>
+      <div id="advanced-tools-section" style="display:block;">
+        <p class="sub" style="margin-top:0;">Fragmented HTTP requests/responses stitched back together from their TCP segments in sequence order — not just what a single packet's first line shows.</p>
+        <div id="tcp-streams-list"></div>
+        <div class="empty" id="tcp-streams-empty">No HTTP streams reassembled yet.</div>
+
+        <div style="margin-top:20px; padding-top:20px; border-top:1px solid #333;">
+          <h3 style="margin-top:0; font-size:0.95rem; color:#0f0;">Paste an ARP snapshot</h3>
+          <p class="sub">Run <code>arp -a</code> and paste output below. Detects MAC changes.</p>
+          <textarea id="arp-input" placeholder="e.g. 192.168.1.1 aa:bb:cc:dd:ee:ff" style="height:80px;"></textarea>
+          <div class="row" style="margin-top:10px;">
+            <button class="btn" onclick="ingestArp()">Analyze snapshot</button>
+            <button class="btn secondary" onclick="clearArpHistory()">Clear history</button>
+          </div>
+          <p class="sub" style="margin-top:10px;">Snapshots analyzed: <span id="arp-snap-count">0</span></p>
+        </div>
+
+        <div style="margin-top:15px; padding-top:15px; border-top:1px solid #333;">
+          <h3 style="margin-top:0; font-size:0.95rem; color:#0f0;">Paste deauth / frame-count log</h3>
+          <p class="sub">Format: numbers separated by comma or newline.</p>
+          <textarea id="deauth-input" placeholder="2,3,1,4,2,58,61,2,3" style="height:80px;"></textarea>
+          <div class="row" style="margin-top:10px;">
+            <button class="btn" onclick="analyzeDeauth()">Analyze log</button>
+          </div>
+        </div>
+
+        <div style="margin-top:15px; padding-top:15px; border-top:1px solid #333;">
+          <h3 style="margin-top:0; font-size:0.95rem; color:#0f0;">Alerts</h3>
+          <div id="alerts"></div>
+          <div class="empty" id="alerts-empty">No anomalies detected yet.</div>
+        </div>
+
+        <div style="margin-top:15px; padding-top:15px; border-top:1px solid #333;">
+          <h3 style="margin-top:0; font-size:0.95rem; color:#0f0;">Activity log (server-side)</h3>
+          <p class="sub">All actions are logged on the server.</p>
+          <button class="btn secondary" onclick="clearServerLogs()">Clear server log</button>
+          <div class="log-container" id="log-container"></div>
+        </div>
       </div>
-      <p class="sub" style="margin-top:10px;">Snapshots analyzed: <span id="arp-snap-count">0</span></p>
-    </div>
-    <div class="card">
-      <h2>Paste deauth / frame-count log</h2>
-      <p class="sub">Format: numbers separated by comma or newline.</p>
-      <textarea id="deauth-input" placeholder="2,3,1,4,2,58,61,2,3"></textarea>
-      <div class="row" style="margin-top:10px;">
-        <button class="btn" onclick="analyzeDeauth()">Analyze log</button>
-      </div>
-    </div>
-    <div class="card">
-      <h2>Alerts</h2>
-      <div id="alerts"></div>
-      <div class="empty" id="alerts-empty">No anomalies detected yet.</div>
-    </div>
-    <div class="card">
-      <h2>Activity log (server-side)</h2>
-      <p class="sub">All actions are logged on the server.</p>
-      <button class="btn secondary" onclick="clearServerLogs()">Clear server log</button>
-      <div class="log-container" id="log-container"></div>
     </div>
   </div>
 
@@ -6720,6 +6721,19 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     if (btn.dataset.tab === 'attacks') { refreshDeauthCapability(); refreshSynFloodCapability(); }
   });
 });
+
+// Advanced Tools Collapsible Section
+function toggleAdvancedTools() {
+  const section = document.getElementById('advanced-tools-section');
+  const h2 = event.target.closest('h2');
+  if (section.style.display === 'none') {
+    section.style.display = 'block';
+    h2.textContent = '▼ Reassembled HTTP streams & Analysis Tools';
+  } else {
+    section.style.display = 'none';
+    h2.textContent = '▶ Reassembled HTTP streams & Analysis Tools';
+  }
+}
 
 // HTTPS Sub-tabs
 function switchHttpsSubtab(subtabName) {
