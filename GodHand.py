@@ -34,6 +34,7 @@ import csv
 import ssl
 import gzip
 import fnmatch
+import signal
 from functools import wraps
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
@@ -2888,6 +2889,384 @@ def verify_capabilities_on_startup():
 
     if not caps['has_cap_net_admin']:
         add_log('warn', 'CAP_NET_ADMIN not available; iptables/routing will not work')
+
+# ---------- Process group management (Phase 6: Subprocess Isolation) ----------
+class ProcessGroup:
+    """Manages subprocess lifecycle with resource limits, automatic cleanup, and graceful restart."""
+
+    def __init__(self, name, max_processes=10, timeout_sec=300, memory_limit_mb=None, cpu_limit_percent=None):
+        self.name = name
+        self.max_processes = max_processes
+        self.timeout_sec = timeout_sec
+        self.memory_limit_mb = memory_limit_mb
+        self.cpu_limit_percent = cpu_limit_percent
+        self.processes = []  # List of (proc, start_time, description)
+        self.lock = threading.RLock()
+
+    def spawn(self, cmd, shell=False, description=""):
+        """Spawn subprocess with automatic cleanup on completion."""
+        with self.lock:
+            # Cleanup zombies before spawning new process
+            self._reap_zombies()
+
+            # Check process limit
+            if len(self.processes) >= self.max_processes:
+                add_log('warn', f'ProcessGroup {self.name}: max_processes ({self.max_processes}) reached')
+                return None
+
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    shell=shell,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    preexec_fn=os.setsid if not shell else None,  # Create process group
+                    text=True
+                )
+
+                start_time = time.time()
+                self.processes.append((proc, start_time, description))
+                add_log('dev', f'ProcessGroup {self.name}: spawned {description} (pid={proc.pid})')
+
+                # Spawn reaper daemon thread for this process
+                reaper_thread = threading.Thread(
+                    target=self._reap_process,
+                    args=(proc, start_time, description),
+                    daemon=True
+                )
+                reaper_thread.start()
+
+                return proc
+            except Exception as e:
+                add_log('error', f'ProcessGroup {self.name}: spawn failed for {description}: {e}')
+                return None
+
+    def _reap_process(self, proc, start_time, description):
+        """Reap a single process after timeout or completion."""
+        try:
+            # Wait for process with timeout
+            if proc.wait(timeout=self.timeout_sec) is None:
+                pass  # Process exited normally
+        except subprocess.TimeoutExpired:
+            add_log('warn', f'ProcessGroup {self.name}: {description} (pid={proc.pid}) timeout after {self.timeout_sec}s, terminating')
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                proc.wait(timeout=2)
+            except:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+                except:
+                    pass
+        except Exception as e:
+            add_log('warn', f'ProcessGroup {self.name}: reap_process error for {description}: {e}')
+        finally:
+            # Remove from process list
+            with self.lock:
+                self.processes = [(p, t, d) for p, t, d in self.processes if p.pid != proc.pid]
+
+    def _reap_zombies(self):
+        """Clean up zombie processes (call with lock held)."""
+        remaining = []
+        for proc, start_time, description in self.processes:
+            if proc.poll() is None:
+                # Still running
+                remaining.append((proc, start_time, description))
+            else:
+                # Exited, already reaped by wait()
+                add_log('dev', f'ProcessGroup {self.name}: reaped {description} (pid={proc.pid}, runtime={time.time()-start_time:.1f}s)')
+
+        self.processes = remaining
+
+    def terminate_all(self, graceful_timeout=2):
+        """Terminate all processes in group (non-blocking)."""
+        with self.lock:
+            if not self.processes:
+                return
+
+            pids_to_kill = [proc.pid for proc, _, _ in self.processes]
+            add_log('info', f'ProcessGroup {self.name}: terminating {len(pids_to_kill)} processes')
+
+            # Spawn async termination thread (non-blocking)
+            terminator = threading.Thread(
+                target=self._terminate_async,
+                args=(pids_to_kill, graceful_timeout),
+                daemon=True
+            )
+            terminator.start()
+
+    def _terminate_async(self, pids_to_kill, graceful_timeout):
+        """Terminate processes asynchronously (runs in daemon thread)."""
+        try:
+            # First pass: SIGTERM
+            for pid in pids_to_kill:
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGTERM)
+                except (ProcessLookupError, OSError):
+                    pass
+
+            # Wait for graceful termination
+            time.sleep(graceful_timeout)
+
+            # Second pass: SIGKILL for stragglers
+            for pid in pids_to_kill:
+                try:
+                    os.killpg(os.getpgid(pid), signal.SIGKILL)
+                except (ProcessLookupError, OSError):
+                    pass
+
+            # Reap the processes
+            time.sleep(0.1)
+            with self.lock:
+                self._reap_zombies()
+
+            add_log('info', f'ProcessGroup {self.name}: all processes terminated')
+        except Exception as e:
+            add_log('error', f'ProcessGroup {self.name}: error during termination: {e}')
+
+    def get_status(self):
+        """Get status of all processes in group."""
+        with self.lock:
+            self._reap_zombies()
+            status = {
+                'name': self.name,
+                'total': len(self.processes),
+                'processes': [
+                    {
+                        'pid': proc.pid,
+                        'description': desc,
+                        'runtime_sec': time.time() - start_time,
+                        'alive': proc.poll() is None
+                    }
+                    for proc, start_time, desc in self.processes
+                ]
+            }
+            return status
+
+    def is_running(self):
+        """Check if any processes are still running."""
+        with self.lock:
+            self._reap_zombies()
+            return len(self.processes) > 0
+
+# Global process groups for attack management
+attack_process_groups = {
+    'arp_spoofing': ProcessGroup('arp_spoofing', max_processes=20, timeout_sec=600),
+    'traffic_capture': ProcessGroup('traffic_capture', max_processes=10, timeout_sec=1800),
+    'deauth': ProcessGroup('deauth', max_processes=30, timeout_sec=300),
+    'dns_spoof': ProcessGroup('dns_spoof', max_processes=10, timeout_sec=900),
+    'gateway': ProcessGroup('gateway', max_processes=5, timeout_sec=3600),
+}
+
+def spawn_attack_process(group_name, cmd, weapon_id=None, shell=False, description=""):
+    """Spawn subprocess through ProcessGroup and optionally track in attack_pids.
+
+    Args:
+        group_name: Name of ProcessGroup ('arp_spoofing', 'traffic_capture', etc.)
+        cmd: Command to run (string if shell=True, list otherwise)
+        weapon_id: Optional weapon ID to track in STATE['attack_pids'] for stop control
+        shell: Whether to run via shell
+        description: Description for logging
+
+    Returns:
+        Subprocess handle, or None if spawn failed
+    """
+    if group_name not in attack_process_groups:
+        add_log('error', f'Unknown process group: {group_name}')
+        return None
+
+    group = attack_process_groups[group_name]
+    proc = group.spawn(cmd, shell=shell, description=description)
+
+    # Track in attack_pids if weapon_id provided (for existing stop control)
+    if proc and weapon_id is not None:
+        with STATE_LOCK:
+            if weapon_id not in STATE['attack_pids']:
+                STATE['attack_pids'][weapon_id] = []
+            STATE['attack_pids'][weapon_id].append(proc)
+
+    return proc
+
+# ---------- Python DNS forwarder (Unbound fallback) ----------
+class PythonDNSForwarder:
+    """Lightweight DNS server for hijacking .lan domains and blocking ad/tracking domains."""
+
+    def __init__(self, listen_ip='0.0.0.0', listen_port=53, upstream_servers=None, lan_domains=None, blocked_domains=None):
+        self.listen_ip = listen_ip
+        self.listen_port = listen_port
+        self.upstream_servers = upstream_servers or ['8.8.8.8', '8.8.4.4']
+        self.lan_domains = lan_domains or ['pac.installCA.lan']
+        self.blocked_domains = set(blocked_domains or [])
+        self.socket = None
+        self.running = False
+        self.request_cache = {}  # Simple cache for responses
+
+    def start(self):
+        """Start DNS forwarder in daemon thread."""
+        try:
+            self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self.socket.bind((self.listen_ip, self.listen_port))
+            self.running = True
+            add_log('success', f'Python DNS forwarder listening on {self.listen_ip}:{self.listen_port}')
+
+            thread = threading.Thread(target=self._dns_loop, daemon=True)
+            thread.start()
+            return True
+        except OSError as e:
+            add_log('error', f'Failed to start DNS forwarder on port {self.listen_port}: {e}')
+            return False
+
+    def stop(self):
+        """Stop DNS forwarder."""
+        self.running = False
+        try:
+            if self.socket:
+                self.socket.close()
+        except:
+            pass
+        add_log('info', 'DNS forwarder stopped')
+
+    def _dns_loop(self):
+        """Main DNS query handling loop."""
+        while self.running:
+            try:
+                self.socket.settimeout(2)
+                data, addr = self.socket.recvfrom(512)
+                threading.Thread(target=self._handle_query, args=(data, addr), daemon=True).start()
+            except socket.timeout:
+                continue
+            except Exception as e:
+                if self.running:
+                    add_log('warn', f'DNS loop error: {e}')
+
+    def _handle_query(self, data, addr):
+        """Handle single DNS query."""
+        try:
+            # Parse DNS query
+            txid = struct.unpack('!H', data[0:2])[0]
+            flags = struct.unpack('!H', data[2:4])[0]
+            qdcount = struct.unpack('!H', data[4:6])[0]
+
+            if not (flags & 0x8000):  # Query, not response
+                # Extract hostname from query
+                hostname = self._extract_hostname(data[12:])
+
+                # Check if .lan domain
+                if any(hostname.endswith(lan) for lan in self.lan_domains):
+                    response = self._build_response(txid, data, hostname, self._get_local_ip())
+                    self.socket.sendto(response, addr)
+                    return
+
+                # Check if blocked domain
+                if hostname.lower() in self.blocked_domains:
+                    response = self._build_nxdomain_response(txid, data, hostname)
+                    self.socket.sendto(response, addr)
+                    return
+
+                # Forward to upstream
+                self._forward_query(data, addr, txid)
+        except Exception as e:
+            add_log('warn', f'DNS query handling error: {e}')
+
+    def _extract_hostname(self, query_section):
+        """Extract hostname from DNS query section."""
+        try:
+            parts = []
+            idx = 0
+            while idx < len(query_section):
+                length = query_section[idx]
+                if length == 0:
+                    break
+                idx += 1
+                parts.append(query_section[idx:idx+length].decode('ascii', errors='ignore'))
+                idx += length
+            return '.'.join(parts)
+        except:
+            return ''
+
+    def _build_response(self, txid, original_query, hostname, local_ip):
+        """Build DNS A record response for .lan domain."""
+        # Response header (copied from query with response flag)
+        header = struct.pack('!HHHHHH', txid, 0x8400, 1, 1, 0, 0)
+
+        # Question section (copy from original)
+        question_start = 12
+        question_end = original_query.index(b'\x00\x01\x00\x01', question_start) + 4 if b'\x00\x01\x00\x01' in original_query[question_start:] else len(original_query)
+        question = original_query[question_start:question_end]
+
+        # Answer section: A record with local IP
+        hostname_bytes = self._encode_hostname(hostname)
+        answer = hostname_bytes + struct.pack('!HHIH', 1, 1, 300, 4)  # Type A, class IN, TTL 300s, length 4
+        answer += socket.inet_aton(local_ip)
+
+        return header + question + answer
+
+    def _build_nxdomain_response(self, txid, original_query, hostname):
+        """Build NXDOMAIN response for blocked domain."""
+        # Response header with NXDOMAIN (rcode=3)
+        header = struct.pack('!HHHHHH', txid, 0x8403, 1, 0, 0, 0)
+
+        # Question section
+        question_start = 12
+        question_end = original_query.index(b'\x00\x01\x00\x01', question_start) + 4 if b'\x00\x01\x00\x01' in original_query[question_start:] else len(original_query)
+        question = original_query[question_start:question_end]
+
+        return header + question
+
+    def _encode_hostname(self, hostname):
+        """Encode hostname to DNS name format."""
+        parts = hostname.rstrip('.').split('.')
+        encoded = b''
+        for part in parts:
+            encoded += struct.pack('!B', len(part)) + part.encode('ascii')
+        encoded += b'\x00'
+        return encoded
+
+    def _get_local_ip(self):
+        """Get device's local IP for .lan responses."""
+        return get_local_ip()
+
+    def _forward_query(self, data, client_addr, txid):
+        """Forward query to upstream DNS server."""
+        for upstream in self.upstream_servers:
+            try:
+                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock.settimeout(3)
+                sock.sendto(data, (upstream, 53))
+                response, _ = sock.recvfrom(512)
+                sock.close()
+                self.socket.sendto(response, client_addr)
+                return
+            except Exception:
+                continue
+
+        # If all upstreams fail, send SERVFAIL
+        header = struct.pack('!HHHHHH', txid, 0x8402, 1, 0, 0, 0)
+        self.socket.sendto(header + data[12:], client_addr)
+
+# Global DNS forwarder instance
+_dns_forwarder = None
+
+def start_python_dns_forwarder(listen_port=53, lan_domains=None, blocked_domains=None):
+    """Start Python DNS forwarder as fallback for Unbound."""
+    global _dns_forwarder
+    if _dns_forwarder and _dns_forwarder.running:
+        add_log('info', 'DNS forwarder already running')
+        return True
+
+    _dns_forwarder = PythonDNSForwarder(
+        listen_port=listen_port,
+        lan_domains=lan_domains or ['pac.installCA.lan'],
+        blocked_domains=blocked_domains or list(DEFAULT_BLOCKED_DOMAINS)
+    )
+    return _dns_forwarder.start()
+
+def stop_python_dns_forwarder():
+    """Stop Python DNS forwarder."""
+    global _dns_forwarder
+    if _dns_forwarder:
+        _dns_forwarder.stop()
+        _dns_forwarder = None
 
 # ---------- gateway: DNS privacy stack ----------
 def fetch_blocklist_domains():
@@ -8616,6 +8995,49 @@ def api_gateway_remove_lan_domain():
         add_log('error', f'Failed to remove .lan domain: {e}')
         return jsonify({'success': False, 'error': str(e)})
 
+@app.route('/api/gateway/dns/python/start', methods=['POST'])
+@require_auth
+def api_python_dns_start():
+    try:
+        lan_domains = STATE.get('lan_domains', ['pac.installCA.lan'])
+        blocked_domains = STATE.get('blocked_domains', list(DEFAULT_BLOCKED_DOMAINS))
+        success = start_python_dns_forwarder(listen_port=53, lan_domains=lan_domains, blocked_domains=blocked_domains)
+        if success:
+            add_log('success', 'Python DNS forwarder started on port 53')
+            return jsonify({'success': True, 'message': 'Python DNS forwarder started'})
+        else:
+            return jsonify({'success': False, 'error': 'Failed to bind port 53; try running as root'})
+    except Exception as e:
+        add_log('error', f'Python DNS forwarder start failed: {e}')
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/gateway/dns/python/stop', methods=['POST'])
+@require_auth
+def api_python_dns_stop():
+    stop_python_dns_forwarder()
+    add_log('info', 'Python DNS forwarder stopped')
+    return jsonify({'success': True, 'message': 'Python DNS forwarder stopped'})
+
+@app.route('/api/gateway/dns/python/fallback', methods=['POST'])
+@require_auth
+def api_python_dns_fallback():
+    """Attempt to start Python DNS forwarder on fallback port if port 53 is unavailable."""
+    try:
+        fallback_port = 5353  # mDNS port as fallback
+        _forwarder = PythonDNSForwarder(
+            listen_port=fallback_port,
+            lan_domains=STATE.get('lan_domains', ['pac.installCA.lan']),
+            blocked_domains=STATE.get('blocked_domains', list(DEFAULT_BLOCKED_DOMAINS))
+        )
+        if _forwarder.start():
+            add_log('warn', f'DNS forwarder running on port {fallback_port} (port 53 unavailable; update client DNS config)')
+            return jsonify({'success': True, 'message': f'DNS forwarder on fallback port {fallback_port}', 'port': fallback_port})
+        else:
+            return jsonify({'success': False, 'error': f'Failed to bind port {fallback_port}'})
+    except Exception as e:
+        add_log('error', f'DNS forwarder fallback failed: {e}')
+        return jsonify({'success': False, 'error': str(e)})
+
 @app.route('/api/selinux/status', methods=['GET'])
 @require_auth
 def api_selinux_status():
@@ -8695,6 +9117,26 @@ def api_capabilities_restore():
         'message': 'Attempted to restore CAP_NET_RAW capability',
         'capabilities': caps
     })
+
+@app.route('/api/process_groups/status', methods=['GET'])
+@require_auth
+def api_process_groups_status():
+    """Get status of all attack process groups."""
+    status = {}
+    for group_name, group in attack_process_groups.items():
+        status[group_name] = group.get_status()
+    return jsonify({'success': True, 'process_groups': status})
+
+@app.route('/api/process_groups/<group_name>/terminate', methods=['POST'])
+@require_auth
+def api_process_groups_terminate(group_name):
+    """Terminate all processes in a group (non-blocking)."""
+    if group_name not in attack_process_groups:
+        return jsonify({'success': False, 'error': f'Unknown process group: {group_name}'}), 400
+
+    group = attack_process_groups[group_name]
+    group.terminate_all()
+    return jsonify({'success': True, 'message': f'Termination initiated for {group_name}'})
 
 @app.route('/api/https_injection/rules', methods=['GET'])
 @require_auth
