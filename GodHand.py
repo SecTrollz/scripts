@@ -51,6 +51,20 @@ if not LOGIN_PASSWORD and not SECRET:
     print('  GODHAND_PASSWORD yourself to keep a stable login.')
     print('=' * 64)
 
+# ---------- termux environment detection ----------
+def is_termux():
+    """Detect if running in Termux environment."""
+    return os.path.exists('/data/data/com.termux') or os.environ.get('PREFIX', '').endswith('/usr')
+
+def get_cert_dir():
+    """Get certificate directory appropriate for environment (Termux-aware)."""
+    if is_termux():
+        prefix = os.environ.get('PREFIX', '/data/data/com.termux/files/usr')
+        cert_dir = os.path.join(prefix, 'var', 'godhand', 'certs')
+    else:
+        cert_dir = '/var/godhand/certs'
+    return cert_dir
+
 # ---------- gateway (DNS/VPN/proxy) configuration ----------
 GATEWAY_DIR = os.path.join(os.environ['PREFIX'], 'etc', 'godhand-gateway') if os.environ.get('PREFIX') else '/etc/godhand-gateway'
 GW_UNBOUND_CONF = os.path.join(GATEWAY_DIR, 'unbound.conf')
@@ -391,7 +405,9 @@ class CertificateCache:
 
 # Initialize certificate infrastructure on startup
 try:
-    CERT_AUTHORITY = CertificateAuthority('/var/godhand/certs')
+    cert_dir = get_cert_dir()
+    add_log('info', f'Using certificate directory: {cert_dir}')
+    CERT_AUTHORITY = CertificateAuthority(cert_dir)
     CERT_CACHE = CertificateCache(CERT_AUTHORITY)
     add_log('success', 'HTTPS certificate infrastructure initialized')
 except Exception as e:
