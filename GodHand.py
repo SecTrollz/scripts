@@ -5463,6 +5463,9 @@ nav button .icon svg { display: block; }
     <div id="root-warning" class="status-message" style="display:none; border-left-color:var(--danger);">
       <strong>Not running as root.</strong> Recon scanning, ARP Freeze, Deauth Flood, SYN Flood, DHCP Storm, and Traffic Capture all need raw sockets (and <code>iw</code>/<code>iptables</code> for some), which require root. Run this with <code>sudo</code> (or as root in Termux) or these will fail.
     </div>
+    <div id="selinux-warning" class="status-message" style="display:none; border-left-color:var(--warning);">
+      <strong>⚠️ SELinux is ENFORCING.</strong> Network operations may be blocked. <button class="btn" onclick="setSelinuxPermissive()" style="margin-left:10px; padding:8px 12px; font-size:0.9rem;">Set Permissive</button> or <button class="btn secondary" onclick="updateSelinuxStatus()" style="margin-left:6px; padding:8px 12px; font-size:0.9rem;">Refresh</button>
+    </div>
     <div class="card">
       <h2>Interface & gateway</h2>
       <p class="sub">Start here — set your Wi‑Fi interface and gateway IP before scanning or attacking.</p>
@@ -6750,6 +6753,56 @@ async function checkPrerequisites() {
   } catch(e) {}
 }
 
+// SELinux status check
+async function updateSelinuxStatus() {
+  try {
+    const data = await apiCall('selinux/status');
+    const selinuxWarning = document.getElementById('selinux-warning');
+    if (selinuxWarning) {
+      if (data.enforcing) {
+        selinuxWarning.style.display = 'block';
+        selinuxWarning.innerHTML = `<strong>⚠️ SELinux is ENFORCING.</strong> Network operations may be blocked. <button class="btn" onclick="setSelinuxPermissive()" style="margin-left:10px; padding:8px 12px; font-size:0.9rem;">Set Permissive</button> or <button class="btn secondary" onclick="updateSelinuxStatus()" style="margin-left:6px; padding:8px 12px; font-size:0.9rem;">Refresh</button>`;
+      } else if (data.status === 'Permissive') {
+        selinuxWarning.style.display = 'block';
+        selinuxWarning.style.borderLeftColor = 'var(--info)';
+        selinuxWarning.innerHTML = `<strong>ℹ️ SELinux is Permissive.</strong> Warnings logged but not enforced. <button class="btn secondary" onclick="setSelinuxEnforcing()" style="margin-left:10px; padding:8px 12px; font-size:0.9rem;">Set Enforcing</button>`;
+      } else {
+        selinuxWarning.style.display = 'none';
+      }
+    }
+  } catch(e) {
+    // SELinux not available or error querying status
+  }
+}
+
+async function setSelinuxPermissive() {
+  try {
+    const data = await apiCall('selinux/set_permissive', 'POST');
+    if (data.success) {
+      showToast('SELinux set to Permissive', 'success');
+      await updateSelinuxStatus();
+    } else {
+      showToast('Failed to set SELinux permissive: ' + (data.error || 'unknown'), 'error');
+    }
+  } catch(e) {
+    showToast('Error: ' + e.message, 'error');
+  }
+}
+
+async function setSelinuxEnforcing() {
+  try {
+    const data = await apiCall('selinux/set_enforcing', 'POST');
+    if (data.success) {
+      showToast('SELinux set to Enforcing', 'success');
+      await updateSelinuxStatus();
+    } else {
+      showToast('Failed to set SELinux enforcing: ' + (data.error || 'unknown'), 'error');
+    }
+  } catch(e) {
+    showToast('Error: ' + e.message, 'error');
+  }
+}
+
 // Interface loading
 async function loadInterfaces() {
   try {
@@ -7361,6 +7414,7 @@ function initApp() {
   loadInterfaces();
   loadTargets();
   checkPrerequisites();
+  updateSelinuxStatus();
   pollLogs();
   pollAttackStatus();
   pollTrafficCapture();
@@ -7372,6 +7426,7 @@ function initApp() {
   setInterval(pollTrafficCapture, 1000);
   setInterval(pollBandwidth, 2000);
   setInterval(refreshGatewayStatus, 4000);
+  setInterval(updateSelinuxStatus, 10000);
 }
 
 // ========== HTTPS Interception (Phase 1.5) ==========
@@ -8303,6 +8358,44 @@ def api_gateway_remove_lan_domain():
         return jsonify({'success': True, 'lan_domains': lan_domains})
     except Exception as e:
         add_log('error', f'Failed to remove .lan domain: {e}')
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/selinux/status', methods=['GET'])
+@require_auth
+def api_selinux_status():
+    status = check_selinux_status()
+    if status is None:
+        return jsonify({'success': True, 'status': 'disabled', 'enforcing': False})
+    return jsonify({'success': True, 'status': status, 'enforcing': status == 'Enforcing'})
+
+@app.route('/api/selinux/set_permissive', methods=['POST'])
+@require_auth
+def api_selinux_set_permissive():
+    try:
+        result = subprocess.run(['setenforce', '0'], capture_output=True, text=True, timeout=2)
+        if result.returncode == 0:
+            add_log('success', 'SELinux set to Permissive mode')
+            return jsonify({'success': True, 'message': 'SELinux set to Permissive'})
+        else:
+            add_log('error', f'setenforce failed: {result.stderr}')
+            return jsonify({'success': False, 'error': result.stderr})
+    except Exception as e:
+        add_log('error', f'Failed to set permissive: {e}')
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/selinux/set_enforcing', methods=['POST'])
+@require_auth
+def api_selinux_set_enforcing():
+    try:
+        result = subprocess.run(['setenforce', '1'], capture_output=True, text=True, timeout=2)
+        if result.returncode == 0:
+            add_log('success', 'SELinux set to Enforcing mode')
+            return jsonify({'success': True, 'message': 'SELinux set to Enforcing'})
+        else:
+            add_log('error', f'setenforce failed: {result.stderr}')
+            return jsonify({'success': False, 'error': result.stderr})
+    except Exception as e:
+        add_log('error', f'Failed to set enforcing: {e}')
         return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/api/https_injection/rules', methods=['GET'])
@@ -9475,12 +9568,69 @@ def mitigate_ipv6_doh(iface):
     if not (ipv6_success or doh_success):
         add_log('warn', f'IPv6/DoH mitigation partially failed; traffic coverage may be reduced on {iface}')
 
+# ---------- SELinux detection & monitoring ----------
+def check_selinux_status():
+    """Detect SELinux enforcement status (Enforcing/Permissive/Disabled)."""
+    try:
+        result = subprocess.run(['getenforce'], capture_output=True, text=True, timeout=2)
+        return result.stdout.strip()  # Returns: Enforcing|Permissive|Disabled
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+
+def _monitor_selinux_denials():
+    """Monitor audit.log for AVC denials in daemon thread."""
+    audit_log = '/data/misc/audit/audit.log' if os.path.exists('/data/misc/audit/audit.log') else '/var/log/audit/audit.log'
+    if not os.path.exists(audit_log):
+        return
+
+    last_size = 0
+    denial_count = 0
+
+    try:
+        while True:
+            try:
+                stat = os.stat(audit_log)
+                if stat.st_size > last_size:
+                    with open(audit_log, 'r') as f:
+                        f.seek(last_size)
+                        for line in f:
+                            if 'avc: denied' in line:
+                                denial_count += 1
+                                if 'af_packet' in line or 'raw_socket' in line:
+                                    add_log('warn', f'SELinux denied raw socket operation: {line[:100]}...')
+                                if denial_count == 1:
+                                    add_log('warn', 'SELinux AVC denials detected - may block packet injection')
+                    last_size = stat.st_size
+                time.sleep(5)
+            except (IOError, OSError):
+                time.sleep(5)
+                continue
+    except Exception as e:
+        add_log('error', f'SELinux denial monitor error: {e}')
+
+def start_selinux_monitoring():
+    """Start background thread to monitor SELinux denials."""
+    selinux_status = check_selinux_status()
+    if not selinux_status:
+        add_log('dev', 'SELinux not detected on system')
+        return
+
+    add_log('info', f'SELinux status: {selinux_status}')
+    if selinux_status == 'Enforcing':
+        add_log('warn', 'SELinux is ENFORCING - may block network operations; consider setting to Permissive')
+
+    # Start denial monitor thread (only if Enforcing)
+    if selinux_status == 'Enforcing':
+        monitor_thread = threading.Thread(target=_monitor_selinux_denials, daemon=True)
+        monitor_thread.start()
+
 # ---------- bootstrap ----------
 if __name__ == '__main__':
     if os.geteuid() != 0:
         print("WARNING: Not running as root. Some features (raw sockets, iptables) may fail.")
     ensure_tool('iw')
     ensure_tool('iptables')
+    start_selinux_monitoring()
     ddns_bootstrap_from_env()
     threading.Thread(target=ddns_supervisor_loop, daemon=True).start()
     app.run(host='0.0.0.0', port=APP_PORT, debug=False, threaded=True)
