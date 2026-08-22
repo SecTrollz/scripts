@@ -76,19 +76,53 @@ done
 
 # Install gateway services (DNS & proxy)
 echo -e "${BLUE}Installing gateway services (DNS & proxy)...${NC}"
-GATEWAY_TOOLS=(
-    "tinyproxy"
-    "dnscrypt-proxy"
-)
 
-for pkg in "${GATEWAY_TOOLS[@]}"; do
-    echo -n "  Installing $pkg... "
-    if pkg install -y "$pkg" > /dev/null 2>&1; then
+# Try to install tinyproxy
+echo -n "  Installing tinyproxy... "
+if pkg install -y tinyproxy > /dev/null 2>&1; then
+    if command -v tinyproxy &> /dev/null; then
         echo -e "${GREEN}✓${NC}"
     else
-        echo -e "${YELLOW}⚠ (failed, will retry or skip)${NC}"
+        echo -e "${YELLOW}⚠ (build needed)${NC}"
+        # Try building from source if not in repos
+        pkg install -y autoconf automake make > /dev/null 2>&1
     fi
-done
+else
+    echo -e "${YELLOW}⚠ (not available, using alternatives)${NC}"
+    # Try installing alternative proxy servers
+    for alt in squid-proxy privoxy; do
+        if pkg install -y "$alt" > /dev/null 2>&1; then
+            echo "  Found alternative proxy: $alt"
+            break
+        fi
+    done
+fi
+
+# Try to install dnscrypt-proxy
+echo -n "  Installing dnscrypt-proxy... "
+if pkg install -y dnscrypt-proxy > /dev/null 2>&1; then
+    if command -v dnscrypt-proxy &> /dev/null; then
+        echo -e "${GREEN}✓${NC}"
+    else
+        echo -e "${YELLOW}⚠ (verifying)${NC}"
+    fi
+else
+    echo -e "${YELLOW}⚠ (not in main repos)${NC}"
+    # Try rust-based installer
+    echo "  Attempting rust-based dnscrypt-proxy install..."
+    pkg install -y rust > /dev/null 2>&1
+    if command -v cargo &> /dev/null; then
+        cargo install dnscrypt-proxy > /dev/null 2>&1 || true
+    fi
+fi
+
+# Install unbound as DNS fallback
+echo -n "  Installing unbound (DNS fallback)... "
+if pkg install -y unbound > /dev/null 2>&1; then
+    echo -e "${GREEN}✓${NC}"
+else
+    echo -e "${YELLOW}⚠ (optional)${NC}"
+fi
 
 # Install network attack tools (if root)
 if [ "$EUID" -eq 0 ]; then
