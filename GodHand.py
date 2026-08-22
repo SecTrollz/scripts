@@ -4895,6 +4895,7 @@ nav button .icon svg { display: block; }
   <button class="tab-btn" data-tab="recon"><span class="icon"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg></span> Recon</button>
   <button class="tab-btn" data-tab="attacks"><span class="icon"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"></circle><circle cx="12" cy="12" r="6"></circle><circle cx="12" cy="12" r="2"></circle></svg></span> Attacks</button>
   <button class="tab-btn" data-tab="monitor"><span class="icon"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg></span> Monitor</button>
+  <button class="tab-btn" data-tab="https"><span class="icon"><svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path><line x1="12" y1="12" x2="12" y2="12.01"></line></svg></span> HTTPS</button>
 </nav>
 
 <main>
@@ -5322,6 +5323,92 @@ GODHAND_DDNS_ENABLED=1                  # optional, default on when the above ar
       <p class="sub">All actions are logged on the server.</p>
       <button class="btn secondary" onclick="clearServerLogs()">Clear server log</button>
       <div class="log-container" id="log-container"></div>
+    </div>
+  </div>
+
+  <div id="tab-https" class="tab-content">
+    <div class="card">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; flex-wrap:wrap; gap:8px;">
+        <h2 style="margin:0;">HTTPS traffic monitor</h2>
+        <span id="https-status-badge">Inactive</span>
+      </div>
+      <p class="sub">Real-time HTTPS interception: monitor encrypted traffic, inspect requests/responses, and apply injection rules.</p>
+      <div class="stat-row">
+        <div class="stat-tile"><span class="stat-value" id="https-stat-total">0</span><span class="stat-label">Requests</span></div>
+        <div class="stat-tile"><span class="stat-value" id="https-stat-hosts">0</span><span class="stat-label">Domains</span></div>
+        <div class="stat-tile"><span class="stat-value" id="https-stat-injected">0</span><span class="stat-label">Injected</span></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Live HTTPS traffic</h2>
+      <div class="table-responsive" style="max-height:400px; overflow-y:auto;">
+        <table>
+          <thead>
+            <tr>
+              <th style="min-width:150px;">Timestamp</th>
+              <th style="min-width:200px;">Domain</th>
+              <th>Method</th>
+              <th>Path</th>
+              <th>Status</th>
+              <th style="min-width:100px;">Size</th>
+            </tr>
+          </thead>
+          <tbody id="https-traffic-body">
+            <tr><td colspan="6" style="text-align:center; color:#999;">No HTTPS traffic captured yet. Gateway services must be running.</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Response injection rules</h2>
+      <p class="sub">Create rules to modify HTTPS responses: inject headers, remove headers, replace content, inject HTML.</p>
+
+      <div style="margin-bottom:16px; padding:12px; background:#1a1a1a; border:1px solid #444; border-radius:4px;">
+        <h3 style="margin-top:0; margin-bottom:8px; font-size:0.95rem;">New rule</h3>
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:8px;">
+          <div>
+            <label style="font-size:0.8rem; color:#999; display:block; margin-bottom:4px;">Domain pattern (*.example.com)</label>
+            <input type="text" id="rule-hostname" placeholder="*.example.com or *" style="width:100%; padding:6px; border:1px solid #555; background:#0a0a0a; color:#0f0; border-radius:4px;">
+          </div>
+          <div>
+            <label style="font-size:0.8rem; color:#999; display:block; margin-bottom:4px;">Action type</label>
+            <select id="rule-action" style="width:100%; padding:6px; border:1px solid #555; background:#0a0a0a; color:#0f0; border-radius:4px;">
+              <option value="add_header">Add header</option>
+              <option value="remove_header">Remove header</option>
+              <option value="replace_body">Replace text</option>
+              <option value="inject_html">Inject HTML</option>
+            </select>
+          </div>
+        </div>
+        <div>
+          <label style="font-size:0.8rem; color:#999; display:block; margin-bottom:4px;">Value</label>
+          <textarea id="rule-value" placeholder="Header-Name: value  OR  search|replace  OR  HTML code" style="width:100%; padding:6px; border:1px solid #555; background:#0a0a0a; color:#0f0; border-radius:4px; min-height:60px; font-family:monospace; font-size:0.85rem;"></textarea>
+        </div>
+        <div style="display:flex; gap:8px; margin-top:8px;">
+          <button class="btn" onclick="createInjectionRule()" style="flex:1;">Create rule</button>
+          <button class="btn secondary" onclick="clearRuleForm()" style="flex:1;">Clear</button>
+        </div>
+      </div>
+
+      <div id="rules-container">
+        <p style="color:#999; text-align:center;">Loading rules...</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>.lan domain management</h2>
+      <p class="sub">Configure custom .lan domains for transparent proxy discovery (e.g., pac.installCA.lan).</p>
+
+      <div style="display:flex; gap:8px; margin-bottom:12px;">
+        <input type="text" id="lan-domain-input" placeholder="custom.lan" style="flex:1; padding:6px; border:1px solid #555; background:#0a0a0a; color:#0f0; border-radius:4px;">
+        <button class="btn" onclick="addLanDomain()" style="min-width:100px;">Add domain</button>
+      </div>
+
+      <div id="lan-domains-list">
+        <p style="color:#999; text-align:center;">Loading domains...</p>
+      </div>
     </div>
   </div>
 </main>
@@ -6932,6 +7019,205 @@ console.log('%c╔════════════════════�
 console.log('%c║  GodHand v5 Developer Console Active             ║', 'color: #54B4EC; font-size: 12px;');
 console.log('%c║  Type: godDev.help()  for commands                ║', 'color: #54B4EC; font-size: 12px;');
 console.log('%c╚════════════════════════════════════════════════════╝', 'color: #54B4EC; font-size: 12px;');
+
+// HTTPS tab functions
+async function createInjectionRule() {
+  const hostname = document.getElementById('rule-hostname').value.trim();
+  const action = document.getElementById('rule-action').value;
+  const value = document.getElementById('rule-value').value.trim();
+
+  if (!hostname || !value) {
+    showToast('Hostname pattern and value required', 'error');
+    return;
+  }
+
+  try {
+    const res = await apiCall('https_injection/rules', 'POST', {
+      hostname_pattern: hostname,
+      action_type: action,
+      action_value: value,
+      enabled: true
+    });
+    if (res.success) {
+      showToast('Rule created: ' + res.id, 'success');
+      clearRuleForm();
+      loadInjectionRules();
+    } else {
+      showToast('Failed: ' + (res.error || 'unknown error'), 'error');
+    }
+  } catch(e) {
+    showToast('Error: ' + e.message, 'error');
+  }
+}
+
+function clearRuleForm() {
+  document.getElementById('rule-hostname').value = '';
+  document.getElementById('rule-action').value = 'add_header';
+  document.getElementById('rule-value').value = '';
+}
+
+async function loadInjectionRules() {
+  try {
+    const res = await apiCall('https_injection/rules');
+    const container = document.getElementById('rules-container');
+
+    if (!res.rules || res.rules.length === 0) {
+      container.innerHTML = '<p style="color:#999; text-align:center;">No injection rules created yet.</p>';
+      return;
+    }
+
+    let html = '<div style="display:grid; gap:8px;">';
+    res.rules.forEach(rule => {
+      html += `
+        <div style="padding:10px; background:#1a1a1a; border:1px solid #444; border-radius:4px; display:grid; grid-template-columns:1fr auto auto auto; gap:8px; align-items:center;">
+          <div>
+            <div><strong>${rule.hostname_pattern}</strong> → <code>${rule.action_type}</code></div>
+            <div style="color:#999; font-size:0.85rem; margin-top:4px;">${rule.action_value.substring(0, 50)}${rule.action_value.length > 50 ? '...' : ''}</div>
+          </div>
+          <label style="display:flex; align-items:center; gap:6px; cursor:pointer;">
+            <input type="checkbox" ${rule.enabled ? 'checked' : ''} onchange="toggleRuleEnabled('${rule.id}', this.checked)">
+            <span style="font-size:0.85rem; color:#999;">Enabled</span>
+          </label>
+          <button class="btn secondary" onclick="editRuleForm('${rule.id}')" style="min-width:60px; padding:4px 8px; font-size:0.85rem;">Edit</button>
+          <button class="btn danger" onclick="deleteInjectionRule('${rule.id}')" style="min-width:60px; padding:4px 8px; font-size:0.85rem;">Delete</button>
+        </div>
+      `;
+    });
+    html += '</div>';
+    container.innerHTML = html;
+  } catch(e) {
+    document.getElementById('rules-container').innerHTML = '<p style="color:#c44; text-align:center;">Error loading rules: ' + e.message + '</p>';
+  }
+}
+
+async function toggleRuleEnabled(ruleId, enabled) {
+  try {
+    const res = await apiCall('https_injection/rules/' + ruleId, 'PUT', { enabled });
+    if (res.success) {
+      loadInjectionRules();
+    }
+  } catch(e) {
+    showToast('Error: ' + e.message, 'error');
+  }
+}
+
+async function deleteInjectionRule(ruleId) {
+  if (!confirm('Delete this injection rule?')) return;
+  try {
+    const res = await apiCall('https_injection/rules/' + ruleId, 'DELETE');
+    if (res.success) {
+      showToast('Rule deleted', 'success');
+      loadInjectionRules();
+    }
+  } catch(e) {
+    showToast('Error: ' + e.message, 'error');
+  }
+}
+
+async function addLanDomain() {
+  const domain = document.getElementById('lan-domain-input').value.trim();
+  if (!domain) {
+    showToast('Domain required', 'error');
+    return;
+  }
+  if (!domain.endsWith('.lan')) {
+    showToast('Domain must end with .lan', 'error');
+    return;
+  }
+
+  try {
+    const res = await apiCall('gateway/dns/add_lan_domain', 'POST', { domain });
+    if (res.success) {
+      showToast('Domain added: ' + domain, 'success');
+      document.getElementById('lan-domain-input').value = '';
+      loadLanDomains();
+    } else {
+      showToast('Failed: ' + (res.error || 'unknown'), 'error');
+    }
+  } catch(e) {
+    showToast('Error: ' + e.message, 'error');
+  }
+}
+
+async function loadLanDomains() {
+  try {
+    const res = await apiCall('gateway/dns/lan_domains');
+    const container = document.getElementById('lan-domains-list');
+
+    if (!res.lan_domains || res.lan_domains.length === 0) {
+      container.innerHTML = '<p style="color:#999; text-align:center;">No .lan domains configured.</p>';
+      return;
+    }
+
+    let html = '<div style="display:grid; gap:6px;">';
+    res.lan_domains.forEach(domain => {
+      html += `
+        <div style="padding:8px 12px; background:#1a1a1a; border:1px solid #444; border-radius:4px; display:flex; justify-content:space-between; align-items:center;">
+          <code>${domain}</code>
+          <button class="btn danger" onclick="deleteLanDomain('${domain}')" style="padding:4px 8px; font-size:0.85rem;">Remove</button>
+        </div>
+      `;
+    });
+    html += '</div>';
+    container.innerHTML = html;
+  } catch(e) {
+    document.getElementById('lan-domains-list').innerHTML = '<p style="color:#c44; text-align:center;">Error loading domains</p>';
+  }
+}
+
+async function deleteLanDomain(domain) {
+  if (!confirm('Remove ' + domain + '?')) return;
+  try {
+    const res = await apiCall('gateway/dns/remove_lan_domain', 'POST', { domain });
+    if (res.success) {
+      showToast('Domain removed', 'success');
+      loadLanDomains();
+    }
+  } catch(e) {
+    showToast('Error: ' + e.message, 'error');
+  }
+}
+
+async function updateHttpsTraffic() {
+  try {
+    const res = await apiCall('https_traffic?limit=50');
+    const tbody = document.getElementById('https-traffic-body');
+
+    if (!res.traffic || res.traffic.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; color:#999;">No traffic captured</td></tr>';
+      return;
+    }
+
+    let html = '';
+    res.traffic.slice(0, 20).forEach(entry => {
+      const ts = new Date(entry.timestamp * 1000).toLocaleTimeString();
+      html += `<tr><td>${ts}</td><td>${entry.hostname || '—'}</td><td>${entry.method || '—'}</td><td>${entry.path || '—'}</td><td>${entry.status_code || '—'}</td><td>${formatBytes(entry.bytes || 0)}</td></tr>`;
+    });
+    tbody.innerHTML = html;
+  } catch(e) {}
+}
+
+function formatBytes(bytes) {
+  if (bytes === 0) return '0 B';
+  const k = 1024;
+  const sizes = ['B', 'KB', 'MB'];
+  const i = Math.floor(Math.log(bytes) / Math.log(k));
+  return Math.round((bytes / Math.pow(k, i)) * 10) / 10 + ' ' + sizes[i];
+}
+
+// Initialize HTTPS tab when tab is shown
+document.querySelectorAll('.tab-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    if (btn.dataset.tab === 'https') {
+      setTimeout(() => {
+        loadInjectionRules();
+        loadLanDomains();
+        updateHttpsTraffic();
+        setInterval(updateHttpsTraffic, 2000);
+      }, 100);
+    }
+  });
+});
 
 checkLoginRequired();
 </script>
