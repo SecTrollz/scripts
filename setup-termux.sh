@@ -74,6 +74,22 @@ for pkg in "${PACKAGES[@]}"; do
     fi
 done
 
+# Install gateway services (DNS & proxy)
+echo -e "${BLUE}Installing gateway services (DNS & proxy)...${NC}"
+GATEWAY_TOOLS=(
+    "tinyproxy"
+    "dnscrypt-proxy"
+)
+
+for pkg in "${GATEWAY_TOOLS[@]}"; do
+    echo -n "  Installing $pkg... "
+    if pkg install -y "$pkg" > /dev/null 2>&1; then
+        echo -e "${GREEN}✓${NC}"
+    else
+        echo -e "${YELLOW}⚠ (failed, will retry or skip)${NC}"
+    fi
+done
+
 # Install network attack tools (if root)
 if [ "$EUID" -eq 0 ]; then
     echo -e "${BLUE}Installing network attack tools (requires root)...${NC}"
@@ -90,6 +106,15 @@ if [ "$EUID" -eq 0 ]; then
             echo -e "${YELLOW}⚠ (may not be available)${NC}"
         fi
     done
+fi
+
+# Install proot as fallback for non-root environments
+echo -e "${BLUE}Installing proot (fallback for non-root packet injection)...${NC}"
+echo -n "  Installing proot... "
+if pkg install -y proot > /dev/null 2>&1; then
+    echo -e "${GREEN}✓${NC}"
+else
+    echo -e "${YELLOW}⚠ (optional, skipping)${NC}"
 fi
 
 # Install Python dependencies
@@ -204,6 +229,16 @@ echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}  Setup Complete!${NC}"
 echo -e "${GREEN}========================================${NC}"
 echo ""
+echo "Installed Components:"
+echo "  ✓ GodHand (main application)"
+echo "  ✓ Flask (web framework)"
+echo "  ✓ OpenSSL (certificate generation)"
+echo "  ✓ tinyproxy (HTTP proxy)"
+echo "  ✓ dnscrypt-proxy (DNS encryption)"
+if command -v proot &> /dev/null; then
+    echo "  ✓ proot (fallback for non-root packet injection)"
+fi
+echo ""
 echo "Next steps:"
 echo ""
 echo "1. ${YELLOW}Start GodHand:${NC}"
@@ -222,11 +257,25 @@ echo "   Set these in your shell profile (~/.bashrc):"
 echo "   ${BLUE}export GODHAND_PASSWORD='${GODHAND_PASSWORD}'${NC}"
 echo "   ${BLUE}export GODHAND_SECRET='${GODHAND_SECRET}'${NC}"
 echo ""
-echo "5. ${YELLOW}Certificate directory:${NC}"
-echo "   ${BLUE}$PREFIX/var/godhand/certs${NC}"
+echo "5. ${YELLOW}Directories:${NC}"
+echo "   Certificates: ${BLUE}$PREFIX/var/godhand/certs${NC}"
+echo "   Logs: ${BLUE}$PREFIX/var/godhand/logs${NC}"
+echo "   Config: ${BLUE}$PREFIX/etc/godhand-gateway${NC}"
 echo ""
-echo "6. ${YELLOW}Logs directory:${NC}"
-echo "   ${BLUE}$PREFIX/var/godhand/logs${NC}"
+echo "6. ${YELLOW}Gateway Services:${NC}"
+if command -v tinyproxy &> /dev/null; then
+    echo "   tinyproxy: ${BLUE}$PREFIX/bin/tinyproxy${NC} (HTTP proxy on port 8888)"
+fi
+if command -v dnscrypt-proxy &> /dev/null; then
+    echo "   dnscrypt-proxy: ${BLUE}$PREFIX/bin/dnscrypt-proxy${NC} (DNS on port 5353)"
+fi
+if command -v proot &> /dev/null; then
+    echo "   proot: Available for non-root packet injection"
+fi
+echo ""
+echo "7. ${YELLOW}Non-Root Mode (if running without su):${NC}"
+echo "   proot can simulate root for packet injection:"
+echo "   ${BLUE}proot -r / godhand-start${NC}"
 echo ""
 echo -e "${YELLOW}Documentation:${NC}"
 echo "  Setup Guide: ${BLUE}HTTPS_SETUP_GUIDE.md${NC}"
