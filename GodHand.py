@@ -2686,6 +2686,120 @@ def simple_dns_query(domain, server='127.0.0.1', port=53, timeout=3):
     _, flags, _, ancount = struct.unpack('!HHHH', data[:8])
     return {'rcode': flags & 0x000F, 'answer_count': ancount}
 
+# ---------- ping wrapper for Android/Linux compatibility ----------
+_PING_METHOD_CACHE = None
+
+def _detect_ping_method():
+    """Detect available ping binary and method on this system."""
+    global _PING_METHOD_CACHE
+    if _PING_METHOD_CACHE:
+        return _PING_METHOD_CACHE
+
+    # Try ping binaries in order of preference
+    ping_paths = [
+        ('/bin/ping', ['-c', '1']),
+        ('/system/bin/ping', ['-c', '1']),
+        ('/bin/busybox', ['ping', '-c', '1']),
+        ('ping', ['-c', '1']),
+    ]
+
+    for binary, args in ping_paths:
+        try:
+            result = subprocess.run([binary] + args + ['127.0.0.1'], capture_output=True, timeout=2)
+            if result.returncode in (0, 1):  # Success or timeout
+                _PING_METHOD_CACHE = ('binary', binary, args)
+                add_log('dev', f'Ping method detected: {binary}')
+                return _PING_METHOD_CACHE
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            continue
+
+    # Fallback to socket-based ICMP ping
+    _PING_METHOD_CACHE = ('socket', None, None)
+    add_log('dev', 'Ping method: socket-based ICMP (fallback)')
+    return _PING_METHOD_CACHE
+
+def _ping_via_socket(target, timeout=5):
+    """Send ICMP ECHO_REQUEST via raw socket."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+        sock.settimeout(timeout)
+
+        # Build ICMP packet (type 8 = ECHO_REQUEST)
+        icmp_type = 8
+        icmp_code = 0
+        icmp_checksum = 0
+        icmp_id = os.getpid() & 0xFFFF
+        icmp_seq = 1
+
+        icmp_header = struct.pack('!BBHHH', icmp_type, icmp_code, icmp_checksum, icmp_id, icmp_seq)
+        icmp_data = b'GodHand ping'
+
+        # Calculate checksum
+        icmp_checksum = sum(struct.unpack('!H', icmp_header[i:i+2])[0] for i in range(0, len(icmp_header), 2))
+        if len(icmp_data) % 2:
+            icmp_data += b'\x00'
+        icmp_checksum += sum(struct.unpack('!H', icmp_data[i:i+2])[0] for i in range(0, len(icmp_data), 2))
+        icmp_checksum = (icmp_checksum + (icmp_checksum >> 16)) & 0xFFFF
+        icmp_checksum = ~icmp_checksum & 0xFFFF
+
+        icmp_header = struct.pack('!BBHHH', icmp_type, icmp_code, icmp_checksum, icmp_id, icmp_seq)
+        icmp_packet = icmp_header + icmp_data
+
+        start = time.time()
+        sock.sendto(icmp_packet, (target, 0))
+        data, _ = sock.recvfrom(1024)
+        elapsed = (time.time() - start) * 1000  # Convert to ms
+
+        sock.close()
+        return {'available': True, 'latency_ms': int(elapsed), 'packet_loss': 0}
+    except Exception as e:
+        try:
+            sock.close()
+        except:
+            pass
+        return {'available': False, 'latency_ms': None, 'packet_loss': 100, 'error': str(e)}
+
+def ping(target, count=1, timeout=5):
+    """
+    Cross-platform ping wrapper for Android/Linux compatibility.
+    Returns: {'available': bool, 'latency_ms': int, 'packet_loss': int, 'error': str}
+    """
+    method, binary, args = _detect_ping_method()
+
+    if method == 'binary':
+        try:
+            result = subprocess.run(
+                [binary] + args + [target],
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+
+            output = result.stdout + result.stderr
+
+            # Parse latency from output (format: "time=10.5 ms")
+            latency_match = re.search(r'time[=:]\s*(\d+(?:\.\d+)?)', output)
+            latency_ms = int(float(latency_match.group(1))) if latency_match else None
+
+            # Parse packet loss (format: "0% packet loss" or "0 packets lost")
+            loss_match = re.search(r'(\d+)%\s*(?:packet\s+)?loss', output)
+            packet_loss = int(loss_match.group(1)) if loss_match else (0 if result.returncode == 0 else 100)
+
+            available = packet_loss < 100
+
+            return {
+                'available': available,
+                'latency_ms': latency_ms,
+                'packet_loss': packet_loss
+            }
+        except subprocess.TimeoutExpired:
+            return {'available': False, 'latency_ms': None, 'packet_loss': 100, 'error': 'timeout'}
+        except Exception as e:
+            return {'available': False, 'latency_ms': None, 'packet_loss': 100, 'error': str(e)}
+    else:
+        # Socket-based ICMP (requires CAP_NET_RAW)
+        return _ping_via_socket(target, timeout)
+
 # ---------- gateway: DNS privacy stack ----------
 def fetch_blocklist_domains():
     try:
@@ -8396,6 +8510,29 @@ def api_selinux_set_enforcing():
             return jsonify({'success': False, 'error': result.stderr})
     except Exception as e:
         add_log('error', f'Failed to set enforcing: {e}')
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/diagnostics/ping', methods=['POST'])
+@require_auth
+def api_diagnostics_ping():
+    data = request.json or {}
+    target = data.get('target', 'google.com').strip()
+
+    if not target:
+        return jsonify({'success': False, 'error': 'Target required'})
+
+    try:
+        result = ping(target, timeout=5)
+        return jsonify({
+            'success': True,
+            'target': target,
+            'available': result.get('available'),
+            'latency_ms': result.get('latency_ms'),
+            'packet_loss': result.get('packet_loss'),
+            'error': result.get('error')
+        })
+    except Exception as e:
+        add_log('error', f'Ping diagnostics failed for {target}: {e}')
         return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/api/https_injection/rules', methods=['GET'])
