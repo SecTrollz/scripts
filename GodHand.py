@@ -9,6 +9,7 @@ Run as root.
 
 import os
 import sys
+import stat
 import subprocess
 import time
 import json
@@ -2685,6 +2686,208 @@ def simple_dns_query(domain, server='127.0.0.1', port=53, timeout=3):
         s.close()
     _, flags, _, ancount = struct.unpack('!HHHH', data[:8])
     return {'rcode': flags & 0x000F, 'answer_count': ancount}
+
+# ---------- ping wrapper for Android/Linux compatibility ----------
+_PING_METHOD_CACHE = None
+
+def _detect_ping_method():
+    """Detect available ping binary and method on this system."""
+    global _PING_METHOD_CACHE
+    if _PING_METHOD_CACHE:
+        return _PING_METHOD_CACHE
+
+    # Try ping binaries in order of preference
+    ping_paths = [
+        ('/bin/ping', ['-c', '1']),
+        ('/system/bin/ping', ['-c', '1']),
+        ('/bin/busybox', ['ping', '-c', '1']),
+        ('ping', ['-c', '1']),
+    ]
+
+    for binary, args in ping_paths:
+        try:
+            result = subprocess.run([binary] + args + ['127.0.0.1'], capture_output=True, timeout=2)
+            if result.returncode in (0, 1):  # Success or timeout
+                _PING_METHOD_CACHE = ('binary', binary, args)
+                add_log('dev', f'Ping method detected: {binary}')
+                return _PING_METHOD_CACHE
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            continue
+
+    # Fallback to socket-based ICMP ping
+    _PING_METHOD_CACHE = ('socket', None, None)
+    add_log('dev', 'Ping method: socket-based ICMP (fallback)')
+    return _PING_METHOD_CACHE
+
+def _ping_via_socket(target, timeout=5):
+    """Send ICMP ECHO_REQUEST via raw socket."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
+        sock.settimeout(timeout)
+
+        # Build ICMP packet (type 8 = ECHO_REQUEST)
+        icmp_type = 8
+        icmp_code = 0
+        icmp_checksum = 0
+        icmp_id = os.getpid() & 0xFFFF
+        icmp_seq = 1
+
+        icmp_header = struct.pack('!BBHHH', icmp_type, icmp_code, icmp_checksum, icmp_id, icmp_seq)
+        icmp_data = b'GodHand ping'
+
+        # Calculate checksum
+        icmp_checksum = sum(struct.unpack('!H', icmp_header[i:i+2])[0] for i in range(0, len(icmp_header), 2))
+        if len(icmp_data) % 2:
+            icmp_data += b'\x00'
+        icmp_checksum += sum(struct.unpack('!H', icmp_data[i:i+2])[0] for i in range(0, len(icmp_data), 2))
+        icmp_checksum = (icmp_checksum + (icmp_checksum >> 16)) & 0xFFFF
+        icmp_checksum = ~icmp_checksum & 0xFFFF
+
+        icmp_header = struct.pack('!BBHHH', icmp_type, icmp_code, icmp_checksum, icmp_id, icmp_seq)
+        icmp_packet = icmp_header + icmp_data
+
+        start = time.time()
+        sock.sendto(icmp_packet, (target, 0))
+        data, _ = sock.recvfrom(1024)
+        elapsed = (time.time() - start) * 1000  # Convert to ms
+
+        sock.close()
+        return {'available': True, 'latency_ms': int(elapsed), 'packet_loss': 0}
+    except Exception as e:
+        try:
+            sock.close()
+        except:
+            pass
+        return {'available': False, 'latency_ms': None, 'packet_loss': 100, 'error': str(e)}
+
+def ping(target, count=1, timeout=5):
+    """
+    Cross-platform ping wrapper for Android/Linux compatibility.
+    Returns: {'available': bool, 'latency_ms': int, 'packet_loss': int, 'error': str}
+    """
+    method, binary, args = _detect_ping_method()
+
+    if method == 'binary':
+        try:
+            result = subprocess.run(
+                [binary] + args + [target],
+                capture_output=True,
+                text=True,
+                timeout=timeout
+            )
+
+            output = result.stdout + result.stderr
+
+            # Parse latency from output (format: "time=10.5 ms")
+            latency_match = re.search(r'time[=:]\s*(\d+(?:\.\d+)?)', output)
+            latency_ms = int(float(latency_match.group(1))) if latency_match else None
+
+            # Parse packet loss (format: "0% packet loss" or "0 packets lost")
+            loss_match = re.search(r'(\d+)%\s*(?:packet\s+)?loss', output)
+            packet_loss = int(loss_match.group(1)) if loss_match else (0 if result.returncode == 0 else 100)
+
+            available = packet_loss < 100
+
+            return {
+                'available': available,
+                'latency_ms': latency_ms,
+                'packet_loss': packet_loss
+            }
+        except subprocess.TimeoutExpired:
+            return {'available': False, 'latency_ms': None, 'packet_loss': 100, 'error': 'timeout'}
+        except Exception as e:
+            return {'available': False, 'latency_ms': None, 'packet_loss': 100, 'error': str(e)}
+    else:
+        # Socket-based ICMP (requires CAP_NET_RAW)
+        return _ping_via_socket(target, timeout)
+
+# ---------- capability verification (CAP_NET_RAW, etc.) ----------
+def check_cap_net_raw():
+    """Verify CAP_NET_RAW capability for raw socket operations."""
+    try:
+        sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+        sock.close()
+        return True
+    except (OSError, AttributeError):
+        return False
+
+def check_capabilities():
+    """Check all critical capabilities and cache results."""
+    caps = {
+        'CAP_NET_RAW': check_cap_net_raw(),
+        'CAP_NET_ADMIN': _check_cap_net_admin(),
+        'root': os.geteuid() == 0 if hasattr(os, 'geteuid') else False
+    }
+    return caps
+
+def _check_cap_net_admin():
+    """Verify CAP_NET_ADMIN for iptables/routing operations."""
+    try:
+        # Try to read /proc/net/iptable_filter to verify iptables capability
+        with open('/proc/net/iptable_filter', 'r') as f:
+            f.read(1)
+        return True
+    except (OSError, IOError, FileNotFoundError):
+        return False
+
+def get_capability_status():
+    """Get current capability status for API and logging."""
+    caps = check_capabilities()
+    status = {
+        'has_cap_net_raw': caps['CAP_NET_RAW'],
+        'has_cap_net_admin': caps['CAP_NET_ADMIN'],
+        'is_root': caps['root'],
+        'packet_injection_enabled': caps['CAP_NET_RAW'],
+        'traffic_redirect_enabled': caps['CAP_NET_ADMIN'] and caps['root'],
+        'packet_capture_enabled': caps['CAP_NET_RAW'] or caps['root']
+    }
+    return status
+
+def attempt_capability_restoration():
+    """Try to restore missing CAP_NET_RAW capability."""
+    if check_cap_net_raw():
+        return True  # Already have it
+
+    # Try setcap if available
+    try:
+        python_path = sys.executable
+        result = subprocess.run(
+            ['setcap', 'cap_net_raw+ep', python_path],
+            capture_output=True,
+            timeout=5
+        )
+        if result.returncode == 0:
+            add_log('success', f'CAP_NET_RAW restored via setcap on {python_path}')
+            return True
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+
+    # Try setuid bit as fallback
+    try:
+        python_path = sys.executable
+        os.chmod(python_path, os.stat(python_path).st_mode | stat.S_ISUID)
+        add_log('warn', f'Applied setuid bit to {python_path} (less secure than setcap)')
+        return True
+    except Exception as e:
+        add_log('warn', f'Could not restore CAP_NET_RAW: {e}')
+        return False
+
+def verify_capabilities_on_startup():
+    """Verify capabilities at startup and log warnings/suggestions."""
+    caps = get_capability_status()
+
+    if not caps['is_root']:
+        add_log('warn', 'Not running as root; packet injection, iptables, and traffic redirection will fail')
+
+    if not caps['has_cap_net_raw']:
+        add_log('warn', 'CAP_NET_RAW not available; packet injection (ARP, deauth) will not work')
+        if attempt_capability_restoration():
+            add_log('success', 'CAP_NET_RAW capability restored')
+        else:
+            add_log('error', 'Could not restore CAP_NET_RAW; run as root or set CAP_NET_RAW manually')
+
+    if not caps['has_cap_net_admin']:
+        add_log('warn', 'CAP_NET_ADMIN not available; iptables/routing will not work')
 
 # ---------- gateway: DNS privacy stack ----------
 def fetch_blocklist_domains():
@@ -5463,6 +5666,12 @@ nav button .icon svg { display: block; }
     <div id="root-warning" class="status-message" style="display:none; border-left-color:var(--danger);">
       <strong>Not running as root.</strong> Recon scanning, ARP Freeze, Deauth Flood, SYN Flood, DHCP Storm, and Traffic Capture all need raw sockets (and <code>iw</code>/<code>iptables</code> for some), which require root. Run this with <code>sudo</code> (or as root in Termux) or these will fail.
     </div>
+    <div id="selinux-warning" class="status-message" style="display:none; border-left-color:var(--warning);">
+      <strong>⚠️ SELinux is ENFORCING.</strong> Network operations may be blocked. <button class="btn" onclick="setSelinuxPermissive()" style="margin-left:10px; padding:8px 12px; font-size:0.9rem;">Set Permissive</button> or <button class="btn secondary" onclick="updateSelinuxStatus()" style="margin-left:6px; padding:8px 12px; font-size:0.9rem;">Refresh</button>
+    </div>
+    <div id="capabilities-warning" class="status-message" style="display:none; border-left-color:var(--danger);">
+      <strong>⚠️ Critical capability missing:</strong> <span id="capabilities-warning-text">CAP_NET_RAW</span> required for packet injection. <button class="btn" onclick="restoreCapabilities()" style="margin-left:10px; padding:8px 12px; font-size:0.9rem;">Attempt Restore</button> or <button class="btn secondary" onclick="updateCapabilityStatus()" style="margin-left:6px; padding:8px 12px; font-size:0.9rem;">Refresh</button>
+    </div>
     <div class="card">
       <h2>Interface & gateway</h2>
       <p class="sub">Start here — set your Wi‑Fi interface and gateway IP before scanning or attacking.</p>
@@ -6750,6 +6959,104 @@ async function checkPrerequisites() {
   } catch(e) {}
 }
 
+// SELinux status check
+async function updateSelinuxStatus() {
+  try {
+    const data = await apiCall('selinux/status');
+    const selinuxWarning = document.getElementById('selinux-warning');
+    if (selinuxWarning) {
+      if (data.enforcing) {
+        selinuxWarning.style.display = 'block';
+        selinuxWarning.innerHTML = `<strong>⚠️ SELinux is ENFORCING.</strong> Network operations may be blocked. <button class="btn" onclick="setSelinuxPermissive()" style="margin-left:10px; padding:8px 12px; font-size:0.9rem;">Set Permissive</button> or <button class="btn secondary" onclick="updateSelinuxStatus()" style="margin-left:6px; padding:8px 12px; font-size:0.9rem;">Refresh</button>`;
+      } else if (data.status === 'Permissive') {
+        selinuxWarning.style.display = 'block';
+        selinuxWarning.style.borderLeftColor = 'var(--info)';
+        selinuxWarning.innerHTML = `<strong>ℹ️ SELinux is Permissive.</strong> Warnings logged but not enforced. <button class="btn secondary" onclick="setSelinuxEnforcing()" style="margin-left:10px; padding:8px 12px; font-size:0.9rem;">Set Enforcing</button>`;
+      } else {
+        selinuxWarning.style.display = 'none';
+      }
+    }
+  } catch(e) {
+    // SELinux not available or error querying status
+  }
+}
+
+async function setSelinuxPermissive() {
+  try {
+    const data = await apiCall('selinux/set_permissive', 'POST');
+    if (data.success) {
+      showToast('SELinux set to Permissive', 'success');
+      await updateSelinuxStatus();
+    } else {
+      showToast('Failed to set SELinux permissive: ' + (data.error || 'unknown'), 'error');
+    }
+  } catch(e) {
+    showToast('Error: ' + e.message, 'error');
+  }
+}
+
+async function setSelinuxEnforcing() {
+  try {
+    const data = await apiCall('selinux/set_enforcing', 'POST');
+    if (data.success) {
+      showToast('SELinux set to Enforcing', 'success');
+      await updateSelinuxStatus();
+    } else {
+      showToast('Failed to set SELinux enforcing: ' + (data.error || 'unknown'), 'error');
+    }
+  } catch(e) {
+    showToast('Error: ' + e.message, 'error');
+  }
+}
+
+// Capability verification
+async function updateCapabilityStatus() {
+  try {
+    const data = await apiCall('capabilities/status');
+    const caps = data.capabilities;
+    const capWarning = document.getElementById('capabilities-warning');
+    const capWarningText = document.getElementById('capabilities-warning-text');
+
+    let hasMissingCapability = false;
+    let missingCaps = [];
+
+    if (!caps.packet_injection_enabled) {
+      hasMissingCapability = true;
+      missingCaps.push('CAP_NET_RAW (packet injection)');
+    }
+
+    if (!caps.traffic_redirect_enabled && !caps.has_cap_net_admin) {
+      hasMissingCapability = true;
+      missingCaps.push('CAP_NET_ADMIN (traffic redirect)');
+    }
+
+    if (capWarning) {
+      if (hasMissingCapability) {
+        capWarning.style.display = 'block';
+        capWarningText.textContent = missingCaps.join(', ');
+      } else {
+        capWarning.style.display = 'none';
+      }
+    }
+  } catch(e) {
+    // Capabilities API not available
+  }
+}
+
+async function restoreCapabilities() {
+  try {
+    const data = await apiCall('capabilities/restore', 'POST');
+    if (data.success) {
+      showToast('Capability restoration attempted', 'success');
+      setTimeout(() => updateCapabilityStatus(), 1000);
+    } else {
+      showToast('Could not restore capabilities automatically; run as root', 'error');
+    }
+  } catch(e) {
+    showToast('Error: ' + e.message, 'error');
+  }
+}
+
 // Interface loading
 async function loadInterfaces() {
   try {
@@ -7361,6 +7668,8 @@ function initApp() {
   loadInterfaces();
   loadTargets();
   checkPrerequisites();
+  updateSelinuxStatus();
+  updateCapabilityStatus();
   pollLogs();
   pollAttackStatus();
   pollTrafficCapture();
@@ -7372,6 +7681,8 @@ function initApp() {
   setInterval(pollTrafficCapture, 1000);
   setInterval(pollBandwidth, 2000);
   setInterval(refreshGatewayStatus, 4000);
+  setInterval(updateSelinuxStatus, 10000);
+  setInterval(updateCapabilityStatus, 10000);
 }
 
 // ========== HTTPS Interception (Phase 1.5) ==========
@@ -8304,6 +8615,86 @@ def api_gateway_remove_lan_domain():
     except Exception as e:
         add_log('error', f'Failed to remove .lan domain: {e}')
         return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/selinux/status', methods=['GET'])
+@require_auth
+def api_selinux_status():
+    status = check_selinux_status()
+    if status is None:
+        return jsonify({'success': True, 'status': 'disabled', 'enforcing': False})
+    return jsonify({'success': True, 'status': status, 'enforcing': status == 'Enforcing'})
+
+@app.route('/api/selinux/set_permissive', methods=['POST'])
+@require_auth
+def api_selinux_set_permissive():
+    try:
+        result = subprocess.run(['setenforce', '0'], capture_output=True, text=True, timeout=2)
+        if result.returncode == 0:
+            add_log('success', 'SELinux set to Permissive mode')
+            return jsonify({'success': True, 'message': 'SELinux set to Permissive'})
+        else:
+            add_log('error', f'setenforce failed: {result.stderr}')
+            return jsonify({'success': False, 'error': result.stderr})
+    except Exception as e:
+        add_log('error', f'Failed to set permissive: {e}')
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/selinux/set_enforcing', methods=['POST'])
+@require_auth
+def api_selinux_set_enforcing():
+    try:
+        result = subprocess.run(['setenforce', '1'], capture_output=True, text=True, timeout=2)
+        if result.returncode == 0:
+            add_log('success', 'SELinux set to Enforcing mode')
+            return jsonify({'success': True, 'message': 'SELinux set to Enforcing'})
+        else:
+            add_log('error', f'setenforce failed: {result.stderr}')
+            return jsonify({'success': False, 'error': result.stderr})
+    except Exception as e:
+        add_log('error', f'Failed to set enforcing: {e}')
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/diagnostics/ping', methods=['POST'])
+@require_auth
+def api_diagnostics_ping():
+    data = request.json or {}
+    target = data.get('target', 'google.com').strip()
+
+    if not target:
+        return jsonify({'success': False, 'error': 'Target required'})
+
+    try:
+        result = ping(target, timeout=5)
+        return jsonify({
+            'success': True,
+            'target': target,
+            'available': result.get('available'),
+            'latency_ms': result.get('latency_ms'),
+            'packet_loss': result.get('packet_loss'),
+            'error': result.get('error')
+        })
+    except Exception as e:
+        add_log('error', f'Ping diagnostics failed for {target}: {e}')
+        return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/capabilities/status', methods=['GET'])
+@require_auth
+def api_capabilities_status():
+    return jsonify({
+        'success': True,
+        'capabilities': get_capability_status()
+    })
+
+@app.route('/api/capabilities/restore', methods=['POST'])
+@require_auth
+def api_capabilities_restore():
+    restored = attempt_capability_restoration()
+    caps = get_capability_status()
+    return jsonify({
+        'success': restored,
+        'message': 'Attempted to restore CAP_NET_RAW capability',
+        'capabilities': caps
+    })
 
 @app.route('/api/https_injection/rules', methods=['GET'])
 @require_auth
@@ -9475,12 +9866,70 @@ def mitigate_ipv6_doh(iface):
     if not (ipv6_success or doh_success):
         add_log('warn', f'IPv6/DoH mitigation partially failed; traffic coverage may be reduced on {iface}')
 
+# ---------- SELinux detection & monitoring ----------
+def check_selinux_status():
+    """Detect SELinux enforcement status (Enforcing/Permissive/Disabled)."""
+    try:
+        result = subprocess.run(['getenforce'], capture_output=True, text=True, timeout=2)
+        return result.stdout.strip()  # Returns: Enforcing|Permissive|Disabled
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+
+def _monitor_selinux_denials():
+    """Monitor audit.log for AVC denials in daemon thread."""
+    audit_log = '/data/misc/audit/audit.log' if os.path.exists('/data/misc/audit/audit.log') else '/var/log/audit/audit.log'
+    if not os.path.exists(audit_log):
+        return
+
+    last_size = 0
+    denial_count = 0
+
+    try:
+        while True:
+            try:
+                stat = os.stat(audit_log)
+                if stat.st_size > last_size:
+                    with open(audit_log, 'r') as f:
+                        f.seek(last_size)
+                        for line in f:
+                            if 'avc: denied' in line:
+                                denial_count += 1
+                                if 'af_packet' in line or 'raw_socket' in line:
+                                    add_log('warn', f'SELinux denied raw socket operation: {line[:100]}...')
+                                if denial_count == 1:
+                                    add_log('warn', 'SELinux AVC denials detected - may block packet injection')
+                    last_size = stat.st_size
+                time.sleep(5)
+            except (IOError, OSError):
+                time.sleep(5)
+                continue
+    except Exception as e:
+        add_log('error', f'SELinux denial monitor error: {e}')
+
+def start_selinux_monitoring():
+    """Start background thread to monitor SELinux denials."""
+    selinux_status = check_selinux_status()
+    if not selinux_status:
+        add_log('dev', 'SELinux not detected on system')
+        return
+
+    add_log('info', f'SELinux status: {selinux_status}')
+    if selinux_status == 'Enforcing':
+        add_log('warn', 'SELinux is ENFORCING - may block network operations; consider setting to Permissive')
+
+    # Start denial monitor thread (only if Enforcing)
+    if selinux_status == 'Enforcing':
+        monitor_thread = threading.Thread(target=_monitor_selinux_denials, daemon=True)
+        monitor_thread.start()
+
 # ---------- bootstrap ----------
 if __name__ == '__main__':
     if os.geteuid() != 0:
         print("WARNING: Not running as root. Some features (raw sockets, iptables) may fail.")
     ensure_tool('iw')
     ensure_tool('iptables')
+    start_selinux_monitoring()
+    verify_capabilities_on_startup()
     ddns_bootstrap_from_env()
     threading.Thread(target=ddns_supervisor_loop, daemon=True).start()
     app.run(host='0.0.0.0', port=APP_PORT, debug=False, threaded=True)
