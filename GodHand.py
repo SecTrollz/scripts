@@ -27,6 +27,7 @@ import urllib.request
 import urllib.parse
 import base64
 import secrets
+import uuid
 from functools import wraps
 from flask import Flask, request, jsonify, render_template_string, abort, Response
 
@@ -116,6 +117,7 @@ STATE = {
     'log': [],
     'status': 'Ready',
     'lan_domains': ['pac.installCA.lan'],  # Domains resolved to local IP for .lan hijacking
+    'injection_rules': [],  # Response injection rules [{id, enabled, hostname_pattern, action_type, action_value, ...}]
 }
 STATE_LOCK = threading.Lock()
 
@@ -416,6 +418,148 @@ except Exception as e:
     CERT_AUTHORITY = None
     CERT_CACHE = None
 
+# ---------- HTTP Response Injection/Modification ----------
+class ResponseModifier:
+    """Apply injection rules to HTTP responses."""
+
+    @staticmethod
+    def parse_http_response(data: bytes):
+        """Parse HTTP response into headers and body.
+
+        Returns: (status_line, headers_dict, body) or (None, {}, None) on error
+        """
+        try:
+            parts = data.split(b'\r\n\r\n', 1)
+            if not parts:
+                return None, {}, None
+
+            header_section = parts[0]
+            body = parts[1] if len(parts) > 1 else b''
+
+            lines = header_section.split(b'\r\n')
+            if not lines:
+                return None, {}, None
+
+            status_line = lines[0].decode('ascii', errors='ignore')
+            headers = {}
+
+            for line in lines[1:]:
+                if b':' in line:
+                    key, value = line.split(b':', 1)
+                    headers[key.decode('ascii', errors='ignore').strip()] = value.decode('ascii', errors='ignore').strip()
+
+            return status_line, headers, body
+        except Exception as e:
+            add_log('warn', f'Failed to parse HTTP response: {e}')
+            return None, {}, None
+
+    @staticmethod
+    def rebuild_http_response(status_line: str, headers: dict, body: bytes) -> bytes:
+        """Rebuild HTTP response from parsed components."""
+        response = f"{status_line}\r\n".encode('ascii')
+        for key, value in headers.items():
+            response += f"{key}: {value}\r\n".encode('ascii')
+        response += b"\r\n"
+        response += body
+        return response
+
+    @staticmethod
+    def apply_rules(hostname: str, response_data: bytes) -> bytes:
+        """Apply enabled injection rules to HTTP response.
+
+        Args:
+            hostname: Target hostname
+            response_data: Raw HTTP response bytes
+
+        Returns:
+            Modified response bytes (or original if no rules matched)
+        """
+        try:
+            with STATE_LOCK:
+                rules = [r for r in STATE.get('injection_rules', []) if r.get('enabled', False)]
+
+            if not rules:
+                return response_data
+
+            status_line, headers, body = ResponseModifier.parse_http_response(response_data)
+            if status_line is None:
+                return response_data
+
+            modified = False
+
+            for rule in rules:
+                pattern = rule.get('hostname_pattern', '')
+                if not pattern or not ResponseModifier._pattern_matches(pattern, hostname):
+                    continue
+
+                action_type = rule.get('action_type', '')
+                action_value = rule.get('action_value', '')
+
+                try:
+                    if action_type == 'add_header':
+                        # Format: "Header-Name: Header-Value"
+                        if ':' in action_value:
+                            key, value = action_value.split(':', 1)
+                            headers[key.strip()] = value.strip()
+                            modified = True
+
+                    elif action_type == 'remove_header':
+                        # action_value = header name to remove
+                        if action_value in headers:
+                            del headers[action_value]
+                            modified = True
+
+                    elif action_type == 'replace_body':
+                        # action_value = "search_string|replacement_string"
+                        if '|' in action_value:
+                            search, replacement = action_value.split('|', 1)
+                            if search.encode() in body:
+                                body = body.replace(search.encode(), replacement.encode())
+                                modified = True
+
+                    elif action_type == 'inject_html':
+                        # action_value = HTML to inject before </body>
+                        if b'</body>' in body or b'</BODY>' in body:
+                            injection = action_value.encode()
+                            body = body.replace(b'</body>', injection + b'</body>')
+                            if body == response_data:  # Try uppercase
+                                body = body.replace(b'</BODY>', injection + b'</BODY>')
+                            modified = True
+
+                except Exception as e:
+                    add_log('warn', f'Failed to apply injection rule {rule.get("id")}: {e}')
+
+            if modified:
+                # Update Content-Length if body changed
+                if b'Content-Length' in str(headers).encode():
+                    headers['Content-Length'] = str(len(body))
+
+                return ResponseModifier.rebuild_http_response(status_line, headers, body)
+
+            return response_data
+
+        except Exception as e:
+            add_log('warn', f'Error applying injection rules: {e}')
+            return response_data
+
+    @staticmethod
+    def _pattern_matches(pattern: str, hostname: str) -> bool:
+        """Check if hostname matches pattern (supports wildcards).
+
+        Examples:
+            '*.example.com' matches 'api.example.com'
+            'example.com' matches 'example.com'
+            '*' matches any hostname
+        """
+        if pattern == '*':
+            return True
+        if pattern == hostname:
+            return True
+
+        # Convert wildcard pattern to regex
+        import fnmatch
+        return fnmatch.fnmatch(hostname, pattern)
+
 # ---------- HTTPS MITM Proxy Core ----------
 class HTTPSInterceptProxy:
     """Pure Python HTTPS interception proxy (transparent MITM).
@@ -644,6 +788,8 @@ class HTTPSInterceptProxy:
                     # Upstream → Client
                     data = upstream_tls.recv(buffer_size)
                     if data:
+                        # Phase 2: Apply injection rules to responses
+                        data = ResponseModifier.apply_rules(hostname, data)
                         client_tls.sendall(data)
                         # Phase 1: Log HTTP responses (first line contains status code)
                         if data.startswith(b'HTTP/'):
@@ -6312,6 +6458,93 @@ def api_gateway_remove_lan_domain():
     except Exception as e:
         add_log('error', f'Failed to remove .lan domain: {e}')
         return jsonify({'success': False, 'error': str(e)})
+
+@app.route('/api/https_injection/rules', methods=['GET'])
+@require_auth
+def api_injection_list_rules():
+    with STATE_LOCK:
+        rules = [dict(r) for r in STATE.get('injection_rules', [])]
+    return jsonify({'success': True, 'rules': rules})
+
+@app.route('/api/https_injection/rules', methods=['POST'])
+@require_auth
+def api_injection_create_rule():
+    data = request.json
+    rule_id = str(uuid.uuid4())[:8]
+    rule = {
+        'id': rule_id,
+        'enabled': data.get('enabled', True),
+        'hostname_pattern': data.get('hostname_pattern', ''),
+        'action_type': data.get('action_type', ''),  # 'add_header', 'remove_header', 'replace_body', 'inject_html'
+        'action_value': data.get('action_value', ''),
+        'description': data.get('description', ''),
+        'created_at': time.time()
+    }
+
+    if not rule['hostname_pattern']:
+        return jsonify({'success': False, 'error': 'hostname_pattern required'})
+    if not rule['action_type'] or rule['action_type'] not in ['add_header', 'remove_header', 'replace_body', 'inject_html']:
+        return jsonify({'success': False, 'error': 'action_type must be: add_header, remove_header, replace_body, or inject_html'})
+
+    with STATE_LOCK:
+        STATE['injection_rules'].append(rule)
+
+    add_log('info', f'Created injection rule: {rule_id} ({rule["action_type"]})')
+    return jsonify({'success': True, 'rule': rule})
+
+@app.route('/api/https_injection/rules/<rule_id>', methods=['GET'])
+@require_auth
+def api_injection_get_rule(rule_id):
+    with STATE_LOCK:
+        rule = next((r for r in STATE.get('injection_rules', []) if r['id'] == rule_id), None)
+
+    if not rule:
+        return jsonify({'success': False, 'error': 'Rule not found'})
+
+    return jsonify({'success': True, 'rule': rule})
+
+@app.route('/api/https_injection/rules/<rule_id>', methods=['PUT'])
+@require_auth
+def api_injection_update_rule(rule_id):
+    data = request.json
+
+    with STATE_LOCK:
+        rule = next((r for r in STATE.get('injection_rules', []) if r['id'] == rule_id), None)
+        if not rule:
+            return jsonify({'success': False, 'error': 'Rule not found'})
+
+        # Update allowed fields
+        if 'enabled' in data:
+            rule['enabled'] = data['enabled']
+        if 'hostname_pattern' in data:
+            rule['hostname_pattern'] = data['hostname_pattern']
+        if 'action_type' in data:
+            if data['action_type'] not in ['add_header', 'remove_header', 'replace_body', 'inject_html']:
+                return jsonify({'success': False, 'error': 'Invalid action_type'})
+            rule['action_type'] = data['action_type']
+        if 'action_value' in data:
+            rule['action_value'] = data['action_value']
+        if 'description' in data:
+            rule['description'] = data['description']
+
+        rule['updated_at'] = time.time()
+
+    add_log('info', f'Updated injection rule: {rule_id}')
+    return jsonify({'success': True, 'rule': rule})
+
+@app.route('/api/https_injection/rules/<rule_id>', methods=['DELETE'])
+@require_auth
+def api_injection_delete_rule(rule_id):
+    with STATE_LOCK:
+        original_count = len(STATE.get('injection_rules', []))
+        STATE['injection_rules'] = [r for r in STATE['injection_rules'] if r['id'] != rule_id]
+        deleted = original_count > len(STATE['injection_rules'])
+
+    if not deleted:
+        return jsonify({'success': False, 'error': 'Rule not found'})
+
+    add_log('info', f'Deleted injection rule: {rule_id}')
+    return jsonify({'success': True, 'status': 'Rule deleted'})
 
 @app.route('/api/gateway/proxy/start', methods=['POST'])
 @require_auth
