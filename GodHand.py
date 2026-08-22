@@ -431,13 +431,14 @@ class HTTPSInterceptProxy:
     Phase 2 (injection): Modify responses before forwarding.
     """
 
-    def __init__(self, listen_port=8888, ca=None, cert_cache=None):
+    def __init__(self, listen_port=8888, ca=None, cert_cache=None, max_log_size=10000):
         self.listen_port = listen_port
         self.ca = ca
         self.cert_cache = cert_cache
         self.running = False
         self.proxy_thread = None
         self.traffic_log = []
+        self.max_log_size = max_log_size
 
     @staticmethod
     def extract_sni(data: bytes) -> str:
@@ -569,7 +570,7 @@ class HTTPSInterceptProxy:
             try:
                 client_tls = context.wrap_socket(client_socket, server_side=True)
             except ssl.SSLError as e:
-                add_log('warn', f'TLS wrap failed for {hostname}: {e}')
+                add_log('error', f'TLS handshake failed for {client_addr[0]} → {hostname}: {type(e).__name__}: {e}')
                 return
 
             # Connect to upstream server
@@ -589,7 +590,7 @@ class HTTPSInterceptProxy:
             try:
                 upstream_tls = upstream_context.wrap_socket(upstream_socket, server_hostname=hostname)
             except ssl.SSLError as e:
-                add_log('warn', f'Upstream TLS failed for {hostname}: {e}')
+                add_log('error', f'Upstream TLS failed for {hostname}:443: {type(e).__name__}: {e}')
                 return
 
             # Forward traffic between client and upstream
@@ -668,7 +669,7 @@ class HTTPSInterceptProxy:
                     'request_line': request_line,
                     'bytes': len(data)
                 }
-                self.traffic_log.append(entry)
+                self._add_traffic_entry(entry)
                 add_log('info', f'[HTTPS] {client_ip} → {hostname}: {request_line}')
         except Exception as e:
             add_log('warn', f'Failed to log HTTP request: {e}')
@@ -690,7 +691,7 @@ class HTTPSInterceptProxy:
                     'status_line': status_line,
                     'bytes': len(data)
                 }
-                self.traffic_log.append(entry)
+                self._add_traffic_entry(entry)
                 add_log('info', f'[HTTPS] {hostname} → {client_ip}: {status_line}')
         except Exception as e:
             add_log('warn', f'Failed to log HTTP response: {e}')
@@ -737,6 +738,12 @@ class HTTPSInterceptProxy:
         """Stop MITM proxy server."""
         self.running = False
         add_log('info', 'MITM proxy stopped')
+
+    def _add_traffic_entry(self, entry: dict):
+        """Add entry to traffic log with automatic size management."""
+        self.traffic_log.append(entry)
+        if len(self.traffic_log) > self.max_log_size:
+            self.traffic_log = self.traffic_log[-self.max_log_size:]
 
     def get_traffic_log(self, limit=100):
         """Return recent traffic log entries."""
@@ -1104,7 +1111,8 @@ class SocketProxy:
             sock.bind((iface, 0))
             sock.close()
             return True
-        except (OSError, PermissionError):
+        except (OSError, PermissionError) as e:
+            add_log('dev', f'AF_PACKET test failed on {iface}: {e}')
             return False
 
     @staticmethod
@@ -1115,7 +1123,8 @@ class SocketProxy:
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
             sock.close()
             return True
-        except (OSError, PermissionError):
+        except (OSError, PermissionError) as e:
+            add_log('dev', f'AF_INET test failed on {iface}: {e}')
             return False
 
     @staticmethod
@@ -1127,7 +1136,8 @@ class SocketProxy:
             test_sock.connect(('127.0.0.1', 1080))
             test_sock.close()
             return True
-        except (OSError, TimeoutError):
+        except (OSError, TimeoutError) as e:
+            add_log('dev', f'SOCKS proxy test failed (localhost:1080): {e}')
             return False
 
     @staticmethod
@@ -6097,6 +6107,7 @@ def api_stop_network_port_monitor():
 @app.route('/api/stop_attack', methods=['POST'])
 @require_auth
 def api_stop_attack():
+    interface_to_reset = None
     with STATE_LOCK:
         for weapon, pids in list(STATE['attack_pids'].items()):
             kill_attack(pids)
@@ -6108,13 +6119,16 @@ def api_stop_attack():
             except:
                 pass
             STATE['monitor_log_path'] = None
-    # Only reset monitor mode if a weapon actually put the interface into it
-    # (weapon 2's monitor path). Weapons 3/4/5 and the ARP/native fallbacks never
-    # switch modes, so firing `iw set type managed` on every stop would needlessly
-    # bounce the Wi-Fi association -- exactly the connectivity disruption to avoid.
-    if STATE['interface'] and get_state('monitor_mode_active'):
-        set_monitor(STATE['interface'], False)
-        update_state('monitor_mode_active', False)
+        # Only reset monitor mode if a weapon actually put the interface into it
+        # (weapon 2's monitor path). Weapons 3/4/5 and the ARP/native fallbacks never
+        # switch modes, so firing `iw set type managed` on every stop would needlessly
+        # bounce the Wi-Fi association -- exactly the connectivity disruption to avoid.
+        if STATE['interface'] and get_state('monitor_mode_active'):
+            interface_to_reset = STATE['interface']
+    if interface_to_reset:
+        set_monitor(interface_to_reset, False)
+        with STATE_LOCK:
+            update_state('monitor_mode_active', False)
     add_log('info', 'All attacks stopped')
     return jsonify({'success': True, 'status': 'All attacks stopped'})
 
