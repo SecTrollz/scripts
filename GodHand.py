@@ -5717,12 +5717,13 @@ GODHAND_DDNS_ENABLED=1                  # optional, default on when the above ar
   </div>
 
   <div id="tab-https" class="tab-content">
+    <!-- Header & Statistics (Persistent across sub-tabs) -->
     <div class="card">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; flex-wrap:wrap; gap:8px;">
-        <h2 style="margin:0;">HTTPS traffic monitor</h2>
+        <h2 style="margin:0;">HTTPS Traffic Interception</h2>
         <span id="https-status-badge">Inactive</span>
       </div>
-      <p class="sub">Real-time HTTPS interception: monitor encrypted traffic, inspect requests/responses, and apply injection rules.</p>
+      <p class="sub">Real-time HTTPS monitoring, injection rules, and .lan domain configuration</p>
       <div class="stat-row">
         <div class="stat-tile"><span class="stat-value" id="https-stat-total">0</span><span class="stat-label">Requests</span></div>
         <div class="stat-tile"><span class="stat-value" id="https-stat-hosts">0</span><span class="stat-label">Domains</span></div>
@@ -5730,74 +5731,89 @@ GODHAND_DDNS_ENABLED=1                  # optional, default on when the above ar
       </div>
     </div>
 
-    <div class="card">
-      <h2>Live HTTPS traffic</h2>
-      <div class="table-responsive" style="max-height:400px; overflow-y:auto;">
-        <table>
-          <thead>
-            <tr>
-              <th style="min-width:150px;">Timestamp</th>
-              <th style="min-width:200px;">Domain</th>
-              <th>Method</th>
-              <th>Path</th>
-              <th>Status</th>
-              <th style="min-width:100px;">Size</th>
-            </tr>
-          </thead>
-          <tbody id="https-traffic-body">
-            <tr><td colspan="6" style="text-align:center; color:#999;">No HTTPS traffic captured yet. Gateway services must be running.</td></tr>
-          </tbody>
-        </table>
+    <!-- Sub-tabs Navigation -->
+    <div class="card" style="padding:0; background:transparent; border:none; margin-bottom:0;">
+      <div class="https-subtabs" style="display:flex; gap:0; border-bottom:1px solid #444; background:#0a0a0a; border-radius:4px 4px 0 0;">
+        <button class="https-subtab-btn active" onclick="switchHttpsSubtab('live-traffic')" style="flex:1; padding:12px 16px; border:none; background:transparent; color:#0f0; cursor:pointer; border-bottom:2px solid #0f0; font-weight:500; text-align:left; font-size:0.95rem;">Live Traffic</button>
+        <button class="https-subtab-btn" onclick="switchHttpsSubtab('injection')" style="flex:1; padding:12px 16px; border:none; background:transparent; color:#666; cursor:pointer; border-bottom:2px solid transparent; font-weight:500; text-align:left; font-size:0.95rem;">Injection Rules</button>
+        <button class="https-subtab-btn" onclick="switchHttpsSubtab('domains')" style="flex:1; padding:12px 16px; border:none; background:transparent; color:#666; cursor:pointer; border-bottom:2px solid transparent; font-weight:500; text-align:left; font-size:0.95rem;">.lan Domains</button>
       </div>
     </div>
 
-    <div class="card">
-      <h2>Response injection rules</h2>
-      <p class="sub">Create rules to modify HTTPS responses: inject headers, remove headers, replace content, inject HTML.</p>
-
-      <div style="margin-bottom:16px; padding:12px; background:#1a1a1a; border:1px solid #444; border-radius:4px;">
-        <h3 style="margin-top:0; margin-bottom:8px; font-size:0.95rem;">New rule</h3>
-        <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:8px;">
-          <div>
-            <label style="font-size:0.8rem; color:#999; display:block; margin-bottom:4px;">Domain pattern (*.example.com)</label>
-            <input type="text" id="rule-hostname" placeholder="*.example.com or *" style="width:100%; padding:6px; border:1px solid #555; background:#0a0a0a; color:#0f0; border-radius:4px;">
-          </div>
-          <div>
-            <label style="font-size:0.8rem; color:#999; display:block; margin-bottom:4px;">Action type</label>
-            <select id="rule-action" style="width:100%; padding:6px; border:1px solid #555; background:#0a0a0a; color:#0f0; border-radius:4px;">
-              <option value="add_header">Add header</option>
-              <option value="remove_header">Remove header</option>
-              <option value="replace_body">Replace text</option>
-              <option value="inject_html">Inject HTML</option>
-            </select>
-          </div>
+    <!-- Sub-tab: Live Traffic -->
+    <div id="https-subtab-live-traffic" class="https-subtab active" style="display:block;">
+      <div class="card">
+        <div class="table-responsive" style="max-height:500px; overflow-y:auto;">
+          <table>
+            <thead>
+              <tr>
+                <th style="min-width:150px;">Timestamp</th>
+                <th style="min-width:200px;">Domain</th>
+                <th>Method</th>
+                <th>Path</th>
+                <th>Status</th>
+                <th style="min-width:100px;">Size</th>
+              </tr>
+            </thead>
+            <tbody id="https-traffic-body">
+              <tr><td colspan="6" style="text-align:center; color:#999;">No HTTPS traffic captured yet. Gateway services must be running.</td></tr>
+            </tbody>
+          </table>
         </div>
-        <div>
-          <label style="font-size:0.8rem; color:#999; display:block; margin-bottom:4px;">Value</label>
-          <textarea id="rule-value" placeholder="Header-Name: value  OR  search|replace  OR  HTML code" style="width:100%; padding:6px; border:1px solid #555; background:#0a0a0a; color:#0f0; border-radius:4px; min-height:60px; font-family:monospace; font-size:0.85rem;"></textarea>
-        </div>
-        <div style="display:flex; gap:8px; margin-top:8px;">
-          <button class="btn" onclick="createInjectionRule()" style="flex:1;">Create rule</button>
-          <button class="btn secondary" onclick="clearRuleForm()" style="flex:1;">Clear</button>
-        </div>
-      </div>
-
-      <div id="rules-container">
-        <p style="color:#999; text-align:center;">Loading rules...</p>
       </div>
     </div>
 
-    <div class="card">
-      <h2>.lan domain management</h2>
-      <p class="sub">Configure custom .lan domains for transparent proxy discovery (e.g., pac.installCA.lan).</p>
+    <!-- Sub-tab: Injection Rules -->
+    <div id="https-subtab-injection" class="https-subtab" style="display:none;">
+      <div class="card">
+        <p class="sub">Create rules to modify HTTPS responses: inject headers, remove headers, replace content, inject HTML.</p>
 
-      <div style="display:flex; gap:8px; margin-bottom:12px;">
-        <input type="text" id="lan-domain-input" placeholder="custom.lan" style="flex:1; padding:6px; border:1px solid #555; background:#0a0a0a; color:#0f0; border-radius:4px;">
-        <button class="btn" onclick="addLanDomain()" style="min-width:100px;">Add domain</button>
+        <div style="margin-bottom:16px; padding:12px; background:#1a1a1a; border:1px solid #444; border-radius:4px;">
+          <h3 style="margin-top:0; margin-bottom:8px; font-size:0.95rem;">New Rule</h3>
+          <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:8px;">
+            <div>
+              <label style="font-size:0.8rem; color:#999; display:block; margin-bottom:4px;">Domain pattern (*.example.com)</label>
+              <input type="text" id="rule-hostname" placeholder="*.example.com or *" style="width:100%; padding:6px; border:1px solid #555; background:#0a0a0a; color:#0f0; border-radius:4px;">
+            </div>
+            <div>
+              <label style="font-size:0.8rem; color:#999; display:block; margin-bottom:4px;">Action type</label>
+              <select id="rule-action" style="width:100%; padding:6px; border:1px solid #555; background:#0a0a0a; color:#0f0; border-radius:4px;">
+                <option value="add_header">Add header</option>
+                <option value="remove_header">Remove header</option>
+                <option value="replace_body">Replace text</option>
+                <option value="inject_html">Inject HTML</option>
+              </select>
+            </div>
+          </div>
+          <div>
+            <label style="font-size:0.8rem; color:#999; display:block; margin-bottom:4px;">Value</label>
+            <textarea id="rule-value" placeholder="Header-Name: value  OR  search|replace  OR  HTML code" style="width:100%; padding:6px; border:1px solid #555; background:#0a0a0a; color:#0f0; border-radius:4px; min-height:60px; font-family:monospace; font-size:0.85rem;"></textarea>
+          </div>
+          <div style="display:flex; gap:8px; margin-top:8px;">
+            <button class="btn" onclick="createInjectionRule()" style="flex:1;">Create rule</button>
+            <button class="btn secondary" onclick="clearRuleForm()" style="flex:1;">Clear</button>
+          </div>
+        </div>
+
+        <div id="rules-container">
+          <p style="color:#999; text-align:center;">Loading rules...</p>
+        </div>
       </div>
+    </div>
 
-      <div id="lan-domains-list">
-        <p style="color:#999; text-align:center;">Loading domains...</p>
+    <!-- Sub-tab: .lan Domains -->
+    <div id="https-subtab-domains" class="https-subtab" style="display:none;">
+      <div class="card">
+        <p class="sub">Configure custom .lan domains for transparent proxy discovery (e.g., pac.installCA.lan).</p>
+
+        <div style="display:flex; gap:8px; margin-bottom:12px;">
+          <input type="text" id="lan-domain-input" placeholder="custom.lan" style="flex:1; padding:6px; border:1px solid #555; background:#0a0a0a; color:#0f0; border-radius:4px;">
+          <button class="btn" onclick="addLanDomain()" style="min-width:100px;">Add domain</button>
+        </div>
+
+        <div id="lan-domains-list">
+          <p style="color:#999; text-align:center;">Loading domains...</p>
+        </div>
       </div>
     </div>
   </div>
@@ -5946,6 +5962,25 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     if (btn.dataset.tab === 'attacks') { refreshDeauthCapability(); refreshSynFloodCapability(); }
   });
 });
+
+// HTTPS Sub-tabs
+function switchHttpsSubtab(subtabName) {
+  // Hide all sub-tabs
+  document.querySelectorAll('.https-subtab').forEach(tab => tab.style.display = 'none');
+  // Deactivate all sub-tab buttons
+  document.querySelectorAll('.https-subtab-btn').forEach(btn => {
+    btn.style.color = '#666';
+    btn.style.borderBottom = '2px solid transparent';
+  });
+  // Show selected sub-tab
+  const subtab = document.getElementById('https-subtab-' + subtabName);
+  if (subtab) {
+    subtab.style.display = 'block';
+  }
+  // Activate selected button
+  event.target.style.color = '#0f0';
+  event.target.style.borderBottom = '2px solid #0f0';
+}
 
 // Weapon selection
 document.querySelectorAll('.weapon-btn').forEach(el => {
