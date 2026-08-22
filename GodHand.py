@@ -34,6 +34,7 @@ import ssl
 import gzip
 from functools import wraps
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, jsonify, render_template_string, abort, Response, send_file
 
 # ---------- configuration ----------
@@ -875,6 +876,7 @@ class HTTPSInterceptProxy:
         self.proxy_thread = None
         self.traffic_log = []
         self.max_log_size = max_log_size
+        self.executor = ThreadPoolExecutor(max_workers=50)
 
     @staticmethod
     def extract_sni(data: bytes) -> str:
@@ -1171,12 +1173,8 @@ class HTTPSInterceptProxy:
                 try:
                     server_socket.settimeout(1)
                     client_socket, client_addr = server_socket.accept()
-                    # Handle each connection in a thread
-                    threading.Thread(
-                        target=self.handle_client_connection,
-                        args=(client_socket, client_addr),
-                        daemon=True
-                    ).start()
+                    # Handle each connection via bounded thread pool (max 50 workers)
+                    self.executor.submit(self.handle_client_connection, client_socket, client_addr)
                 except socket.timeout:
                     continue
                 except Exception as e:
@@ -1186,8 +1184,9 @@ class HTTPSInterceptProxy:
             self.running = False
 
     def stop(self):
-        """Stop MITM proxy server."""
+        """Stop MITM proxy server and shut down thread pool."""
         self.running = False
+        self.executor.shutdown(wait=False)
         add_log('info', 'MITM proxy stopped')
 
     def _add_traffic_entry(self, entry: dict):
