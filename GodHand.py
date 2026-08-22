@@ -159,6 +159,246 @@ def require_auth(f):
         return f(*args, **kwargs)
     return decorated
 
+# ---------- HTTPS Certificate Management ----------
+class CertificateAuthority:
+    """Manages HTTPS interception via custom CA certificate.
+
+    Generates and maintains a self-signed CA certificate that acts as a
+    transparent proxy's root of trust. All intercepted HTTPS connections
+    are re-encrypted with certificates signed by this CA.
+
+    Security: Private key stored with mode 0600. Never logged or transmitted.
+    """
+
+    def __init__(self, cert_dir='/var/godhand/certs'):
+        self.cert_dir = cert_dir
+        self.ca_key_path = os.path.join(cert_dir, 'ca-key.pem')
+        self.ca_cert_path = os.path.join(cert_dir, 'ca-cert.pem')
+        self.ca_key = None
+        self.ca_cert = None
+        self._ensure_dir()
+        self._initialize_ca()
+
+    def _ensure_dir(self):
+        """Ensure certificate directory exists with proper permissions."""
+        try:
+            os.makedirs(self.cert_dir, mode=0o700, exist_ok=True)
+        except Exception as e:
+            add_log('error', f'Failed to create cert dir {self.cert_dir}: {e}')
+            raise
+
+    def _initialize_ca(self):
+        """Generate CA cert/key if not exists, otherwise load existing."""
+        if os.path.exists(self.ca_key_path) and os.path.exists(self.ca_cert_path):
+            add_log('info', f'Loading existing CA from {self.ca_cert_path}')
+            return self._load_existing_ca()
+
+        add_log('info', 'Generating new CA certificate (this may take a moment)...')
+        self._generate_ca()
+
+    def _generate_ca(self):
+        """Generate new self-signed CA certificate using openssl."""
+        try:
+            # Generate 2048-bit RSA private key
+            subprocess.run(
+                ['openssl', 'genrsa', '-out', self.ca_key_path, '2048'],
+                check=True,
+                capture_output=True,
+                timeout=30
+            )
+            os.chmod(self.ca_key_path, 0o600)
+
+            # Generate self-signed certificate (valid 10 years)
+            subprocess.run(
+                ['openssl', 'req', '-new', '-x509', '-days', '3650',
+                 '-key', self.ca_key_path, '-out', self.ca_cert_path,
+                 '-subj', '/C=US/ST=Private/L=Local/O=GodHand/CN=GodHand CA'],
+                check=True,
+                capture_output=True,
+                timeout=30
+            )
+            os.chmod(self.ca_cert_path, 0o644)
+
+            add_log('success', f'CA certificate generated: {self.ca_cert_path}')
+        except subprocess.CalledProcessError as e:
+            add_log('error', f'Failed to generate CA certificate: {e.stderr.decode()}')
+            raise
+        except Exception as e:
+            add_log('error', f'CA generation failed: {e}')
+            raise
+
+    def _load_existing_ca(self):
+        """Load existing CA key and certificate."""
+        try:
+            with open(self.ca_key_path, 'r') as f:
+                self.ca_key = f.read()
+            with open(self.ca_cert_path, 'r') as f:
+                self.ca_cert = f.read()
+            add_log('info', 'CA certificate loaded successfully')
+        except Exception as e:
+            add_log('error', f'Failed to load CA: {e}')
+            raise
+
+    def get_ca_cert_path(self):
+        """Return path to CA certificate for distribution."""
+        return self.ca_cert_path
+
+    def get_ca_cert_pem(self):
+        """Return CA certificate in PEM format."""
+        if not self.ca_cert:
+            with open(self.ca_cert_path, 'r') as f:
+                self.ca_cert = f.read()
+        return self.ca_cert
+
+
+class CertificateCache:
+    """Manages cached server certificates for HTTPS interception.
+
+    When the MITM proxy intercepts an HTTPS connection to a specific hostname,
+    it generates a certificate for that hostname signed by the CA. This cache
+    stores generated certificates to avoid regenerating them repeatedly.
+
+    Cache format: /var/godhand/certs/{hostname}.pem
+    Certificates have 30-day validity (matches typical test durations).
+    """
+
+    def __init__(self, ca: CertificateAuthority):
+        self.ca = ca
+        self.cert_dir = ca.cert_dir
+        self._cache = {}  # hostname -> (cert_path, cert_pem)
+
+    def get_or_create_cert(self, hostname: str) -> tuple:
+        """Get certificate for hostname, creating if needed.
+
+        Args:
+            hostname: FQDN or IP to create certificate for
+
+        Returns:
+            Tuple of (cert_path, cert_pem) both as strings
+        """
+        # Check memory cache first
+        if hostname in self._cache:
+            cert_path, cert_pem = self._cache[hostname]
+            if os.path.exists(cert_path):
+                return (cert_path, cert_pem)
+            else:
+                # File was deleted, regenerate
+                del self._cache[hostname]
+
+        # Check disk cache
+        cert_path = os.path.join(self.cert_dir, f'{hostname}.pem')
+        if os.path.exists(cert_path):
+            try:
+                with open(cert_path, 'r') as f:
+                    cert_pem = f.read()
+                self._cache[hostname] = (cert_path, cert_pem)
+                return (cert_path, cert_pem)
+            except Exception as e:
+                add_log('warn', f'Failed to load cached cert for {hostname}: {e}')
+
+        # Generate new certificate
+        return self._generate_cert(hostname)
+
+    def _generate_cert(self, hostname: str) -> tuple:
+        """Generate new certificate for hostname using CA.
+
+        Args:
+            hostname: FQDN or IP to create certificate for
+
+        Returns:
+            Tuple of (cert_path, cert_pem) both as strings
+        """
+        cert_path = os.path.join(self.cert_dir, f'{hostname}.pem')
+        key_path = os.path.join(self.cert_dir, f'{hostname}-key.pem')
+
+        try:
+            # Generate private key for this cert
+            subprocess.run(
+                ['openssl', 'genrsa', '-out', key_path, '2048'],
+                check=True,
+                capture_output=True,
+                timeout=10
+            )
+
+            # Create certificate signing request
+            csr_path = os.path.join(self.cert_dir, f'{hostname}.csr')
+            subprocess.run(
+                ['openssl', 'req', '-new', '-key', key_path, '-out', csr_path,
+                 '-subj', f'/C=US/ST=Private/L=Local/O=GodHand/CN={hostname}'],
+                check=True,
+                capture_output=True,
+                timeout=10
+            )
+
+            # Sign CSR with CA certificate (valid 30 days)
+            subprocess.run(
+                ['openssl', 'x509', '-req', '-in', csr_path, '-days', '30',
+                 '-CA', self.ca.ca_cert_path, '-CAkey', self.ca.ca_key_path,
+                 '-CAcreateserial', '-out', cert_path],
+                check=True,
+                capture_output=True,
+                timeout=10
+            )
+
+            # Combine cert + key into single PEM file (what TLS needs)
+            with open(key_path, 'r') as f:
+                key_pem = f.read()
+            with open(cert_path, 'r') as f:
+                cert_pem_only = f.read()
+
+            cert_pem = key_pem + cert_pem_only
+
+            # Write combined PEM file
+            with open(cert_path, 'w') as f:
+                f.write(cert_pem)
+            os.chmod(cert_path, 0o600)
+
+            # Clean up temporary files
+            for tmp in [key_path, csr_path]:
+                if os.path.exists(tmp):
+                    os.remove(tmp)
+
+            # Cache in memory
+            self._cache[hostname] = (cert_path, cert_pem)
+            add_log('info', f'Generated certificate for {hostname}')
+            return (cert_path, cert_pem)
+
+        except subprocess.CalledProcessError as e:
+            add_log('error', f'Failed to generate cert for {hostname}: {e.stderr.decode()}')
+            raise
+        except Exception as e:
+            add_log('error', f'Certificate generation failed for {hostname}: {e}')
+            raise
+
+    def cleanup_old_certs(self, max_age_days: int = 60):
+        """Remove certificates older than max_age_days to prevent storage buildup."""
+        now = time.time()
+        cutoff = now - (max_age_days * 86400)
+
+        try:
+            for filename in os.listdir(self.cert_dir):
+                if filename.endswith('.pem') and filename != 'ca-key.pem' and filename != 'ca-cert.pem':
+                    filepath = os.path.join(self.cert_dir, filename)
+                    if os.path.getmtime(filepath) < cutoff:
+                        os.remove(filepath)
+                        hostname = filename.replace('.pem', '')
+                        if hostname in self._cache:
+                            del self._cache[hostname]
+                        add_log('info', f'Cleaned up old cert: {hostname}')
+        except Exception as e:
+            add_log('warn', f'Error cleaning up old certs: {e}')
+
+
+# Initialize certificate infrastructure on startup
+try:
+    CERT_AUTHORITY = CertificateAuthority('/var/godhand/certs')
+    CERT_CACHE = CertificateCache(CERT_AUTHORITY)
+    add_log('success', 'HTTPS certificate infrastructure initialized')
+except Exception as e:
+    add_log('error', f'Failed to initialize HTTPS infrastructure: {e}')
+    CERT_AUTHORITY = None
+    CERT_CACHE = None
+
 app = Flask(__name__)
 
 @app.after_request
