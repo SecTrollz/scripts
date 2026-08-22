@@ -32,6 +32,7 @@ import sqlite3
 import csv
 import ssl
 import gzip
+import fnmatch
 from functools import wraps
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
@@ -541,7 +542,7 @@ class ResponseModifier:
 
             if modified:
                 # Update Content-Length if body changed
-                if b'Content-Length' in str(headers).encode():
+                if 'Content-Length' in headers:
                     headers['Content-Length'] = str(len(body))
 
                 return ResponseModifier.rebuild_http_response(status_line, headers, body)
@@ -567,7 +568,6 @@ class ResponseModifier:
             return True
 
         # Convert wildcard pattern to regex
-        import fnmatch
         return fnmatch.fnmatch(hostname, pattern)
 
 # ---------- Traffic Persistence Database ----------
@@ -1354,7 +1354,8 @@ class HTTPSInterceptProxy:
                         request_buffer += data
 
                         # Phase 1: Log HTTP requests (first line contains method/path)
-                        if request_buffer.startswith(b'GET') or request_buffer.startswith(b'POST') or request_buffer.startswith(b'PUT'):
+                        # Check for valid HTTP methods (GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, CONNECT, TRACE)
+                        if b' HTTP/' in request_buffer[:100]:  # HTTP method line usually within first 100 bytes
                             # Try to parse HTTP request
                             request_parts = self._parse_http_request(request_buffer)
                             if request_parts:
@@ -1404,16 +1405,11 @@ class HTTPSInterceptProxy:
                         parsed = HTTPManipulator.parse_http_response(data)
 
                         # Apply injection rules to modify response content
-                        modified_body = parsed['body']
                         if 'text/html' in parsed['headers'].get('content-type', '').lower():
                             # Example: Inject logging script before </body>
-                            injection = ResponseModifier.apply_rules(hostname, parsed['body'])
-                            if injection != parsed['body']:
-                                modified_body = injection
-
-                        # Rebuild response with modified body
-                        if modified_body != parsed['body']:
-                            data = HTTPManipulator.rebuild_http_response(parsed, modified_body)
+                            data = ResponseModifier.apply_rules(hostname, data)
+                            # Re-parse modified response for logging
+                            parsed = HTTPManipulator.parse_http_response(data)
 
                         client_tls.sendall(data)
                         # Log HTTP responses (first line contains status code)
