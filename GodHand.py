@@ -1021,13 +1021,49 @@ class ResponseTemplateGenerator:
         return (200, headers, json.dumps(response_body).encode('utf-8'))
 
     def _generate_motorola_response(self, request_body, device_id):
-        """Generate Motorola bootloader response (JSON)."""
+        """Generate Motorola bootloader response with challenge-response protocol.
+
+        Motorola uses a challenge-response handshake:
+        - First request: device sends no challenge → server responds with challenge
+        - Second request: device sends challenge → server responds with challenge_accepted
+        """
         import json
-        response_body = {
-            "device_id": device_id or "unknown",
-            "status": "bootloader_unlock_supported",
-            "challenge_accepted": True
-        }
+        import secrets
+
+        try:
+            # Parse request to check for challenge
+            challenge_in_request = None
+            if request_body:
+                try:
+                    req_data = json.loads(request_body) if isinstance(request_body, str) else json.loads(request_body.decode('utf-8'))
+                    challenge_in_request = req_data.get('challenge')
+                except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
+                    pass
+
+            if challenge_in_request:
+                # Device sent challenge → respond with acceptance
+                response_body = {
+                    "device_id": device_id or "unknown",
+                    "status": "challenge_accepted",
+                    "challenge_response": secrets.token_hex(32),  # 64-char hex response
+                    "unlock_available": True
+                }
+            else:
+                # First query → send challenge to device
+                response_body = {
+                    "device_id": device_id or "unknown",
+                    "status": "bootloader_unlock_available",
+                    "challenge": secrets.token_hex(32),  # 64-char hex challenge
+                    "unlock_supported": True
+                }
+        except Exception as e:
+            add_log('warn', f'Motorola response generation error: {e}, falling back to basic response')
+            response_body = {
+                "device_id": device_id or "unknown",
+                "status": "bootloader_unlock_supported",
+                "challenge_accepted": True
+            }
+
         headers = {'Content-Type': 'application/json'}
         return (200, headers, json.dumps(response_body).encode('utf-8'))
 
@@ -1851,14 +1887,26 @@ function FindProxyForURL(url, host) {{
 
 
 # Initialize OEM unlock detection infrastructure (Phase 5E)
+UNLOCK_QUERY_DETECTOR = None
+UNLOCK_RESPONSE_GENERATOR = None
 try:
     UNLOCK_QUERY_DETECTOR = UnlockQueryDetector()
-    UNLOCK_RESPONSE_GENERATOR = ResponseTemplateGenerator()
-    add_log('success', 'OEM unlock detection infrastructure initialized')
+    add_log('dev', 'UnlockQueryDetector initialized successfully')
 except Exception as e:
-    add_log('warn', f'Failed to initialize OEM unlock infrastructure: {e}')
-    UNLOCK_QUERY_DETECTOR = None
-    UNLOCK_RESPONSE_GENERATOR = None
+    add_log('error', f'Failed to initialize UnlockQueryDetector: {e} (OEM unlock detection disabled)')
+
+try:
+    UNLOCK_RESPONSE_GENERATOR = ResponseTemplateGenerator()
+    add_log('dev', 'ResponseTemplateGenerator initialized successfully')
+except Exception as e:
+    add_log('error', f'Failed to initialize ResponseTemplateGenerator: {e} (OEM unlock injection disabled)')
+
+if UNLOCK_QUERY_DETECTOR and UNLOCK_RESPONSE_GENERATOR:
+    add_log('success', 'OEM unlock Phase 5E infrastructure fully operational')
+elif UNLOCK_QUERY_DETECTOR or UNLOCK_RESPONSE_GENERATOR:
+    add_log('warn', 'OEM unlock Phase 5E partially operational (detector or generator unavailable)')
+else:
+    add_log('warn', 'OEM unlock Phase 5E disabled (initialization failed)')
 
 app = Flask(__name__)
 
