@@ -579,6 +579,7 @@ class TrafficDatabase:
             db_path = os.path.join(GATEWAY_DIR, 'https_traffic.db')
         self.db_path = db_path
         self.lock = threading.Lock()
+        self.initialized = False
         self._init_db()
 
     def _init_db(self):
@@ -610,9 +611,12 @@ class TrafficDatabase:
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_client_ip ON https_traffic(client_ip)')
                 conn.commit()
                 conn.close()
+                self.initialized = True
                 add_log('info', f'Traffic database initialized: {self.db_path}')
         except Exception as e:
             add_log('error', f'Failed to initialize traffic database: {e}')
+            self.initialized = False
+            raise
 
     def add_entry(self, entry: dict):
         """Add traffic entry to database."""
@@ -1838,7 +1842,12 @@ class ARPSpoofingFallback:
         }
 
 
-ARP_FALLBACK = ARPSpoofingFallback()
+ARP_FALLBACK = None
+try:
+    ARP_FALLBACK = ARPSpoofingFallback()
+    add_log('dev', 'ARP spoofing fallback initialized')
+except Exception as e:
+    add_log('warn', f'Failed to initialize ARP spoofing fallback: {e} (ARP spoofing fallback disabled)')
 
 # Initialize MITM proxy on startup
 try:
@@ -1911,12 +1920,16 @@ else:
 app = Flask(__name__)
 
 # Initialize traffic database
+TRAFFIC_DATABASE = None
 try:
-    TRAFFIC_DATABASE = TrafficDatabase()
-    add_log('success', 'Traffic database initialized')
+    db = TrafficDatabase()
+    if db.initialized:
+        TRAFFIC_DATABASE = db
+        add_log('success', 'Traffic database initialized')
+    else:
+        add_log('error', 'Traffic database initialization failed (db.initialized=False)')
 except Exception as e:
     add_log('error', f'Failed to initialize traffic database: {e}')
-    TRAFFIC_DATABASE = None
 
 @app.after_request
 def add_no_cache_headers(response):
