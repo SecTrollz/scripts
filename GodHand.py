@@ -4092,6 +4092,40 @@ GODHAND_DDNS_ENABLED=1                  # optional, default on when the above ar
       <div id="attack-status" class="status-message">Status: Ready</div>
     </div>
     <div class="card">
+      <h2>HTTPS Interception (Phase 1.5)</h2>
+      <p class="sub">Transparent MITM proxy for HTTPS traffic inspection. Intercept, decrypt, and monitor all HTTPS traffic from configured devices. Configure devices via <code>pac.installCA.lan</code> to use as proxy.</p>
+      <div style="display:flex; gap:10px; flex-wrap:wrap;">
+        <button class="btn" id="https-start-btn" onclick="httpsInterceptStart()">🔒 Start Interception</button>
+        <button class="btn secondary" id="https-stop-btn" onclick="httpsInterceptStop()" disabled>⏹ Stop Interception</button>
+      </div>
+      <div id="https-status" class="status-message">Status: Not running</div>
+      <div style="margin-top:15px; padding:10px; background:rgba(100,100,100,0.15); border-radius:4px; font-size:0.9rem;">
+        <strong>Live Traffic:</strong>
+        <div style="margin-top:10px; max-height:400px; overflow-y:auto; border:1px solid rgba(255,255,255,0.1); border-radius:3px; background:rgba(0,0,0,0.2);">
+          <table id="https-traffic-table" style="width:100%; font-size:0.85rem; border-collapse:collapse;">
+            <thead style="position:sticky; top:0; background:rgba(0,0,0,0.4);">
+              <tr>
+                <th style="padding:8px; text-align:left; border-bottom:1px solid rgba(255,255,255,0.1);">Timestamp</th>
+                <th style="padding:8px; text-align:left; border-bottom:1px solid rgba(255,255,255,0.1);">Type</th>
+                <th style="padding:8px; text-align:left; border-bottom:1px solid rgba(255,255,255,0.1);">Hostname</th>
+                <th style="padding:8px; text-align:left; border-bottom:1px solid rgba(255,255,255,0.1);">Method/Status</th>
+                <th style="padding:8px; text-align:left; border-bottom:1px solid rgba(255,255,255,0.1);">Client IP</th>
+              </tr>
+            </thead>
+            <tbody id="https-traffic-tbody">
+            </tbody>
+          </table>
+        </div>
+        <div id="https-traffic-empty" style="padding:20px; text-align:center; color:#999;">No traffic captured yet</div>
+      </div>
+      <div style="margin-top:10px;">
+        <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-size:0.9rem;">
+          <input type="text" id="https-filter" placeholder="Filter by hostname (e.g., example.com)" style="flex:1; padding:6px;">
+          <button class="btn small" onclick="httpsFilterTraffic()">Filter</button>
+        </label>
+      </div>
+    </div>
+    <div class="card">
       <h2>Live traffic capture</h2>
       <p class="sub">Weapon 5 output — see the <strong>Monitor</strong> tab for the full capture &amp; analysis panel (top talkers, ports, live feed).</p>
       <div id="attacks-traffic-status" class="status-message">Not capturing.</div>
@@ -5524,6 +5558,150 @@ function initApp() {
   setInterval(refreshGatewayStatus, 4000);
 }
 
+// ========== HTTPS Interception (Phase 1.5) ==========
+let httpsInterceptRunning = false;
+let httpsTrafficEntries = [];
+let httpsEventSource = null;
+
+async function httpsInterceptStart() {
+  try {
+    const res = await fetch('/api/https_traffic/start', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + authToken }
+    });
+    const data = await res.json();
+    if (data.success) {
+      httpsInterceptRunning = true;
+      document.getElementById('https-status').textContent = '🟢 Status: Interception active on port 8888';
+      document.getElementById('https-status').style.color = '#4caf50';
+      document.getElementById('https-start-btn').disabled = true;
+      document.getElementById('https-stop-btn').disabled = false;
+      startHttpsStreamListener();
+      addLog('success', 'HTTPS interception started');
+    } else {
+      addLog('error', 'Failed to start HTTPS interception: ' + (data.error || 'unknown error'));
+    }
+  } catch (e) {
+    addLog('error', 'HTTPS start failed: ' + e.message);
+  }
+}
+
+async function httpsInterceptStop() {
+  try {
+    const res = await fetch('/api/https_traffic/stop', {
+      method: 'POST',
+      headers: { 'Authorization': 'Bearer ' + authToken }
+    });
+    const data = await res.json();
+    if (data.success) {
+      httpsInterceptRunning = false;
+      document.getElementById('https-status').textContent = '🔴 Status: Not running';
+      document.getElementById('https-status').style.color = '#f44336';
+      document.getElementById('https-start-btn').disabled = false;
+      document.getElementById('https-stop-btn').disabled = true;
+      if (httpsEventSource) {
+        httpsEventSource.close();
+        httpsEventSource = null;
+      }
+      addLog('success', 'HTTPS interception stopped');
+    } else {
+      addLog('error', 'Failed to stop HTTPS interception: ' + (data.error || 'unknown error'));
+    }
+  } catch (e) {
+    addLog('error', 'HTTPS stop failed: ' + e.message);
+  }
+}
+
+function startHttpsStreamListener() {
+  // Connect to Server-Sent Events stream for live traffic
+  if (httpsEventSource) {
+    httpsEventSource.close();
+  }
+
+  httpsEventSource = new EventSource('/api/https_traffic/stream?foo=' + Math.random(), {
+    headers: { 'Authorization': 'Bearer ' + authToken }
+  });
+
+  httpsEventSource.addEventListener('message', (event) => {
+    try {
+      const entry = JSON.parse(event.data);
+      if (!entry.error) {
+        httpsTrafficEntries.unshift(entry);
+        // Keep only last 500 entries in memory
+        if (httpsTrafficEntries.length > 500) {
+          httpsTrafficEntries.pop();
+        }
+        updateHttpsTrafficTable();
+      }
+    } catch (e) {
+      console.error('Failed to parse HTTPS traffic entry:', e);
+    }
+  });
+
+  httpsEventSource.addEventListener('error', (event) => {
+    console.error('HTTPS stream error:', event);
+    httpsEventSource.close();
+  });
+}
+
+function updateHttpsTrafficTable() {
+  const tbody = document.getElementById('https-traffic-tbody');
+  const emptyMsg = document.getElementById('https-traffic-empty');
+
+  if (httpsTrafficEntries.length === 0) {
+    tbody.innerHTML = '';
+    emptyMsg.style.display = 'block';
+    return;
+  }
+
+  emptyMsg.style.display = 'none';
+  tbody.innerHTML = httpsTrafficEntries.map(entry => {
+    const timestamp = new Date(entry.timestamp).toLocaleTimeString();
+    const method = entry.method || entry.status || '—';
+    const icon = entry.type === 'request' ? '→' : '←';
+
+    return `
+      <tr style="border-bottom:1px solid rgba(255,255,255,0.05); hover:{background:rgba(255,255,255,0.05);}">
+        <td style="padding:6px; font-size:0.8rem;">${timestamp}</td>
+        <td style="padding:6px;">${icon} ${entry.type}</td>
+        <td style="padding:6px; word-break:break-all;">${entry.hostname}</td>
+        <td style="padding:6px; color:#80B9E8;">${method}</td>
+        <td style="padding:6px; font-family:monospace;">${entry.client_ip}</td>
+      </tr>
+    `;
+  }).slice(0, 100).join('');
+}
+
+async function httpsFilterTraffic() {
+  const filter = document.getElementById('https-filter').value.toLowerCase();
+  if (!filter) {
+    updateHttpsTrafficTable();
+    return;
+  }
+
+  // Filter in-memory entries
+  const filtered = httpsTrafficEntries.filter(e =>
+    e.hostname.toLowerCase().includes(filter)
+  );
+
+  const tbody = document.getElementById('https-traffic-tbody');
+  tbody.innerHTML = filtered.map(entry => {
+    const timestamp = new Date(entry.timestamp).toLocaleTimeString();
+    const method = entry.method || entry.status || '—';
+    const icon = entry.type === 'request' ? '→' : '←';
+
+    return `
+      <tr style="border-bottom:1px solid rgba(255,255,255,0.05);">
+        <td style="padding:6px; font-size:0.8rem;">${timestamp}</td>
+        <td style="padding:6px;">${icon} ${entry.type}</td>
+        <td style="padding:6px; word-break:break-all;">${entry.hostname}</td>
+        <td style="padding:6px; color:#80B9E8;">${method}</td>
+        <td style="padding:6px; font-family:monospace;">${entry.client_ip}</td>
+      </tr>
+    `;
+  }).join('');
+}
+
 // ========== Developer Console Commands (F12) ==========
 // Usage: godDev.testAllModes()  or  godDev.verifySidesteps()
 window.godDev = {
@@ -6594,6 +6772,58 @@ def api_https_traffic():
         'entries': filtered[:limit],
         'proxy_running': HTTPS_PROXY.running
     })
+
+@app.route('/api/https_traffic/stream', methods=['GET'])
+@require_auth
+def api_https_traffic_stream():
+    """Server-Sent Events (SSE) stream for live HTTPS traffic (Phase 1.5).
+
+    Streams new traffic entries in real-time as they're logged by the MITM proxy.
+    Client connects and receives JSON objects for each new request/response.
+
+    Keeps connection open and pushes events as proxy logs traffic.
+    Browser automatically reconnects on disconnect.
+
+    Usage (JavaScript):
+        const eventSource = new EventSource('/api/https_traffic/stream');
+        eventSource.onmessage = (event) => {
+            const entry = JSON.parse(event.data);
+            // Update UI with new traffic entry
+        };
+    """
+    global HTTPS_PROXY
+
+    if not HTTPS_PROXY:
+        return Response('data: {"error": "HTTPS proxy not initialized"}\n\n', mimetype='text/event-stream')
+
+    def generate():
+        """Generator function that yields SSE events for new traffic entries."""
+        last_index = len(HTTPS_PROXY.traffic_log)
+
+        while True:
+            try:
+                # Check for new entries
+                current_log = HTTPS_PROXY.get_traffic_log(limit=1000)
+                current_index = len(HTTPS_PROXY.traffic_log)
+
+                # Send any new entries since last check
+                if current_index > last_index:
+                    new_entries = current_log[-(current_index - last_index):]
+                    for entry in new_entries:
+                        yield f"data: {json.dumps(entry)}\n\n"
+                    last_index = current_index
+
+                # Sleep briefly to avoid busy loop
+                time.sleep(0.5)
+
+            except GeneratorExit:
+                break
+            except Exception as e:
+                add_log('error', f'SSE stream error: {e}')
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
+                break
+
+    return Response(generate(), mimetype='text/event-stream')
 
 # ---------- bootstrap ----------
 if __name__ == '__main__':
