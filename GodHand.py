@@ -399,6 +399,342 @@ except Exception as e:
     CERT_AUTHORITY = None
     CERT_CACHE = None
 
+# ---------- HTTPS MITM Proxy Core ----------
+class HTTPSInterceptProxy:
+    """Pure Python HTTPS interception proxy (transparent MITM).
+
+    Listens on port 8888 for incoming TLS connections from configured devices.
+    Intercepts HTTPS traffic by:
+    1. Extracting SNI (Server Name Indication) from ClientHello
+    2. Generating a certificate for that hostname (signed by CA)
+    3. Establishing two TLS connections: client↔proxy and proxy↔server
+    4. Forwarding HTTP requests/responses through both connections
+    5. Logging all traffic for inspection
+
+    Phase 1 (inspection): Log traffic only, no modification.
+    Phase 2 (injection): Modify responses before forwarding.
+    """
+
+    def __init__(self, listen_port=8888, ca=None, cert_cache=None):
+        self.listen_port = listen_port
+        self.ca = ca
+        self.cert_cache = cert_cache
+        self.running = False
+        self.proxy_thread = None
+        self.traffic_log = []
+
+    @staticmethod
+    def extract_sni(data: bytes) -> str:
+        """Extract SNI (Server Name Indication) from TLS ClientHello.
+
+        TLS ClientHello structure:
+        - Byte 0: Content Type (0x16 = Handshake)
+        - Bytes 1-2: TLS Version
+        - Bytes 3-4: Length
+        - Byte 5: Handshake Type (0x01 = ClientHello)
+        - Bytes 6-8: Handshake Length
+        - Bytes 9-10: ClientHello Version
+        - Bytes 11-42: Random
+        - Byte 43: Session ID Length
+        - Then: Extensions (including SNI)
+
+        Args:
+            data: Raw TLS ClientHello packet bytes
+
+        Returns:
+            Hostname from SNI extension, or empty string if not found
+        """
+        try:
+            if len(data) < 44 or data[0] != 0x16:  # Not a handshake record
+                return ""
+
+            # Skip to extension list
+            # Position 43 = session ID length
+            session_id_len = data[43]
+            ext_start = 44 + session_id_len + 2  # +2 for cipher suite length
+
+            if ext_start >= len(data):
+                return ""
+
+            # Parse extensions
+            while ext_start < len(data):
+                if ext_start + 4 > len(data):
+                    break
+
+                ext_type = int.from_bytes(data[ext_start:ext_start+2], 'big')
+                ext_len = int.from_bytes(data[ext_start+2:ext_start+4], 'big')
+                ext_start += 4
+
+                # Extension type 0 = SNI
+                if ext_type == 0:
+                    if ext_start + 2 > len(data):
+                        break
+                    sni_list_len = int.from_bytes(data[ext_start:ext_start+2], 'big')
+                    ext_start += 2
+
+                    if ext_start + 3 > len(data):
+                        break
+                    name_type = data[ext_start]  # 0 = host_name
+                    name_len = int.from_bytes(data[ext_start+1:ext_start+3], 'big')
+                    ext_start += 3
+
+                    if ext_start + name_len > len(data):
+                        break
+
+                    hostname = data[ext_start:ext_start+name_len].decode('ascii', errors='ignore')
+                    return hostname
+
+                ext_start += ext_len
+
+            return ""
+        except Exception as e:
+            add_log('warn', f'Failed to extract SNI: {e}')
+            return ""
+
+    def handle_client_connection(self, client_socket: socket.socket, client_addr: tuple):
+        """Handle incoming client TLS connection.
+
+        Process:
+        1. Receive TLS ClientHello from client
+        2. Extract SNI hostname
+        3. Get/generate certificate for hostname
+        4. Wrap client socket with TLS using generated cert
+        5. Connect to upstream server (hostname:443)
+        6. Establish TLS to upstream
+        7. Forward traffic between client and upstream
+        8. Log HTTP requests/responses
+
+        Args:
+            client_socket: Connected socket from device
+            client_addr: (ip, port) of connecting device
+        """
+        client_socket.settimeout(10)
+        upstream_socket = None
+
+        try:
+            # Receive initial data from client (contains ClientHello)
+            client_hello_data = b''
+            while len(client_hello_data) < 2048:
+                try:
+                    chunk = client_socket.recv(4096)
+                    if not chunk:
+                        break
+                    client_hello_data += chunk
+                except socket.timeout:
+                    break
+                if len(client_hello_data) > 100:  # Enough data for SNI extraction
+                    break
+
+            if not client_hello_data:
+                return
+
+            # Extract hostname from SNI
+            hostname = self.extract_sni(client_hello_data)
+            if not hostname:
+                add_log('warn', f'Could not extract SNI from {client_addr[0]}')
+                hostname = 'unknown.local'
+
+            add_log('info', f'MITM intercepting {client_addr[0]} → {hostname}:443')
+
+            # Get certificate for this hostname
+            if not self.cert_cache:
+                add_log('error', 'Certificate cache not initialized')
+                return
+
+            cert_path, cert_pem = self.cert_cache.get_or_create_cert(hostname)
+
+            # Wrap client socket with TLS (using generated cert)
+            import ssl
+            context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+            context.load_cert_chain(cert_path)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+
+            try:
+                client_tls = context.wrap_socket(client_socket, server_side=True)
+            except ssl.SSLError as e:
+                add_log('warn', f'TLS wrap failed for {hostname}: {e}')
+                return
+
+            # Connect to upstream server
+            try:
+                upstream_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                upstream_socket.settimeout(10)
+                upstream_socket.connect((hostname, 443))
+            except socket.error as e:
+                add_log('error', f'Failed to connect to {hostname}:443 - {e}')
+                return
+
+            # Wrap upstream connection with TLS
+            upstream_context = ssl.create_default_context()
+            upstream_context.check_hostname = True
+            upstream_context.verify_mode = ssl.CERT_REQUIRED
+
+            try:
+                upstream_tls = upstream_context.wrap_socket(upstream_socket, server_hostname=hostname)
+            except ssl.SSLError as e:
+                add_log('warn', f'Upstream TLS failed for {hostname}: {e}')
+                return
+
+            # Forward traffic between client and upstream
+            self._forward_traffic(client_tls, upstream_tls, hostname, client_addr[0])
+
+        except Exception as e:
+            add_log('error', f'Error handling connection from {client_addr[0]}: {e}')
+        finally:
+            try:
+                client_socket.close()
+            except:
+                pass
+            if upstream_socket:
+                try:
+                    upstream_socket.close()
+                except:
+                    pass
+
+    def _forward_traffic(self, client_tls, upstream_tls, hostname: str, client_ip: str):
+        """Forward traffic between client and upstream server.
+
+        Phase 1 (current): Decrypt, log, forward unchanged.
+        Phase 2 (future): Decrypt, modify, re-encrypt.
+
+        Args:
+            client_tls: TLS socket to client device
+            upstream_tls: TLS socket to upstream server
+            hostname: Target hostname being proxied
+            client_ip: IP of connecting device
+        """
+        try:
+            # Use select for bidirectional forwarding
+            client_tls.settimeout(0.1)
+            upstream_tls.settimeout(0.1)
+            buffer_size = 4096
+
+            while True:
+                try:
+                    # Client → Upstream
+                    data = client_tls.recv(buffer_size)
+                    if data:
+                        upstream_tls.sendall(data)
+                        # Phase 1: Log HTTP requests (first line contains method/path)
+                        if data.startswith(b'GET') or data.startswith(b'POST') or data.startswith(b'PUT'):
+                            self._log_http_request(data, hostname, client_ip)
+                except socket.timeout:
+                    pass
+
+                try:
+                    # Upstream → Client
+                    data = upstream_tls.recv(buffer_size)
+                    if data:
+                        client_tls.sendall(data)
+                        # Phase 1: Log HTTP responses (first line contains status code)
+                        if data.startswith(b'HTTP/'):
+                            self._log_http_response(data, hostname, client_ip)
+                except socket.timeout:
+                    pass
+        except Exception as e:
+            add_log('warn', f'Traffic forwarding error for {hostname}: {e}')
+
+    def _log_http_request(self, data: bytes, hostname: str, client_ip: str):
+        """Log HTTP request in JSON format for inspection.
+
+        Phase 1: Log only (no modification).
+        """
+        try:
+            lines = data.split(b'\r\n')
+            if lines:
+                request_line = lines[0].decode('ascii', errors='ignore')
+                entry = {
+                    'timestamp': time.time(),
+                    'type': 'request',
+                    'client_ip': client_ip,
+                    'hostname': hostname,
+                    'request_line': request_line,
+                    'bytes': len(data)
+                }
+                self.traffic_log.append(entry)
+                add_log('info', f'[HTTPS] {client_ip} → {hostname}: {request_line}')
+        except Exception as e:
+            add_log('warn', f'Failed to log HTTP request: {e}')
+
+    def _log_http_response(self, data: bytes, hostname: str, client_ip: str):
+        """Log HTTP response in JSON format for inspection.
+
+        Phase 1: Log only (no modification).
+        """
+        try:
+            lines = data.split(b'\r\n')
+            if lines:
+                status_line = lines[0].decode('ascii', errors='ignore')
+                entry = {
+                    'timestamp': time.time(),
+                    'type': 'response',
+                    'client_ip': client_ip,
+                    'hostname': hostname,
+                    'status_line': status_line,
+                    'bytes': len(data)
+                }
+                self.traffic_log.append(entry)
+                add_log('info', f'[HTTPS] {hostname} → {client_ip}: {status_line}')
+        except Exception as e:
+            add_log('warn', f'Failed to log HTTP response: {e}')
+
+    def start(self):
+        """Start MITM proxy server listening on port 8888."""
+        if self.running:
+            add_log('warn', 'MITM proxy already running')
+            return
+
+        self.running = True
+        self.proxy_thread = threading.Thread(target=self._run_server, daemon=True)
+        self.proxy_thread.start()
+        add_log('success', f'HTTPS MITM proxy started on port {self.listen_port}')
+
+    def _run_server(self):
+        """Server loop - accept connections and handle them."""
+        try:
+            server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server_socket.bind(('0.0.0.0', self.listen_port))
+            server_socket.listen(10)
+            add_log('info', f'MITM proxy listening on port {self.listen_port}')
+
+            while self.running:
+                try:
+                    server_socket.settimeout(1)
+                    client_socket, client_addr = server_socket.accept()
+                    # Handle each connection in a thread
+                    threading.Thread(
+                        target=self.handle_client_connection,
+                        args=(client_socket, client_addr),
+                        daemon=True
+                    ).start()
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    add_log('error', f'Accept error: {e}')
+        except Exception as e:
+            add_log('error', f'MITM proxy failed to start: {e}')
+            self.running = False
+
+    def stop(self):
+        """Stop MITM proxy server."""
+        self.running = False
+        add_log('info', 'MITM proxy stopped')
+
+    def get_traffic_log(self, limit=100):
+        """Return recent traffic log entries."""
+        return self.traffic_log[-limit:]
+
+
+# Initialize MITM proxy on startup
+try:
+    HTTPS_PROXY = HTTPSInterceptProxy(listen_port=8888, ca=CERT_AUTHORITY, cert_cache=CERT_CACHE)
+    add_log('success', 'HTTPS MITM proxy infrastructure initialized')
+except Exception as e:
+    add_log('error', f'Failed to initialize MITM proxy: {e}')
+    HTTPS_PROXY = None
+
 # ---------- PAC File Server ----------
 def generate_pac_file(proxy_host: str = '127.0.0.1', proxy_port: int = 8888) -> str:
     """Generate RFC 2496-compliant PAC (Proxy Auto-Config) file.
