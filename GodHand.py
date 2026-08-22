@@ -997,15 +997,35 @@ def install_package(pkg_name):
     if pm is None:
         add_log('error', f'No package manager found; cannot install {pkg_name}')
         return False
-    cmd = list(pm) + [pkg_name]
-    try:
-        add_log('info', f'Installing {pkg_name} ...')
-        subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        _INSTALLED_TOOLS.add(pkg_name)
-        return True
-    except:
-        add_log('error', f'Failed to install {pkg_name}')
-        return False
+
+    # Define fallback chains for packages that have alternatives in Termux
+    fallback_chains = {
+        'dnscrypt-proxy': ['dnscrypt-proxy', 'unbound'],
+        'tinyproxy': ['tinyproxy', 'squid-proxy', 'privoxy'],
+    }
+
+    packages_to_try = fallback_chains.get(pkg_name, [pkg_name])
+
+    for pkg in packages_to_try:
+        if tool_exists(pkg):
+            _INSTALLED_TOOLS.add(pkg_name)
+            add_log('info', f'{pkg_name} available via {pkg}')
+            return True
+
+        cmd = list(pm) + [pkg]
+        try:
+            add_log('info', f'Installing {pkg} ...')
+            subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            if tool_exists(pkg):
+                _INSTALLED_TOOLS.add(pkg_name)
+                add_log('success', f'{pkg_name} installed via {pkg}')
+                return True
+        except:
+            add_log('info', f'Failed to install {pkg}, trying alternatives...')
+            continue
+
+    add_log('error', f'Failed to install {pkg_name} (tried: {", ".join(packages_to_try)})')
+    return False
 
 def tool_exists(name):
     """Check if tool exists and is executable."""
@@ -1501,8 +1521,6 @@ def gateway_dns_status():
     }
 
 def start_gateway_dns():
-    if not ensure_tool('dnscrypt-proxy'):
-        raise RuntimeError('dnscrypt-proxy could not be installed')
     if not ensure_tool('unbound'):
         raise RuntimeError('unbound could not be installed')
     if not os.path.exists(GW_BLOCKLIST_CONF):
@@ -1510,20 +1528,36 @@ def start_gateway_dns():
     stop_proc('dnscrypt-proxy')
     stop_proc('unbound')
     time.sleep(0.3)
-    dnscrypt_proc = subprocess.Popen(['dnscrypt-proxy', '-config', GW_DNSCRYPT_CONF],
-                                      stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    time.sleep(1.5)
-    if dnscrypt_proc.poll() is not None:
-        err = dnscrypt_proc.stderr.read().decode(errors='ignore')[-400:]
-        raise RuntimeError(f'dnscrypt-proxy failed to start: {err}')
+
+    dnscrypt_available = ensure_tool('dnscrypt-proxy')
+    dnscrypt_proc = None
+
+    if dnscrypt_available and tool_exists('dnscrypt-proxy'):
+        try:
+            dnscrypt_proc = subprocess.Popen(['dnscrypt-proxy', '-config', GW_DNSCRYPT_CONF],
+                                            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            time.sleep(1.5)
+            if dnscrypt_proc.poll() is not None:
+                err = dnscrypt_proc.stderr.read().decode(errors='ignore')[-400:]
+                add_log('warning', f'dnscrypt-proxy failed to start: {err}, falling back to unbound only')
+                dnscrypt_proc = None
+        except Exception as e:
+            add_log('warning', f'Failed to start dnscrypt-proxy: {e}, falling back to unbound only')
+            dnscrypt_proc = None
+
     unbound_proc = subprocess.Popen(['unbound', '-c', GW_UNBOUND_CONF, '-d'],
                                      stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     time.sleep(1)
     if unbound_proc.poll() is not None:
         err = unbound_proc.stderr.read().decode(errors='ignore')[-400:]
-        stop_proc('dnscrypt-proxy')
+        if dnscrypt_proc:
+            stop_proc('dnscrypt-proxy')
         raise RuntimeError(f'unbound failed to start: {err}')
-    add_log('success', 'Gateway DNS stack started (Unbound + DNSCrypt-proxy)')
+
+    if dnscrypt_proc:
+        add_log('success', 'Gateway DNS stack started (Unbound + DNSCrypt-proxy)')
+    else:
+        add_log('success', 'Gateway DNS stack started (Unbound only - dnscrypt-proxy unavailable)')
 
 def stop_gateway_dns():
     stop_proc('unbound')
