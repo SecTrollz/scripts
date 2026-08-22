@@ -424,6 +424,10 @@ except Exception as e:
     CERT_AUTHORITY = None
     CERT_CACHE = None
 
+# Placeholder globals for OEM unlock infrastructure (initialized later after class definitions)
+UNLOCK_QUERY_DETECTOR = None
+UNLOCK_RESPONSE_GENERATOR = None
+
 # ---------- HTTP Response Injection/Modification ----------
 class ResponseModifier:
     """Apply injection rules to HTTP responses."""
@@ -853,6 +857,191 @@ def create_custom_http_reply(status_code: int, headers: dict, body: bytes) -> by
     header_block = ''.join([f"{k}: {v}\r\n" for k, v in headers.items()])
     return response_line.encode() + header_block.encode() + b'\r\n' + body
 
+# ---------- Phase 5E: OEM Unlock Query Detection ----------
+class UnlockQueryDetector:
+    """Detect OEM unlock status queries and identify device type.
+
+    Monitors HTTPS traffic for carrier lock verification queries made by
+    Android devices during recovery boot. Detects: Pixel (Google), Samsung (Knox),
+    OnePlus, Motorola, and generic Android devices.
+    """
+
+    def __init__(self):
+        self.query_patterns = {
+            'pixel': {
+                'hostnames': ['googleapis.com', 'google.com', 'play.google.com'],
+                'paths': ['/androiddeviceintegrity', '/oem_unlock', '/deviceStatus'],
+                'methods': ['POST'],
+            },
+            'samsung': {
+                'hostnames': ['knox.samsung.com', 'sslgate.samsung.com'],
+                'paths': ['/api/v2/device', '/unlock_status', '/knox/verify'],
+                'methods': ['POST'],
+            },
+            'oneplus': {
+                'hostnames': ['api.oneplusapi.com'],
+                'paths': ['/v1/oem_unlock', '/check'],
+                'methods': ['POST'],
+            },
+            'motorola': {
+                'hostnames': ['motorolasupport.com', 'bootloader-unlock.motorola.com'],
+                'paths': ['/bootloader-unlock', '/unlock/challenge'],
+                'methods': ['POST', 'GET'],
+            },
+        }
+
+    def detect_query(self, hostname, path, method, body):
+        """Detect if request is OEM unlock query.
+
+        Returns: (device_type or None, confidence 0-1)
+        """
+        hostname_lower = hostname.lower()
+        path_lower = path.lower()
+
+        for device_type, patterns in self.query_patterns.items():
+            # Check hostname
+            host_match = any(h in hostname_lower for h in patterns['hostnames'])
+            if not host_match:
+                continue
+
+            # Check path
+            path_match = any(p in path_lower for p in patterns['paths'])
+            if not path_match:
+                continue
+
+            # Check method
+            method_match = method.upper() in patterns['methods']
+            if not method_match:
+                continue
+
+            confidence = 0.95 if all([host_match, path_match, method_match]) else 0.7
+            return (device_type, confidence)
+
+        # Fallback: pattern matching in body for unknown devices
+        if body and ('unlock' in body.lower() or 'oem' in body.lower()):
+            return ('generic', 0.5)
+
+        return (None, 0)
+
+    def extract_device_id(self, hostname, path, body):
+        """Extract device identifiers (IMEI, serial, etc.) from query."""
+        device_info = {
+            'imei': None,
+            'serial': None,
+            'carrier': None,
+            'device_model': None,
+        }
+
+        try:
+            import json
+            # Try to parse as JSON
+            body_str = body.decode('utf-8', errors='ignore') if isinstance(body, bytes) else body
+            if body_str and body_str.strip().startswith('{'):
+                data = json.loads(body_str)
+                device_info['imei'] = data.get('imei') or data.get('device_imei')
+                device_info['serial'] = data.get('device_id') or data.get('serial') or data.get('device_serial')
+                device_info['carrier'] = data.get('carrier_name') or data.get('carrier')
+                device_info['device_model'] = data.get('device_model') or data.get('model')
+        except:
+            pass
+
+        return device_info
+
+class ResponseTemplateGenerator:
+    """Generate device-specific unlock status responses.
+
+    Creates spoofed responses that match carrier format for each device type,
+    signaling to devices that OEM unlock is available.
+    """
+
+    def __init__(self):
+        self.response_cache = {}  # Cache responses per device_type + device_id
+
+    def generate_response(self, device_type, request_body, device_id):
+        """Generate appropriate unlock response for device type.
+
+        Returns: (status_code, headers_dict, body_bytes)
+        """
+        if device_type == 'pixel':
+            return self._generate_pixel_response(request_body, device_id)
+        elif device_type == 'samsung':
+            return self._generate_samsung_response(request_body, device_id)
+        elif device_type == 'oneplus':
+            return self._generate_oneplus_response(request_body, device_id)
+        elif device_type == 'motorola':
+            return self._generate_motorola_response(request_body, device_id)
+        else:
+            return self._generate_generic_response(request_body, device_id)
+
+    def _generate_pixel_response(self, request_body, device_id):
+        """Generate Google/Pixel unlock response (JSON)."""
+        import json
+        response_body = {
+            "unlock_status": "available",
+            "carrier_locked": False,
+            "device_verified": True,
+            "message": "OEM Unlock available"
+        }
+        headers = {
+            'Content-Type': 'application/json',
+            'Content-Length': str(len(json.dumps(response_body))),
+        }
+        return (200, headers, json.dumps(response_body).encode('utf-8'))
+
+    def _generate_samsung_response(self, request_body, device_id):
+        """Generate Samsung Knox unlock response (JSON)."""
+        import json
+        response_body = {
+            "device_state": "unlocked",
+            "sim_locked": False,
+            "knox_status": "green",
+            "attestation_result": {
+                "verified": True,
+                "device_compliant": True
+            },
+            "unlock_available": True
+        }
+        headers = {
+            'Content-Type': 'application/json',
+            'X-Knox-Version': '3.8',
+        }
+        return (200, headers, json.dumps(response_body).encode('utf-8'))
+
+    def _generate_oneplus_response(self, request_body, device_id):
+        """Generate OnePlus unlock response (JSON)."""
+        import json
+        import time
+        response_body = {
+            "unlock_available": True,
+            "device_id": device_id or "unknown",
+            "reason": "ok",
+            "valid_until": int(time.time()) + 86400
+        }
+        headers = {'Content-Type': 'application/json'}
+        return (200, headers, json.dumps(response_body).encode('utf-8'))
+
+    def _generate_motorola_response(self, request_body, device_id):
+        """Generate Motorola bootloader response (JSON)."""
+        import json
+        response_body = {
+            "device_id": device_id or "unknown",
+            "status": "bootloader_unlock_supported",
+            "challenge_accepted": True
+        }
+        headers = {'Content-Type': 'application/json'}
+        return (200, headers, json.dumps(response_body).encode('utf-8'))
+
+    def _generate_generic_response(self, request_body, device_id):
+        """Generic fallback response (JSON)."""
+        import json
+        response_body = {
+            "status": "success",
+            "unlock_enabled": True,
+            "error": None
+        }
+        headers = {'Content-Type': 'application/json'}
+        return (200, headers, json.dumps(response_body).encode('utf-8'))
+
 class HTTPSInterceptProxy:
     """Pure Python HTTPS interception proxy (transparent MITM).
 
@@ -1142,6 +1331,7 @@ class HTTPSInterceptProxy:
 
         Phase 1 (current): Decrypt, log, forward unchanged.
         Phase 2 (future): Decrypt, modify, re-encrypt.
+        Phase 5E: Intercept OEM unlock queries and inject spoofed responses.
 
         Args:
             client_tls: TLS socket to client device
@@ -1154,16 +1344,58 @@ class HTTPSInterceptProxy:
             client_tls.settimeout(0.1)
             upstream_tls.settimeout(0.1)
             buffer_size = 4096
+            request_buffer = b''  # Buffer for incomplete HTTP requests
 
             while True:
                 try:
                     # Client → Upstream
                     data = client_tls.recv(buffer_size)
                     if data:
-                        upstream_tls.sendall(data)
+                        request_buffer += data
+
                         # Phase 1: Log HTTP requests (first line contains method/path)
-                        if data.startswith(b'GET') or data.startswith(b'POST') or data.startswith(b'PUT'):
-                            self._log_http_request(data, hostname, client_ip)
+                        if request_buffer.startswith(b'GET') or request_buffer.startswith(b'POST') or request_buffer.startswith(b'PUT'):
+                            # Try to parse HTTP request
+                            request_parts = self._parse_http_request(request_buffer)
+                            if request_parts:
+                                method, path, headers, body = request_parts
+
+                                # Phase 5E: Detect OEM unlock queries
+                                if UNLOCK_QUERY_DETECTOR:
+                                    device_type, confidence = UNLOCK_QUERY_DETECTOR.detect_query(hostname, path, method, body)
+
+                                    if device_type and confidence > 0.7:
+                                        add_log('info', f'OEM unlock query detected: {device_type} from {client_ip} → {hostname}{path}')
+
+                                        # Extract device identifiers
+                                        device_info = UNLOCK_QUERY_DETECTOR.extract_device_id(hostname, path, body)
+                                        device_id = device_info.get('serial') or device_info.get('imei') or 'unknown'
+
+                                        # Generate spoofed unlock response
+                                        if UNLOCK_RESPONSE_GENERATOR:
+                                            status, resp_headers, resp_body = UNLOCK_RESPONSE_GENERATOR.generate_response(
+                                                device_type, body, device_id
+                                            )
+
+                                            # Build HTTP response
+                                            spoofed_response = create_custom_http_reply(status, resp_headers, resp_body)
+                                            client_tls.sendall(spoofed_response)
+
+                                            add_log('success', f'OEM unlock response injected for {device_type} device (latency: instant)')
+                                            self._log_http_request(request_buffer, hostname, client_ip)
+                                            self._log_http_response(spoofed_response, hostname, client_ip)
+
+                                            # Clear buffer and continue listening
+                                            request_buffer = b''
+                                            continue
+
+                                # Not an unlock query - forward normally
+                                self._log_http_request(request_buffer, hostname, client_ip)
+                                request_buffer = b''
+
+                        # Forward to upstream (if not already sent as spoofed response)
+                        if request_buffer:
+                            upstream_tls.sendall(data)
                 except socket.timeout:
                     pass
 
@@ -1238,6 +1470,49 @@ class HTTPSInterceptProxy:
                 add_log('info', f'[HTTPS] {hostname} → {client_ip}: {status_line}')
         except Exception as e:
             add_log('warn', f'Failed to log HTTP response: {e}')
+
+    def _parse_http_request(self, data: bytes):
+        """Parse HTTP request from buffer.
+
+        Returns: (method, path, headers_dict, body_bytes) or None if incomplete.
+        """
+        try:
+            # Look for double CRLF that separates headers from body
+            if b'\r\n\r\n' not in data:
+                return None  # Incomplete request
+
+            header_section, body = data.split(b'\r\n\r\n', 1)
+            lines = header_section.split(b'\r\n')
+
+            if not lines:
+                return None
+
+            # Parse request line: "GET /path HTTP/1.1"
+            request_line = lines[0].decode('ascii', errors='ignore')
+            parts = request_line.split()
+
+            if len(parts) < 2:
+                return None
+
+            method = parts[0]  # GET, POST, etc.
+            path = parts[1]    # /path?query
+
+            # Parse headers
+            headers = {}
+            for line in lines[1:]:
+                if b':' in line:
+                    key, value = line.split(b':', 1)
+                    headers[key.decode('ascii', errors='ignore').strip().lower()] = value.decode('ascii', errors='ignore').strip()
+
+            # Handle Content-Length to get complete body
+            content_length = int(headers.get('content-length', 0))
+            if len(body) < content_length:
+                return None  # Incomplete body
+
+            return (method, path, headers, body[:content_length])
+        except Exception as e:
+            add_log('dev', f'HTTP request parse error: {e}')
+            return None
 
     def start(self):
         """Start MITM proxy server listening on port 8888."""
@@ -1581,6 +1856,16 @@ function FindProxyForURL(url, host) {{
 """
     return pac_js.strip()
 
+
+# Initialize OEM unlock detection infrastructure (Phase 5E)
+try:
+    UNLOCK_QUERY_DETECTOR = UnlockQueryDetector()
+    UNLOCK_RESPONSE_GENERATOR = ResponseTemplateGenerator()
+    add_log('success', 'OEM unlock detection infrastructure initialized')
+except Exception as e:
+    add_log('warn', f'Failed to initialize OEM unlock infrastructure: {e}')
+    UNLOCK_QUERY_DETECTOR = None
+    UNLOCK_RESPONSE_GENERATOR = None
 
 app = Flask(__name__)
 
