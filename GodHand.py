@@ -6673,6 +6673,130 @@ def api_dev_console():
 
     return jsonify(results)
 
+# ---------- Phase 2.1: CA Installation & Device Configuration ----------
+@app.route('/api/https_ca_install', methods=['GET'])
+@require_auth
+def api_https_ca_install():
+    """Get CA certificate for installation on devices (Phase 2.1).
+
+    Returns the CA certificate in PEM format for manual installation
+    on rooted Android devices or other test systems.
+
+    Process:
+    1. Rooted Android (ADB): adb push ca-cert.pem /system/etc/security/cacerts/
+    2. Other devices: Install via Settings → Security → Install Certificate
+    """
+    global CERT_AUTHORITY
+
+    if not CERT_AUTHORITY:
+        return jsonify({'success': False, 'error': 'CA not initialized'}), 500
+
+    try:
+        cert_pem = CERT_AUTHORITY.get_ca_cert_pem()
+        add_log('info', 'CA certificate retrieved for device installation')
+        return Response(cert_pem, mimetype='application/x-pem-file', headers={
+            'Content-Disposition': 'attachment; filename=godhand-ca-cert.pem'
+        })
+    except Exception as e:
+        error_msg = f'Failed to retrieve CA certificate: {str(e)}'
+        add_log('error', error_msg)
+        return jsonify({'success': False, 'error': error_msg}), 500
+
+@app.route('/api/https_setup_guide', methods=['GET'])
+@require_auth
+def api_https_setup_guide():
+    """Get platform-specific HTTPS interception setup guide (Phase 2.1)."""
+    guide = {
+        'overview': 'Configure devices to route HTTPS traffic through GodHand MITM proxy',
+        'proxy_url': 'http://pac.installCA.lan/pac',
+        'ca_download_url': '/api/https_ca_install',
+        'platforms': {
+            'android_rooted': {
+                'title': 'Android (Rooted Device - Pixel 9a)',
+                'steps': [
+                    '1. Enable system partition R/W: adb shell mount -o rw,remount /system',
+                    '2. Download CA cert: Download from /api/https_ca_install',
+                    '3. Push to system: adb push godhand-ca-cert.pem /system/etc/security/cacerts/',
+                    '4. Set permissions: adb shell chmod 644 /system/etc/security/cacerts/godhand-ca-cert.pem',
+                    '5. Reboot device: adb reboot',
+                    '6. Configure PAC: Settings → WiFi → (long-press network) → Modify → Proxy → Automatic',
+                    '7. Enter PAC URL: http://pac.installCA.lan/pac',
+                    '8. Verify: Open Chrome → navigate to https://example.com → check proxy logs'
+                ],
+                'notes': 'Requires rooted device with adb access. CA installation is explicit (not covert).'
+            },
+            'android_unrooted': {
+                'title': 'Android (Unrooted Device)',
+                'steps': [
+                    '1. Download CA cert from /api/https_ca_install',
+                    '2. Settings → Security → Install Certificate from Storage',
+                    '3. Select downloaded godhand-ca-cert.pem file',
+                    '4. Name it "GodHand CA" and confirm installation',
+                    '5. Settings → WiFi → (long-press network) → Modify → Proxy → Automatic',
+                    '6. Enter PAC URL: http://pac.installCA.lan/pac',
+                    '7. Note: Unrooted devices cannot intercept system app traffic'
+                ],
+                'notes': 'User-installed CA certificate. Apps must respect system certificate store.'
+            },
+            'ios': {
+                'title': 'iOS Device',
+                'steps': [
+                    '1. Download CA cert from /api/https_ca_install',
+                    '2. Email the certificate to your iOS device',
+                    '3. Tap attachment → Install Certificate → Install',
+                    '4. Settings → General → VPN & Device Management → Trust Certificate',
+                    '5. Settings → WiFi → (info icon) → Configure Proxy → Automatic',
+                    '6. Enter PAC URL: http://pac.installCA.lan/pac',
+                    '7. Note: Some apps use certificate pinning and will reject proxy'
+                ],
+                'notes': 'iOS restricts MITM to Safari and system apps. App-specific proxies not supported.'
+            },
+            'macos': {
+                'title': 'macOS Device',
+                'steps': [
+                    '1. Download CA cert from /api/https_ca_install',
+                    '2. Double-click the .pem file → Keychain Access',
+                    '3. Search for "GodHand" → right-click → Trust → Select Always Trust',
+                    '4. System Preferences → Network → WiFi → Advanced → Proxies',
+                    '5. Check "Automatic Proxy Configuration"',
+                    '6. PAC URL: http://pac.installCA.lan/pac',
+                    '7. Verify: Open browser → navigate to https://example.com'
+                ],
+                'notes': 'Full OS-level proxy support. All HTTPS traffic intercepted.'
+            },
+            'windows': {
+                'title': 'Windows Device',
+                'steps': [
+                    '1. Download CA cert from /api/https_ca_install',
+                    '2. Right-click → Install Certificate → Current User → Browse',
+                    '3. Select "Trusted Root Certification Authorities" → OK → Finish',
+                    '4. Settings → Network & Internet → Proxy',
+                    '5. Toggle "Use a proxy server" → Manual proxy setup → Disabled',
+                    '6. Or: Settings → Manage proxy settings → Automatic proxy configuration',
+                    '7. PAC URL: http://pac.installCA.lan/pac',
+                    '8. Verify: Open browser → navigate to https://example.com'
+                ],
+                'notes': 'Windows supports both manual and PAC proxy. Enterprise policies may override.'
+            }
+        },
+        'troubleshooting': {
+            'traffic_not_appearing': 'Check: (1) proxy running /api/https_traffic/start, (2) CA installed on device, (3) PAC URL correct, (4) device on same network',
+            'cert_warnings': 'Device rejected CA. Ensure CA certificate installed and trusted in device settings.',
+            'dns_not_resolving': 'Check DNS hijacking for .lan domains. Ensure rooted device handling DNS.',
+            'connection_timeout': 'Proxy firewall blocking. Check device can reach rooted device IP:8888.',
+            'app_still_encrypted': 'App uses certificate pinning. Try different app or use system browser.'
+        },
+        'uninstall': {
+            'android_rooted': 'adb shell rm /system/etc/security/cacerts/godhand-ca-cert.pem && adb reboot',
+            'android_unrooted': 'Settings → Security → Remove installed certificates → Select GodHand CA',
+            'ios': 'Settings → VPN & Device Management → Select cert → Delete',
+            'macos': 'Keychain Access → Search GodHand → Delete certificate',
+            'windows': 'Settings → Manage certificates → Delete from Trusted Root CA store'
+        }
+    }
+
+    return jsonify({'success': True, 'guide': guide})
+
 # ---------- Phase 1.4: Traffic Inspection Layer REST API ----------
 @app.route('/api/https_traffic/start', methods=['POST'])
 @require_auth
