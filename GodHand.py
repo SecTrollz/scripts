@@ -946,6 +946,89 @@ class HTTPSInterceptProxy:
             add_log('warn', f'Failed to extract SNI: {e}')
             return ""
 
+    def detect_cert_pinning_app(self, client_addr: str, hostname: str) -> bool:
+        """Detect if connection is from a pinning-enabled app.
+
+        Returns True if this is likely a pinned connection that will reject our fake cert.
+        Uses heuristics: known pinning apps, enterprise SSL pinning patterns, and user-defined list.
+        """
+        # Check user-defined pinning bypass list first
+        if hostname in PINNED_HOSTS and PINNED_HOSTS[hostname]['enabled']:
+            return True
+
+        # Known apps with strong cert pinning
+        pinning_patterns = {
+            'com.google': ['drive.google.com', 'accounts.google.com', 'play.google.com'],
+            'com.facebook': ['facebook.com', 'instagram.com', 'messenger.com'],
+            'com.twitter': ['twitter.com', 'api.twitter.com'],
+            'com.stripe': ['stripe.com', 'api.stripe.com'],
+            'banking': ['bank', 'secure', 'credential'],
+            'health': ['healthkit', 'medical', 'hsa'],
+        }
+
+        # Check hostname against known pinning domains
+        for app_pattern, domains in pinning_patterns.items():
+            for domain in domains:
+                if domain in hostname:
+                    return True
+
+        # Check for enterprise-grade pinning indicators in hostname
+        enterprise_indicators = ['api.', 'secure.', 'auth.', 'oauth.']
+        if any(ind in hostname for ind in enterprise_indicators):
+            # Likely enterprise service with pinning
+            if 'internal' in hostname or 'private' in hostname or 'corp' in hostname:
+                return True
+
+        return False
+
+    def transparent_passthrough(self, client_socket: socket.socket, hostname: str, client_addr: tuple) -> bool:
+        """Attempt transparent passthrough for pinned certificates.
+
+        Relay traffic between client and upstream without TLS interception.
+        This preserves the original certificate chain and bypasses pinning.
+
+        Returns True if passthrough succeeded, False if interception should be attempted instead.
+        """
+        upstream_socket = None
+        try:
+            # Connect to upstream server
+            upstream_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            upstream_socket.settimeout(10)
+            upstream_socket.connect((hostname, 443))
+
+            add_log('info', f'Cert pinning detected: transparent passthrough for {client_addr[0]} → {hostname}')
+
+            # Forward all traffic between client and upstream (encrypted, unchanged)
+            client_socket.settimeout(0.5)
+            upstream_socket.settimeout(0.5)
+
+            sockets = [client_socket, upstream_socket]
+            while True:
+                readable, _, _ = select.select(sockets, [], [], 1)
+                for sock in readable:
+                    try:
+                        data = sock.recv(8192)
+                        if not data:
+                            return True
+
+                        # Forward to other socket
+                        other_sock = upstream_socket if sock is client_socket else client_socket
+                        other_sock.sendall(data)
+                    except (socket.timeout, socket.error):
+                        pass
+
+        except socket.error as e:
+            add_log('warn', f'Passthrough failed for {hostname}: {e}')
+            return False
+        finally:
+            if upstream_socket:
+                try:
+                    upstream_socket.close()
+                except:
+                    pass
+
+        return True
+
     def handle_client_connection(self, client_socket: socket.socket, client_addr: tuple):
         """Handle incoming client TLS connection.
 
@@ -988,6 +1071,13 @@ class HTTPSInterceptProxy:
             if not hostname:
                 add_log('warn', f'Could not extract SNI from {client_addr[0]}')
                 hostname = 'unknown.local'
+
+            # Check for cert pinning before attempting interception
+            if self.detect_cert_pinning_app(client_addr[0], hostname):
+                add_log('info', f'Cert pinning detected for {hostname} - attempting transparent passthrough')
+                if self.transparent_passthrough(client_socket, hostname, client_addr):
+                    return  # Passthrough succeeded
+                add_log('warn', f'Passthrough failed for {hostname} - falling back to interception')
 
             add_log('info', f'MITM intercepting {client_addr[0]} → {hostname}:443')
 
@@ -7555,6 +7645,78 @@ def api_https_setup_guide():
     }
 
     return jsonify({'success': True, 'guide': guide})
+
+# ---------- Phase 2A: Certificate Pinning Bypass Management ----------
+PINNED_HOSTS = {}  # hostname → {'reason': str, 'added_at': timestamp, 'enabled': bool}
+
+@app.route('/api/https_pinning/list', methods=['GET'])
+@require_auth
+def api_https_pinning_list():
+    """List hosts with cert pinning (to be bypassed)."""
+    return jsonify({
+        'success': True,
+        'pinned_hosts': PINNED_HOSTS,
+        'count': len(PINNED_HOSTS)
+    })
+
+@app.route('/api/https_pinning/add', methods=['POST'])
+@require_auth
+def api_https_pinning_add():
+    """Add a host to pinning bypass list."""
+    data = request.get_json() or {}
+    hostname = data.get('hostname', '').strip()
+    reason = data.get('reason', 'App uses certificate pinning')
+
+    if not hostname:
+        return jsonify({'success': False, 'error': 'hostname required'}), 400
+
+    if not re.match(r'^[a-zA-Z0-9.-]+$', hostname):
+        return jsonify({'success': False, 'error': 'invalid hostname'}), 400
+
+    PINNED_HOSTS[hostname] = {
+        'reason': reason,
+        'added_at': datetime.now().isoformat(),
+        'enabled': True
+    }
+    add_log('info', f'Added {hostname} to cert pinning bypass list: {reason}')
+
+    return jsonify({
+        'success': True,
+        'message': f'Added {hostname} to pinning bypass list',
+        'host': PINNED_HOSTS[hostname]
+    })
+
+@app.route('/api/https_pinning/remove', methods=['POST'])
+@require_auth
+def api_https_pinning_remove():
+    """Remove a host from pinning bypass list."""
+    data = request.get_json() or {}
+    hostname = data.get('hostname', '').strip()
+
+    if hostname not in PINNED_HOSTS:
+        return jsonify({'success': False, 'error': f'host {hostname} not in bypass list'}), 404
+
+    del PINNED_HOSTS[hostname]
+    add_log('info', f'Removed {hostname} from cert pinning bypass list')
+
+    return jsonify({'success': True, 'message': f'Removed {hostname} from bypass list'})
+
+@app.route('/api/https_pinning/toggle', methods=['POST'])
+@require_auth
+def api_https_pinning_toggle():
+    """Enable/disable pinning bypass for a host."""
+    data = request.get_json() or {}
+    hostname = data.get('hostname', '').strip()
+    enabled = data.get('enabled', True)
+
+    if hostname not in PINNED_HOSTS:
+        return jsonify({'success': False, 'error': f'host {hostname} not in bypass list'}), 404
+
+    PINNED_HOSTS[hostname]['enabled'] = enabled
+    status = 'enabled' if enabled else 'disabled'
+    add_log('info', f'Pinning bypass for {hostname} {status}')
+
+    return jsonify({'success': True, 'message': f'Bypass {status} for {hostname}'})
 
 # ---------- Phase 1.4: Traffic Inspection Layer REST API ----------
 @app.route('/api/https_traffic/start', methods=['POST'])
