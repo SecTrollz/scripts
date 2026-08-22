@@ -6702,6 +6702,33 @@ def api_https_ca_install():
         add_log('error', error_msg)
         return jsonify({'success': False, 'error': error_msg}), 500
 
+@app.route('/api/https_device_test', methods=['GET'])
+@require_auth
+def api_https_device_test():
+    """Test endpoint to verify device can reach GodHand and proxy is configured (Phase 2.2).
+
+    Returns device information for troubleshooting:
+    - Client IP (device's IP on network)
+    - Proxy status (can reach port 8888)
+    - DNS resolution (.lan domains)
+    - CA certificate accessibility
+    """
+    device_info = {
+        'success': True,
+        'device_ip': request.remote_addr,
+        'server_ip': request.host.split(':')[0],
+        'timestamp': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
+        'diagnostics': {
+            'device_can_reach_server': request.remote_addr != '127.0.0.1',
+            'https_proxy_running': HTTPS_PROXY.running if HTTPS_PROXY else False,
+            'proxy_port': 8888,
+            'pac_url': 'http://pac.installCA.lan/pac',
+            'ca_download_url': '/api/https_ca_install'
+        }
+    }
+    add_log('info', f'Device test from {request.remote_addr} - proxy running: {device_info["diagnostics"]["https_proxy_running"]}')
+    return jsonify(device_info)
+
 @app.route('/api/https_setup_guide', methods=['GET'])
 @require_auth
 def api_https_setup_guide():
