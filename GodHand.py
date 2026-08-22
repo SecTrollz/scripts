@@ -28,8 +28,11 @@ import urllib.parse
 import base64
 import secrets
 import uuid
+import sqlite3
+import csv
 from functools import wraps
-from flask import Flask, request, jsonify, render_template_string, abort, Response
+from datetime import datetime
+from flask import Flask, request, jsonify, render_template_string, abort, Response, send_file
 
 # ---------- configuration ----------
 SECRET = os.environ.get('GODHAND_SECRET', '')
@@ -560,6 +563,172 @@ class ResponseModifier:
         import fnmatch
         return fnmatch.fnmatch(hostname, pattern)
 
+# ---------- Traffic Persistence Database ----------
+class TrafficDatabase:
+    """SQLite database for persistent HTTPS traffic storage."""
+
+    def __init__(self, db_path=None):
+        if db_path is None:
+            db_path = os.path.join(GATEWAY_DIR, 'https_traffic.db')
+        self.db_path = db_path
+        self.lock = threading.Lock()
+        self._init_db()
+
+    def _init_db(self):
+        """Initialize database schema if not exists."""
+        try:
+            with self.lock:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute('''
+                    CREATE TABLE IF NOT EXISTS https_traffic (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        timestamp REAL,
+                        type TEXT,
+                        client_ip TEXT,
+                        hostname TEXT,
+                        request_line TEXT,
+                        status_line TEXT,
+                        bytes INTEGER,
+                        method TEXT,
+                        path TEXT,
+                        status_code INTEGER,
+                        request_body_size INTEGER,
+                        response_body_size INTEGER,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                ''')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_timestamp ON https_traffic(timestamp)')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_hostname ON https_traffic(hostname)')
+                cursor.execute('CREATE INDEX IF NOT EXISTS idx_client_ip ON https_traffic(client_ip)')
+                conn.commit()
+                conn.close()
+                add_log('info', f'Traffic database initialized: {self.db_path}')
+        except Exception as e:
+            add_log('error', f'Failed to initialize traffic database: {e}')
+
+    def add_entry(self, entry: dict):
+        """Add traffic entry to database."""
+        try:
+            with self.lock:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute('''
+                    INSERT INTO https_traffic
+                    (timestamp, type, client_ip, hostname, request_line, status_line, bytes,
+                     method, path, status_code, request_body_size, response_body_size)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    entry.get('timestamp'),
+                    entry.get('type'),
+                    entry.get('client_ip'),
+                    entry.get('hostname'),
+                    entry.get('request_line', ''),
+                    entry.get('status_line', ''),
+                    entry.get('bytes', 0),
+                    entry.get('method', ''),
+                    entry.get('path', ''),
+                    entry.get('status_code'),
+                    entry.get('request_body_size', 0),
+                    entry.get('response_body_size', 0)
+                ))
+                conn.commit()
+                conn.close()
+
+                # Cleanup old entries (keep last 10000)
+                self._cleanup_old_entries()
+        except Exception as e:
+            add_log('warn', f'Failed to add traffic entry to database: {e}')
+
+    def _cleanup_old_entries(self):
+        """Remove entries older than a threshold, keeping last 10000."""
+        try:
+            with self.lock:
+                conn = sqlite3.connect(self.db_path)
+                cursor = conn.cursor()
+                cursor.execute('SELECT COUNT(*) FROM https_traffic')
+                count = cursor.fetchone()[0]
+
+                if count > 10000:
+                    # Delete oldest entries, keeping newest 10000
+                    cursor.execute('''
+                        DELETE FROM https_traffic WHERE id NOT IN (
+                            SELECT id FROM https_traffic ORDER BY timestamp DESC LIMIT 10000
+                        )
+                    ''')
+                    conn.commit()
+                conn.close()
+        except Exception as e:
+            add_log('warn', f'Failed to cleanup old traffic entries: {e}')
+
+    def query(self, limit=100, offset=0, hostname_filter=None, client_ip_filter=None):
+        """Query traffic entries from database."""
+        try:
+            with self.lock:
+                conn = sqlite3.connect(self.db_path)
+                conn.row_factory = sqlite3.Row
+                cursor = conn.cursor()
+
+                query = 'SELECT * FROM https_traffic WHERE 1=1'
+                params = []
+
+                if hostname_filter:
+                    query += ' AND hostname LIKE ?'
+                    params.append(f'%{hostname_filter}%')
+
+                if client_ip_filter:
+                    query += ' AND client_ip = ?'
+                    params.append(client_ip_filter)
+
+                query += ' ORDER BY timestamp DESC LIMIT ? OFFSET ?'
+                params.extend([limit, offset])
+
+                cursor.execute(query, params)
+                rows = cursor.fetchall()
+                conn.close()
+
+                return [dict(row) for row in rows]
+        except Exception as e:
+            add_log('warn', f'Failed to query traffic database: {e}')
+            return []
+
+    def export_csv(self, output_path=None, hostname_filter=None, client_ip_filter=None):
+        """Export traffic to CSV file."""
+        try:
+            rows = self.query(limit=100000, hostname_filter=hostname_filter, client_ip_filter=client_ip_filter)
+
+            if output_path is None:
+                output_path = os.path.join(GATEWAY_DIR, f'https_traffic_{int(time.time())}.csv')
+
+            with open(output_path, 'w', newline='') as f:
+                if rows:
+                    writer = csv.DictWriter(f, fieldnames=rows[0].keys())
+                    writer.writeheader()
+                    writer.writerows(rows)
+
+            add_log('info', f'Traffic exported to CSV: {output_path}')
+            return output_path
+        except Exception as e:
+            add_log('error', f'Failed to export traffic to CSV: {e}')
+            return None
+
+    def export_json(self, output_path=None, hostname_filter=None, client_ip_filter=None):
+        """Export traffic to JSON file."""
+        try:
+            rows = self.query(limit=100000, hostname_filter=hostname_filter, client_ip_filter=client_ip_filter)
+
+            if output_path is None:
+                output_path = os.path.join(GATEWAY_DIR, f'https_traffic_{int(time.time())}.json')
+
+            with open(output_path, 'w') as f:
+                json.dump(rows, f, indent=2, default=str)
+
+            add_log('info', f'Traffic exported to JSON: {output_path}')
+            return output_path
+        except Exception as e:
+            add_log('error', f'Failed to export traffic to JSON: {e}')
+            return None
+
 # ---------- HTTPS MITM Proxy Core ----------
 class HTTPSInterceptProxy:
     """Pure Python HTTPS interception proxy (transparent MITM).
@@ -887,10 +1056,17 @@ class HTTPSInterceptProxy:
         add_log('info', 'MITM proxy stopped')
 
     def _add_traffic_entry(self, entry: dict):
-        """Add entry to traffic log with automatic size management."""
+        """Add entry to traffic log with automatic size management and database persistence."""
         self.traffic_log.append(entry)
         if len(self.traffic_log) > self.max_log_size:
             self.traffic_log = self.traffic_log[-self.max_log_size:]
+
+        # Store in database for persistence (Phase 5D)
+        try:
+            if TRAFFIC_DATABASE:
+                TRAFFIC_DATABASE.add_entry(entry)
+        except Exception as e:
+            pass  # Silently fail; don't disrupt traffic forwarding
 
     def get_traffic_log(self, limit=100):
         """Return recent traffic log entries."""
@@ -944,6 +1120,14 @@ function FindProxyForURL(url, host) {{
 
 
 app = Flask(__name__)
+
+# Initialize traffic database
+try:
+    TRAFFIC_DATABASE = TrafficDatabase()
+    add_log('success', 'Traffic database initialized')
+except Exception as e:
+    add_log('error', f'Failed to initialize traffic database: {e}')
+    TRAFFIC_DATABASE = None
 
 @app.after_request
 def add_no_cache_headers(response):
@@ -7292,6 +7476,50 @@ def api_https_traffic():
         'entries': filtered[:limit],
         'proxy_running': HTTPS_PROXY.running
     })
+
+@app.route('/api/https_traffic/export', methods=['GET'])
+@require_auth
+def api_https_traffic_export():
+    """Export HTTPS traffic to CSV or JSON format (Phase 5D).
+
+    Query parameters:
+    - format: 'csv' or 'json' (default: 'json')
+    - hostname_filter: Filter by hostname
+    - client_ip_filter: Filter by client IP
+
+    Returns:
+        File download or JSON error response
+    """
+    if not TRAFFIC_DATABASE:
+        return jsonify({'success': False, 'error': 'Traffic database not initialized'}), 500
+
+    export_format = request.args.get('format', 'json').lower()
+    hostname_filter = request.args.get('hostname_filter', '')
+    client_ip_filter = request.args.get('client_ip_filter', '')
+
+    if export_format not in ['csv', 'json']:
+        return jsonify({'success': False, 'error': 'Format must be csv or json'}), 400
+
+    try:
+        if export_format == 'csv':
+            filepath = TRAFFIC_DATABASE.export_csv(
+                hostname_filter=hostname_filter if hostname_filter else None,
+                client_ip_filter=client_ip_filter if client_ip_filter else None
+            )
+            if filepath and os.path.exists(filepath):
+                return send_file(filepath, as_attachment=True, download_name=os.path.basename(filepath))
+        else:
+            filepath = TRAFFIC_DATABASE.export_json(
+                hostname_filter=hostname_filter if hostname_filter else None,
+                client_ip_filter=client_ip_filter if client_ip_filter else None
+            )
+            if filepath and os.path.exists(filepath):
+                return send_file(filepath, as_attachment=True, download_name=os.path.basename(filepath))
+
+        return jsonify({'success': False, 'error': 'Export failed'}), 500
+    except Exception as e:
+        add_log('error', f'Traffic export failed: {e}')
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/https_traffic/stream', methods=['GET'])
 @require_auth
