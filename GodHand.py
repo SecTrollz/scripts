@@ -1389,13 +1389,10 @@ class HTTPSInterceptProxy:
                                             request_buffer = b''
                                             continue
 
-                                # Not an unlock query - forward normally
+                                # Not an unlock query - forward to upstream normally
                                 self._log_http_request(request_buffer, hostname, client_ip)
+                                upstream_tls.sendall(request_buffer)
                                 request_buffer = b''
-
-                        # Forward to upstream (if not already sent as spoofed response)
-                        if request_buffer:
-                            upstream_tls.sendall(data)
                 except socket.timeout:
                     pass
 
