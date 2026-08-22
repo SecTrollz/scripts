@@ -2274,7 +2274,7 @@ def index():
 :root {
   /* palette sampled directly from the login/app background photo (app-bg-photo) */
   --bg-base: #011236;
-  --bg-elevated: rgba(1,36,91,0.45);
+  --bg-elevated: rgba(80,80,80,0.45);
   --bg-inset: rgba(255,255,255,0.05);
   --border-subtle: rgba(255,255,255,0.12);
   --border-strong: rgba(255,255,255,0.22);
