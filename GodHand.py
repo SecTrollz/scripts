@@ -458,7 +458,8 @@ def arp_scan(iface, my_ip, cidr):
             break
     for ip in hosts:
         try:
-            sock.send(arp_packet(src_mac, my_ip, ip))
+            pkt = arp_packet(src_mac, my_ip, ip)
+            SocketProxy.send_packet(pkt, iface)
         except:
             pass
 
@@ -1186,16 +1187,15 @@ def send_custom_packet(spec, count=1, interval_ms=0):
     what this is for.
     """
     frame = build_custom_packet(spec)
-    sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x0003))
-    try:
-        sock.bind((spec['iface'], 0))
-        sent = 0
-        for i in range(count):
-            sent += sock.send(frame)
-            if i < count - 1 and interval_ms > 0:
-                time.sleep(interval_ms / 1000.0)
-    finally:
-        sock.close()
+    sent = 0
+    for i in range(count):
+        success, method, error = SocketProxy.send_packet(frame, spec['iface'])
+        if not success:
+            add_log('error', f'Packet injection failed ({method}): {error}')
+            raise RuntimeError(f'Failed to send custom packet via {method}: {error}')
+        sent += len(frame)
+        if i < count - 1 and interval_ms > 0:
+            time.sleep(interval_ms / 1000.0)
     return sent, frame
 
 # ---------- attack launchers ----------
