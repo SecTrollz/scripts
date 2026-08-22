@@ -30,6 +30,8 @@ import secrets
 import uuid
 import sqlite3
 import csv
+import ssl
+import gzip
 from functools import wraps
 from datetime import datetime
 from flask import Flask, request, jsonify, render_template_string, abort, Response, send_file
@@ -730,6 +732,126 @@ class TrafficDatabase:
             return None
 
 # ---------- HTTPS MITM Proxy Core ----------
+class HTTPManipulator:
+    """Parses, modifies, and rebuilds HTTP/1.1 traffic streams.
+
+    Handles chunked encoding, gzip compression, and header manipulation
+    to enable active injection of content into HTTP responses.
+    """
+
+    @staticmethod
+    def _decode_chunked(data: bytes) -> bytes:
+        """Decode chunked transfer encoding."""
+        result = b''
+        while data:
+            try:
+                end = data.find(b'\r\n')
+                if end == -1:
+                    break
+                chunk_size = int(data[:end], 16)
+                if chunk_size == 0:
+                    break
+                chunk_start = end + 2
+                chunk_end = chunk_start + chunk_size
+                result += data[chunk_start:chunk_end]
+                data = data[chunk_end + 2:]
+            except:
+                break
+        return result
+
+    @staticmethod
+    def parse_http_response(data: bytes) -> dict:
+        """Split HTTP response headers and body. Decompress if needed.
+
+        Returns dict with keys: status_line, headers, body
+        """
+        try:
+            header_end = data.find(b'\r\n\r\n')
+            if header_end == -1:
+                return {'status_line': '', 'headers': {}, 'body': data, 'raw': data}
+
+            header_end += 4
+            headers_raw = data[:header_end]
+            body = data[header_end:]
+
+            lines = headers_raw.split(b'\r\n')
+            status_line = lines[0].decode('utf-8', errors='ignore')
+            headers = {}
+
+            for line in lines[1:]:
+                if b': ' in line:
+                    key, val = line.split(b': ', 1)
+                    headers[key.decode().lower()] = val.decode('utf-8', errors='ignore')
+
+            if headers.get('transfer-encoding', '').lower() == 'chunked':
+                body = HTTPManipulator._decode_chunked(body)
+
+            if headers.get('content-encoding', '').lower() == 'gzip':
+                try:
+                    body = gzip.decompress(body)
+                except:
+                    pass
+
+            return {
+                'status_line': status_line,
+                'headers': headers,
+                'body': body,
+                'raw': data
+            }
+        except Exception as e:
+            add_log('dev', f'HTTP parse error: {e}')
+            return {'status_line': '', 'headers': {}, 'body': data, 'raw': data}
+
+    @staticmethod
+    def rebuild_http_response(parsed: dict, new_body: bytes = None) -> bytes:
+        """Rebuild HTTP response with modified body, recalculating Content-Length.
+
+        Removes Transfer-Encoding and Content-Encoding to simplify for client.
+        """
+        try:
+            body_to_send = new_body if new_body is not None else parsed['body']
+            headers = dict(parsed['headers'])
+
+            headers['content-length'] = str(len(body_to_send))
+            headers.pop('transfer-encoding', None)
+            headers.pop('content-encoding', None)
+
+            status_line = parsed['status_line']
+            if not status_line.endswith('\r\n'):
+                status_line += '\r\n'
+
+            header_lines = []
+            for k, v in headers.items():
+                header_lines.append(f"{k.title()}: {v}")
+
+            header_block = status_line + '\r\n'.join(header_lines) + '\r\n\r\n'
+            return header_block.encode('utf-8', errors='ignore') + body_to_send
+        except Exception as e:
+            add_log('dev', f'HTTP rebuild error: {e}')
+            return parsed.get('raw', body_to_send)
+
+def create_custom_http_reply(status_code: int, headers: dict, body: bytes) -> bytes:
+    """Craft a raw HTTP/1.1 response packet from scratch (spoofing).
+
+    Used to reply with fake responses (302 redirect, fake JSON, etc.)
+    without contacting the real upstream server.
+    """
+    status_map = {
+        200: 'OK', 301: 'Moved Permanently', 302: 'Found',
+        304: 'Not Modified', 400: 'Bad Request', 401: 'Unauthorized',
+        403: 'Forbidden', 404: 'Not Found', 500: 'Internal Server Error'
+    }
+    status_text = status_map.get(status_code, 'OK')
+    response_line = f"HTTP/1.1 {status_code} {status_text}\r\n"
+
+    if 'content-length' not in headers:
+        headers['Content-Length'] = str(len(body))
+    if 'server' not in headers:
+        headers['Server'] = 'GodHand/1.0'
+
+    header_block = ''.join([f"{k}: {v}\r\n" for k, v in headers.items()])
+    return response_line.encode() + header_block.encode() + b'\r\n' + body
+
 class HTTPSInterceptProxy:
     """Pure Python HTTPS interception proxy (transparent MITM).
 
@@ -957,10 +1079,23 @@ class HTTPSInterceptProxy:
                     # Upstream → Client
                     data = upstream_tls.recv(buffer_size)
                     if data:
-                        # Phase 2: Apply injection rules to responses
-                        data = ResponseModifier.apply_rules(hostname, data)
+                        # Parse response for inspection/modification
+                        parsed = HTTPManipulator.parse_http_response(data)
+
+                        # Apply injection rules to modify response content
+                        modified_body = parsed['body']
+                        if 'text/html' in parsed['headers'].get('content-type', '').lower():
+                            # Example: Inject logging script before </body>
+                            injection = ResponseModifier.apply_rules(hostname, parsed['body'])
+                            if injection != parsed['body']:
+                                modified_body = injection
+
+                        # Rebuild response with modified body
+                        if modified_body != parsed['body']:
+                            data = HTTPManipulator.rebuild_http_response(parsed, modified_body)
+
                         client_tls.sendall(data)
-                        # Phase 1: Log HTTP responses (first line contains status code)
+                        # Log HTTP responses (first line contains status code)
                         if data.startswith(b'HTTP/'):
                             self._log_http_response(data, hostname, client_ip)
                 except socket.timeout:
