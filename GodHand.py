@@ -7195,33 +7195,72 @@ def api_stop_network_port_monitor():
     except Exception as e:
         return jsonify({'success': False, 'error': str(e)})
 
+def _terminate_attacks_async(attack_pids_copy, interface_to_reset_val):
+    """Terminate all attack processes asynchronously (runs in daemon thread)."""
+    try:
+        for weapon, pids in attack_pids_copy.items():
+            add_log('dev', f'Terminating {len(pids)} process(es) for weapon {weapon}')
+            try:
+                kill_attack(pids)
+                add_log('dev', f'Weapon {weapon} terminated successfully')
+            except Exception as e:
+                add_log('error', f'Failed to terminate weapon {weapon}: {e}')
+
+        # Reset monitor mode if needed
+        if interface_to_reset_val:
+            try:
+                set_monitor(interface_to_reset_val, False)
+                with STATE_LOCK:
+                    update_state('monitor_mode_active', False)
+                add_log('dev', f'Monitor mode reset on {interface_to_reset_val}')
+            except Exception as e:
+                add_log('warn', f'Failed to reset monitor mode: {e}')
+
+        # Cleanup: clear attack state
+        with STATE_LOCK:
+            STATE['attack_pids'] = {}
+            STATE['attack_status'] = {}
+            if STATE['monitor_log_path']:
+                try:
+                    os.unlink(STATE['monitor_log_path'])
+                except:
+                    pass
+                STATE['monitor_log_path'] = None
+
+        add_log('info', 'All attacks stopped and cleaned up')
+    except Exception as e:
+        add_log('error', f'Fatal error in attack termination thread: {e}')
+
 @app.route('/api/stop_attack', methods=['POST'])
 @require_auth
 def api_stop_attack():
-    interface_to_reset = None
-    with STATE_LOCK:
-        for weapon, pids in list(STATE['attack_pids'].items()):
-            kill_attack(pids)
-        STATE['attack_pids'].clear()
-        STATE['attack_status'] = {}
-        if STATE['monitor_log_path']:
-            try:
-                os.unlink(STATE['monitor_log_path'])
-            except:
-                pass
-            STATE['monitor_log_path'] = None
-        # Only reset monitor mode if a weapon actually put the interface into it
-        # (weapon 2's monitor path). Weapons 3/4/5 and the ARP/native fallbacks never
-        # switch modes, so firing `iw set type managed` on every stop would needlessly
-        # bounce the Wi-Fi association -- exactly the connectivity disruption to avoid.
-        if STATE['interface'] and get_state('monitor_mode_active'):
-            interface_to_reset = STATE['interface']
-    if interface_to_reset:
-        set_monitor(interface_to_reset, False)
+    try:
+        interface_to_reset = None
+
+        # Take a snapshot of current processes to terminate (non-blocking read)
         with STATE_LOCK:
-            update_state('monitor_mode_active', False)
-    add_log('info', 'All attacks stopped')
-    return jsonify({'success': True, 'status': 'All attacks stopped'})
+            attack_pids_copy = {w: list(pids) for w, pids in STATE['attack_pids'].items()}
+            if STATE['interface'] and get_state('monitor_mode_active'):
+                interface_to_reset = STATE['interface']
+
+        # Return immediately if no attacks running
+        if not attack_pids_copy or not any(attack_pids_copy.values()):
+            return jsonify({'success': True, 'status': 'No attacks running'})
+
+        # Spawn daemon thread to terminate processes asynchronously (non-blocking)
+        termination_thread = threading.Thread(
+            target=_terminate_attacks_async,
+            args=(attack_pids_copy, interface_to_reset),
+            daemon=True
+        )
+        termination_thread.start()
+
+        # Return immediately to prevent UI freeze
+        add_log('info', 'Stop attack requested, termination in progress (async)')
+        return jsonify({'success': True, 'status': 'Attack termination in progress'})
+    except Exception as e:
+        add_log('error', f'Error stopping attack: {e}')
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 @app.route('/api/attack_status', methods=['GET'])
 @require_auth
