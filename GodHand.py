@@ -4520,6 +4520,102 @@ tr:hover td { background: rgba(255,255,255,0.02); }
   justify-content: center;
 }
 .chip-action:hover { background: var(--glow-accent); color: var(--accent-primary); }
+
+/* Packet Capture List (Compact Grid-based) */
+#packet-capture-container { margin: 0; padding: 0; }
+.packet-toolbar { margin-bottom: 12px; }
+#packetList {
+  display: flex;
+  flex-direction: column;
+  font-family: 'JetBrains Mono', 'Courier New', monospace;
+  font-size: 13px;
+  line-height: 1.4;
+}
+.packet-row {
+  display: grid;
+  grid-template-columns: 40px 80px 1fr 1fr 50px 50px 1.5fr;
+  gap: 6px;
+  padding: 6px 10px;
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+  align-items: center;
+  cursor: pointer;
+  transition: background 0.1s;
+  min-height: 36px;
+}
+.packet-row:nth-child(even) { background: rgba(255,255,255,0.02); }
+.packet-row:hover { background: rgba(84,180,236,0.12); }
+.packet-row.expanded { background: rgba(84,180,236,0.2); border-bottom: 0; }
+.packet-row .expand-icon {
+  display: inline-block;
+  width: 16px;
+  height: 16px;
+  transform: rotate(0deg);
+  transition: transform 0.2s;
+  text-align: center;
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+.packet-row.expanded .expand-icon { transform: rotate(90deg); }
+.packet-row .time { color: var(--text-secondary); font-size: 12px; }
+.packet-row .addr { color: var(--accent-tertiary); font-size: 12px; }
+.packet-row .proto {
+  display: inline-block;
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #000;
+}
+.packet-row .proto.tcp { background: var(--info); }
+.packet-row .proto.udp { background: var(--success); }
+.packet-row .proto.icmp { background: var(--warning); }
+.packet-row .len { color: var(--text-secondary); text-align: right; font-size: 11px; }
+.packet-row .summary {
+  color: var(--text-primary);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.packet-detail {
+  display: none;
+  grid-column: 1 / -1;
+  padding: 12px;
+  background: rgba(0,0,0,0.3);
+  border-top: 1px solid rgba(255,255,255,0.08);
+  border-bottom: 1px solid rgba(255,255,255,0.08);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 300px;
+  overflow-y: auto;
+  color: var(--text-secondary);
+  line-height: 1.3;
+}
+.packet-row.expanded .packet-detail { display: block; }
+.packet-detail-header { color: var(--accent-primary); font-weight: 600; margin-bottom: 8px; }
+.hexdump {
+  margin-top: 8px;
+  padding: 8px;
+  background: rgba(0,0,0,0.5);
+  border-radius: 4px;
+  border: 1px solid rgba(255,255,255,0.08);
+  color: var(--accent-tertiary);
+  overflow-x: auto;
+}
+@media (max-width: 768px) {
+  .packet-row {
+    grid-template-columns: 30px 70px 1fr 1fr 40px 40px 1fr;
+    font-size: 11px;
+    padding: 4px 8px;
+    min-height: 32px;
+    gap: 4px;
+  }
+  .packet-row .addr { font-size: 11px; }
+  .packet-row .summary { font-size: 11px; }
+  .packet-detail { font-size: 10px; padding: 8px; }
+}
+
 .btn-icon {
   background: none;
   border: none;
@@ -5139,34 +5235,38 @@ GODHAND_DDNS_ENABLED=1                  # optional, default on when the above ar
     </div>
     <div class="card">
       <h2>Live packet feed</h2>
-      <p class="sub">Every IPv4 TCP/UDP/ICMP packet to or from your targets, newest at the bottom -- like a live Wireshark capture scoped to this device.</p>
-      <div style="display:grid; grid-template-columns:1fr 1fr 1fr auto; gap:8px; margin-bottom:12px; align-items:end;">
-        <div>
-          <label style="font-size:0.75rem; display:block; margin-bottom:4px; color:#999;">Protocol</label>
-          <select id="filter-proto" onchange="applyPacketFilters()" style="width:100%; padding:6px; border:1px solid #444; background:#1a1a1a; color:#0f0; border-radius:4px; font-size:0.85rem;">
-            <option value="">All</option>
-            <option value="tcp">TCP only</option>
-            <option value="udp">UDP only</option>
-            <option value="icmp">ICMP only</option>
-          </select>
+      <p class="sub">Every IPv4 TCP/UDP/ICMP packet to or from your targets — compact Wireshark-style view. Click any row to expand details and hexdump.</p>
+      <div id="packet-capture-container">
+        <div class="packet-toolbar">
+          <div style="display:grid; grid-template-columns:1fr 1fr 1fr auto; gap:8px; width:100%; align-items:end;">
+            <div>
+              <label style="font-size:0.75rem; display:block; margin-bottom:4px; color:#999;">Protocol</label>
+              <select id="filter-proto" onchange="applyPacketFilters()" style="width:100%; padding:6px; border:1px solid #444; background:#1a1a1a; color:#0f0; border-radius:4px; font-size:0.85rem;">
+                <option value="">All</option>
+                <option value="tcp">TCP only</option>
+                <option value="udp">UDP only</option>
+                <option value="icmp">ICMP only</option>
+              </select>
+            </div>
+            <div>
+              <label style="font-size:0.75rem; display:block; margin-bottom:4px; color:#999;">IP Filter</label>
+              <input type="text" id="filter-ip" placeholder="Filter by IP" onkeyup="applyPacketFilters()" style="width:100%; padding:6px; border:1px solid #444; background:#1a1a1a; color:#0f0; border-radius:4px; font-size:0.85rem;">
+            </div>
+            <div>
+              <label style="font-size:0.75rem; display:block; margin-bottom:4px; color:#999;">Search</label>
+              <input type="text" id="filter-info" placeholder="Port, SNI, DNS..." onkeyup="applyPacketFilters()" style="width:100%; padding:6px; border:1px solid #444; background:#1a1a1a; color:#0f0; border-radius:4px; font-size:0.85rem;">
+            </div>
+            <div style="display:flex; gap:6px;">
+              <button onclick="clearPacketFilters()" style="padding:6px 12px; background:#444; color:#0f0; border:1px solid #555; border-radius:4px; cursor:pointer; font-size:0.85rem;">Clear</button>
+              <button onclick="exportPacketsCSV()" style="padding:6px 12px; background:#444; color:#0f0; border:1px solid #555; border-radius:4px; cursor:pointer; font-size:0.85rem;">Export</button>
+            </div>
+          </div>
         </div>
-        <div>
-          <label style="font-size:0.75rem; display:block; margin-bottom:4px; color:#999;">Source/Dest IP</label>
-          <input type="text" id="filter-ip" placeholder="Filter by IP" onkeyup="applyPacketFilters()" style="width:100%; padding:6px; border:1px solid #444; background:#1a1a1a; color:#0f0; border-radius:4px; font-size:0.85rem;">
+        <div id="packetList" style="border:1px solid #444; border-radius:4px; max-height:380px; overflow-y:auto; background:#0a0a0a;">
+          <!-- Packets rendered dynamically -->
         </div>
-        <div>
-          <label style="font-size:0.75rem; display:block; margin-bottom:4px; color:#999;">Info search</label>
-          <input type="text" id="filter-info" placeholder="HTTP status, port, TLS SNI..." onkeyup="applyPacketFilters()" style="width:100%; padding:6px; border:1px solid #444; background:#1a1a1a; color:#0f0; border-radius:4px; font-size:0.85rem;">
-        </div>
-        <button onclick="clearPacketFilters()" style="padding:6px 12px; background:#444; color:#0f0; border:1px solid #555; border-radius:4px; cursor:pointer; font-size:0.85rem;">Reset</button>
       </div>
-      <div class="table-responsive" style="max-height:380px; overflow-y:auto;">
-        <table id="traffic-packets-table" style="display:none; font-family:'JetBrains Mono',monospace; font-size:0.78rem;">
-          <thead><tr><th>No.</th><th>Time</th><th>Dir</th><th>Source</th><th>Destination</th><th>Proto</th><th>Length</th><th>Info</th></tr></thead>
-          <tbody id="traffic-packets-body"></tbody>
-        </table>
-      </div>
-      <div class="empty" id="traffic-empty">Not capturing. Select weapon 5 on the Attacks tab and press Start.</div>
+      <div class="empty" id="traffic-empty" style="display:none;">Not capturing. Select weapon 5 on the Attacks tab and press Start.</div>
     </div>
     <div class="card">
       <h2>Reassembled HTTP streams</h2>
@@ -5425,23 +5525,112 @@ function formatPacketRow(e) {
     </tr>
   `;
 }
+
+function formatPacketRowCompact(e, idx) {
+  const time = new Date(e.t * 1000);
+  const hh = String(time.getHours()).padStart(2, '0');
+  const mm = String(time.getMinutes()).padStart(2, '0');
+  const ss = String(time.getSeconds()).padStart(2, '0');
+  const ms = String(time.getMilliseconds()).padStart(3, '0');
+  const timeStr = `${hh}:${mm}:${ss}.${ms}`;
+
+  const dirArrow = e.dir === 'out' ? '↑' : '↓';
+  const protoClass = e.proto.toLowerCase();
+  const summary = formatPacketInfo(e);
+
+  const hexdump = e.raw ? toHexdump(e.raw) : '(no raw data)';
+  const detail = formatPacketDetailView(e, hexdump);
+
+  return `
+    <div class="packet-row" data-packet-idx="${idx}" data-packet-no="${e.no}">
+      <span class="expand-icon">▶</span>
+      <span class="time">${timeStr}</span>
+      <span class="addr">${escapeHtml(e.src)}</span>
+      <span class="addr">${escapeHtml(e.dst)}</span>
+      <span class="proto ${protoClass}">${e.proto.toUpperCase()}</span>
+      <span class="len">${e.len}B</span>
+      <span class="summary">${escapeHtml(summary)}</span>
+      <div class="packet-detail">${detail}</div>
+    </div>
+  `;
+}
+
+function togglePacketDetail(e) {
+  if (e.target.classList.contains('packet-row')) {
+    e.target.classList.toggle('expanded');
+  } else {
+    e.target.closest('.packet-row').classList.toggle('expanded');
+  }
+}
+
+function formatPacketDetailView(e, hexdump) {
+  let html = '<div class="packet-detail-header">Packet #' + e.no + ' Details</div>';
+  html += '<div style="margin-bottom:8px;">';
+  html += 'Source: ' + escapeHtml(e.src) + (e.sp ? ':' + e.sp : '') + '<br>';
+  html += 'Destination: ' + escapeHtml(e.dst) + (e.dp ? ':' + e.dp : '') + '<br>';
+  html += 'Protocol: ' + e.proto.toUpperCase() + '<br>';
+  html += 'Length: ' + e.len + ' bytes<br>';
+  if (e.flags && e.flags.length) html += 'Flags: ' + e.flags.join(', ') + '<br>';
+  if (e.tls_sni) html += 'TLS SNI: ' + escapeHtml(e.tls_sni) + '<br>';
+  if (e.dns_query) html += 'DNS Query: ' + escapeHtml(e.dns_query) + '<br>';
+  if (e.http_info) html += 'HTTP: ' + escapeHtml(e.http_info) + '<br>';
+  html += '</div>';
+  html += '<div class="hexdump">' + hexdump + '</div>';
+  return html;
+}
+
+function toHexdump(raw) {
+  if (!raw) return '(no data)';
+  const bytes = typeof raw === 'string' ? raw : String(raw);
+  let hex = '';
+  for (let i = 0; i < Math.min(bytes.length, 256); i += 16) {
+    const chunk = bytes.substr(i, 16);
+    const hexPart = Array.from(chunk).map((c, j) => {
+      const cc = typeof c === 'string' ? c.charCodeAt(0) : c;
+      return (cc < 16 ? '0' : '') + cc.toString(16);
+    }).join(' ');
+    const asciiPart = chunk.replace(/[^\x20-\x7E]/g, '.');
+    hex += String(i).padStart(4, '0') + ':  ' + hexPart.padEnd(48) + '  ' + asciiPart + '\n';
+  }
+  return hex;
+}
+
+function exportPacketsCSV() {
+  if (TRAFFIC_ALL_ENTRIES.length === 0) {
+    alert('No packets to export');
+    return;
+  }
+
+  let csv = 'No,Time,Dir,Source,Destination,Protocol,Length,Info\n';
+  TRAFFIC_ALL_ENTRIES.forEach(e => {
+    const time = new Date(e.t * 1000).toISOString();
+    const dir = e.dir === 'out' ? 'Out' : 'In';
+    const summary = formatPacketInfo(e).replace(/"/g, '""');
+    csv += `"${e.no}","${time}","${dir}","${e.src}","${e.dst}","${e.proto}","${e.len}","${summary}"\n`;
+  });
+
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'packets-' + new Date().toISOString().split('T')[0] + '.csv';
+  link.click();
+  URL.revokeObjectURL(url);
+}
 var TRAFFIC_ALL_ENTRIES = [];
 async function pollTrafficCapture() {
   try {
     const res = await apiCall('monitor_log');
     TRAFFIC_ALL_ENTRIES = res.entries || [];
-    const table = document.getElementById('traffic-packets-table');
-    const body = document.getElementById('traffic-packets-body');
+    const packetList = document.getElementById('packetList');
     const empty = document.getElementById('traffic-empty');
     if (TRAFFIC_ALL_ENTRIES.length) {
       empty.style.display = 'none';
-      table.style.display = 'table';
       applyPacketFilters();
-      const wrap = table.closest('.table-responsive');
-      if (wrap) wrap.scrollTop = wrap.scrollHeight;
+      packetList.scrollTop = packetList.scrollHeight;
     } else {
-      table.style.display = 'none';
       empty.style.display = 'block';
+      packetList.innerHTML = '';
       empty.textContent = res.capturing
         ? 'Capturing... waiting for matching traffic.'
         : 'Not capturing. Select weapon 5 on the Attacks tab and press Start.';
@@ -5473,8 +5662,18 @@ function applyPacketFilters() {
     return true;
   });
 
-  const body = document.getElementById('traffic-packets-body');
-  body.innerHTML = filtered.map(formatPacketRow).join('') || '<tr><td colspan="8" style="text-align:center; color:#666;">No packets match filters.</td></tr>';
+  const packetList = document.getElementById('packetList');
+  if (filtered.length === 0) {
+    packetList.innerHTML = '<div style="padding:20px; text-align:center; color:#666;">No packets match filters.</div>';
+    return;
+  }
+
+  packetList.innerHTML = filtered.map((e, idx) => formatPacketRowCompact(e, idx)).join('');
+
+  // Attach click handlers for expand/collapse
+  document.querySelectorAll('.packet-row').forEach(row => {
+    row.addEventListener('click', togglePacketDetail);
+  });
 }
 
 function clearPacketFilters() {
