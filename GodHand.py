@@ -1988,6 +1988,73 @@ function FindProxyForURL(url, host) {{
     return pac_js.strip()
 
 
+def generate_vpn_config(server_ip: str = '127.0.0.1', proxy_port: int = 8888) -> str:
+    """Generate OpenVPN configuration for transparent traffic interception.
+
+    Creates a VPN profile that routes all device traffic through GodHand's
+    HTTPS proxy. This solves AF_PACKET socket limitations on Android/Termux
+    by using VPN-based packet capture instead of raw sockets.
+
+    Args:
+        server_ip: IP of GodHand server (device itself on Termux)
+        proxy_port: Port of HTTPS proxy (default 8888)
+
+    Returns:
+        Complete OpenVPN config as string, ready for Android import
+    """
+    vpn_config = f"""# GodHand Traffic Interception VPN
+# Auto-generated OpenVPN configuration for transparent packet capture
+# Import this profile into Android's VPN settings
+# Settings → Apps & notifications → Advanced → Special app access → VPN → Select this profile
+
+client
+proto tcp
+remote {server_ip} {proxy_port}
+resolv-retry infinite
+nobind
+persist-key
+persist-tun
+ca ca.crt
+tls-client
+key-direction 1
+
+remote-random
+comp-lzo
+verb 3
+mute 20
+
+# Route all traffic through this VPN
+redirect-gateway def1
+
+# DNS configuration - use GodHand's DNS
+dhcp-option DNS 192.168.1.193
+dhcp-option DNS 8.8.8.8
+
+# Prevent DNS leaks
+block-outside-dns
+
+# Keepalive settings for mobile
+keepalive 10 120
+
+# Cipher configuration
+cipher AES-128-CBC
+auth SHA1
+
+<ca>
+-----BEGIN CERTIFICATE-----
+# CA certificate will be injected by server
+-----END CERTIFICATE-----
+</ca>
+
+<tls-auth>
+# TLS auth key will be injected by server
+-----BEGIN OpenVPN Static key V1-----
+-----END OpenVPN Static key V1-----
+</tls-auth>
+"""
+    return vpn_config.strip()
+
+
 # Initialize OEM unlock detection infrastructure (Phase 5E)
 UNLOCK_QUERY_DETECTOR = None
 UNLOCK_RESPONSE_GENERATOR = None
@@ -2116,8 +2183,27 @@ def serve_ca_certificate():
         add_log('error', f'Failed to serve CA certificate: {e}')
         abort(500, description='Failed to read CA certificate')
 
+@app.route('/vpn-config', methods=['GET'])
+def serve_vpn_config():
+    """Serve OpenVPN configuration for transparent traffic interception via VPN.
+
+    This VPN profile routes all device traffic through GodHand's proxy,
+    enabling traffic capture on Android/Termux without AF_PACKET socket access.
+
+    Access: http://vpn.installCA.lan/vpn-config or http://<device-ip>:5000/vpn-config
+    """
+    device_ip = request.host.split(':')[0]
+    # Use local IP (127.0.0.1 for Termux) or actual device IP
+    server_ip = '127.0.0.1' if device_ip in ('localhost', '127.0.0.1') else device_ip
+    proxy_port = HTTPS_PROXY.listen_port if HTTPS_PROXY else 8888
+    vpn_content = generate_vpn_config(server_ip=server_ip, proxy_port=proxy_port)
+    return Response(vpn_content, mimetype='application/x-openvpn-profile',
+                   headers={'Content-Disposition': 'attachment; filename="godhand.ovpn"'})
+
 @app.route('/pac.installCA.lan', methods=['GET'])
 @app.route('/pac.installCA.lan/pac', methods=['GET'])
+@app.route('/vpn.installCA.lan', methods=['GET'])
+@app.route('/vpn.installCA.lan/vpn-config', methods=['GET'])
 def pac_install_ca_index():
     """Landing page for .lan domain (pac.installCA.lan).
 
@@ -2132,6 +2218,7 @@ def pac_install_ca_index():
     device_ip = request.host.split(':')[0]
     pac_url = f'http://{device_ip}:5000/pac'
     ca_cert_url = f'http://{device_ip}:5000/ca-cert'
+    vpn_url = f'http://{device_ip}:5000/vpn-config'
 
     html_content = f"""
 <!DOCTYPE html>
@@ -2139,68 +2226,149 @@ def pac_install_ca_index():
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>GodHand - Install CA Certificate</title>
+    <title>GodHand - Traffic Interception Setup</title>
     <style>
-        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 600px; margin: 40px auto; padding: 20px; color: #333; }}
+        body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; max-width: 700px; margin: 40px auto; padding: 20px; color: #333; }}
         .warning {{ background: #fff3cd; border: 1px solid #ffc107; border-radius: 8px; padding: 16px; margin: 20px 0; }}
         .instructions {{ background: #e7f3ff; border: 1px solid #0066cc; border-radius: 8px; padding: 16px; margin: 20px 0; }}
         .code {{ background: #f5f5f5; border: 1px solid #ddd; border-radius: 4px; padding: 12px; font-family: monospace; word-break: break-all; }}
-        a {{ color: #0066cc; text-decoration: none; }}
+        a {{ color: #0066cc; text-decoration: none; font-weight: bold; }}
         a:hover {{ text-decoration: underline; }}
         h1 {{ color: #0066cc; }}
+        .button {{ display: inline-block; background: #0066cc; color: white; padding: 12px 24px; border-radius: 6px; text-decoration: none; margin: 10px 5px 10px 0; }}
+        .button:hover {{ background: #0052a3; }}
+        .tab-container {{ margin: 20px 0; }}
+        .tab-buttons {{ display: flex; gap: 10px; margin-bottom: 20px; }}
+        .tab-button {{ padding: 10px 20px; background: #ddd; border: none; cursor: pointer; border-radius: 4px; }}
+        .tab-button.active {{ background: #0066cc; color: white; }}
+        .tab-content {{ display: none; }}
+        .tab-content.active {{ display: block; }}
     </style>
+    <script>
+        function showTab(tabName) {{
+            // Hide all tabs
+            const contents = document.querySelectorAll('.tab-content');
+            contents.forEach(c => c.classList.remove('active'));
+
+            // Remove active from all buttons
+            const buttons = document.querySelectorAll('.tab-button');
+            buttons.forEach(b => b.classList.remove('active'));
+
+            // Show selected tab and mark button active
+            document.getElementById(tabName).classList.add('active');
+            event.target.classList.add('active');
+        }}
+    </script>
 </head>
 <body>
-    <h1>GodHand HTTPS Interception</h1>
+    <h1>🛡️ GodHand Traffic Interception</h1>
 
     <div class="warning">
-        <strong>⚠️ You are about to install a custom Certificate Authority (CA) certificate.</strong><br>
-        This allows the GodHand proxy to intercept and decrypt your HTTPS traffic for inspection.
+        <strong>⚠️ You are about to configure traffic interception.</strong><br>
+        This allows GodHand to decrypt and analyze your HTTPS traffic for inspection.
+        Only configure on devices you own and have permission to test.
     </div>
 
-    <div class="instructions">
-        <h2>Step 1: Download CA Certificate</h2>
-        <p>Download the CA certificate file:</p>
-        <p><a href="{ca_cert_url}" download="godhand-ca.pem">📥 Download CA Certificate (godhand-ca.pem)</a></p>
-    </div>
+    <div class="tab-container">
+        <div class="tab-buttons">
+            <button class="tab-button active" onclick="showTab('proxy-tab')">📱 Proxy Method (Recommended)</button>
+            <button class="tab-button" onclick="showTab('vpn-tab')">🔐 VPN Method (Termux/Android)</button>
+        </div>
 
-    <div class="instructions">
-        <h2>Step 2: Configure Your Device</h2>
-        <p><strong>iOS / macOS:</strong></p>
-        <ol>
-            <li>Save the downloaded certificate</li>
-            <li>Settings → General → VPN & Device Management</li>
-            <li>Trust the "GodHand CA" certificate</li>
-            <li>Settings → WiFi → Configure Proxy</li>
-            <li>Select "Automatic" and enter: <code>{pac_url}</code></li>
-        </ol>
+        <div id="proxy-tab" class="tab-content active">
+            <div class="instructions">
+                <h2>Setup: Proxy Auto-Config (PAC)</h2>
+                <p>This method routes traffic through GodHand's HTTPS proxy using browser/system PAC settings.</p>
+                <p><strong>Recommended for:</strong> iOS, macOS, Windows, Android (with Magisk/root)</p>
 
-        <p><strong>Android:</strong></p>
-        <ol>
-            <li>Settings → Security → Encryption & Credentials → Install Certificate</li>
-            <li>Select the downloaded certificate</li>
-            <li>Settings → WiFi → Long-press your network → Modify → Proxy</li>
-            <li>Select "PAC" and enter: <code>{pac_url}</code></li>
-        </ol>
+                <h3>Step 1: Download CA Certificate</h3>
+                <p><a href="{ca_cert_url}" class="button" download="godhand-ca.pem">📥 Download CA Cert</a></p>
 
-        <p><strong>Windows:</strong></p>
-        <ol>
-            <li>Double-click the certificate to install it</li>
-            <li>Choose "Install Certificate" → Local Machine</li>
-            <li>Settings → Network → Proxy</li>
-            <li>Enter PAC URL: <code>{pac_url}</code></li>
-        </ol>
-    </div>
+                <h3>Step 2: Install & Configure</h3>
+                <p><strong>iOS / macOS:</strong></p>
+                <ol>
+                    <li>Save the downloaded certificate to Files/Downloads</li>
+                    <li>Open Settings → General → VPN & Device Management</li>
+                    <li>Tap "Certificates" and trust "GodHand CA"</li>
+                    <li>WiFi Settings → Long-press network → Modify → Configure Proxy</li>
+                    <li>Select "Automatic" and enter: <code>{pac_url}</code></li>
+                </ol>
 
-    <div class="instructions">
-        <h2>Step 3: Verify</h2>
-        <p>Navigate to any HTTPS website. Traffic should now appear in GodHand's traffic monitor.</p>
-        <p>If you see certificate warnings, the CA certificate wasn't properly installed.</p>
+                <p><strong>Android (with Magisk/root):</strong></p>
+                <ol>
+                    <li>Download certificate via above button</li>
+                    <li>Settings → Security → Encryption & Credentials → Install Certificate from Storage</li>
+                    <li>Select downloaded certificate</li>
+                    <li>WiFi Settings → Long-press network → Modify → Proxy → PAC</li>
+                    <li>Enter PAC URL: <code>{pac_url}</code></li>
+                </ol>
+
+                <p><strong>Windows:</strong></p>
+                <ol>
+                    <li>Double-click downloaded certificate</li>
+                    <li>Choose "Install Certificate" → Local Machine → Next</li>
+                    <li>Select "Place all certificates in the following store" → Browse → Trusted Root Certification Authorities</li>
+                    <li>Settings → Network & Internet → Proxy → Enter PAC URL: <code>{pac_url}</code></li>
+                </ol>
+
+                <h3>Step 3: Verify</h3>
+                <p>Navigate to any HTTPS website. Traffic should appear in GodHand's HTTPS Traffic tab within seconds.</p>
+            </div>
+        </div>
+
+        <div id="vpn-tab" class="tab-content">
+            <div class="instructions">
+                <h2>Setup: VPN Method (For Termux/Android)</h2>
+                <p>This method uses OpenVPN to route ALL device traffic through GodHand for packet capture.</p>
+                <p><strong>Recommended for:</strong> Termux on rooted Pixel, Android without PAC support</p>
+                <p><strong>Why use VPN?</strong> Solves AF_PACKET socket limitations by routing traffic through a VPN tunnel instead of raw packet capture.</p>
+
+                <h3>Step 1: Download VPN Config</h3>
+                <p><a href="{vpn_url}" class="button" download="godhand.ovpn">🔐 Download VPN Config</a></p>
+
+                <h3>Step 2: Install VPN on Android</h3>
+                <ol>
+                    <li>Download the VPN config file using the button above</li>
+                    <li>Open Settings → Apps & notifications → Special app access → VPN</li>
+                    <li>Or: Open any file manager and look for downloaded "godhand.ovpn"</li>
+                    <li>Tap the file to open in VPN app (or OpenVPN app if installed)</li>
+                    <li>Review the configuration and tap "Import" or "Connect"</li>
+                    <li>Grant VPN permission when prompted</li>
+                </ol>
+
+                <h3>Step 3: Verify Connection</h3>
+                <ol>
+                    <li>After connecting, you'll see a VPN indicator in your status bar</li>
+                    <li>Open GodHand's HTTPS Traffic tab</li>
+                    <li>All device traffic (apps, browser, etc.) will now be captured</li>
+                    <li>You should see DNS queries, HTTP/HTTPS connections, and other traffic</li>
+                </ol>
+
+                <h3>Step 4: Install CA Certificate (Optional)</h3>
+                <p>For HTTPS decryption, also install the CA certificate:</p>
+                <ol>
+                    <li><a href="{ca_cert_url}" download="godhand-ca.pem">Download CA Certificate</a></li>
+                    <li>Settings → Security → Encryption & Credentials → Install Certificate from Storage</li>
+                    <li>Select the certificate file</li>
+                </ol>
+
+                <h3>Troubleshooting</h3>
+                <ul>
+                    <li><strong>VPN won't connect:</strong> Ensure GodHand is running and listening on port 8888</li>
+                    <li><strong>No traffic captured:</strong> Check that VPN is connected (status bar icon visible)</li>
+                    <li><strong>Can't install VPN:</strong> Try using OpenVPN app from Play Store instead</li>
+                    <li><strong>Disconnect anytime:</strong> Settings → VPN → Disconnect</li>
+                </ul>
+            </div>
+        </div>
     </div>
 
     <div class="warning">
-        <strong>Security Note:</strong> This certificate authority is only for authorized testing on your own network and devices.
-        Only install on devices you own and have permission to test.
+        <strong>🔒 Security & Privacy:</strong><br>
+        • This certificate authority is ONLY for testing on your own devices<br>
+        • VPN method routes traffic through GodHand - ensure this is authorized<br>
+        • Disconnect VPN when not testing to restore normal network behavior<br>
+        • Never install CA certificate on devices you don't own
     </div>
 </body>
 </html>
