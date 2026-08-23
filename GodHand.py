@@ -5269,6 +5269,14 @@ def start_attack_monitor(targets, port, iface):
         add_log('warn', 'Monitor mode could not be enabled; capture may be incomplete')
     with STATE_LOCK:
         STATE['monitor_entries'] = []
+
+    # Check if we can actually use AF_PACKET sockets (Android/Termux may block this)
+    try:
+        test_sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+        test_sock.close()
+    except (OSError, AttributeError) as e:
+        add_log('warn', f'AF_PACKET socket unavailable ({e}), traffic capture may fail or show no data')
+
     # Use a writable temp directory
     tmpdir = tempfile.gettempdir()
     log_path = os.path.join(tmpdir, f"godhand_monitor_{int(time.time())}.log")
@@ -9477,6 +9485,57 @@ def api_monitor_log():
     entries = STATE.get('monitor_entries', [])
     return jsonify({'entries': entries[-150:], 'capturing': 5 in STATE['attack_pids']})
 
+@app.route('/api/traffic_diagnostics', methods=['GET'])
+@require_auth
+def api_traffic_diagnostics():
+    """Diagnose why traffic capture may not be working."""
+    diags = {
+        'capturing': 5 in STATE['attack_pids'],
+        'entries_count': len(STATE.get('monitor_entries', [])),
+        'af_packet_available': False,
+        'monitor_mode_capable': False,
+        'issues': []
+    }
+
+    # Test AF_PACKET socket availability
+    try:
+        test_sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+        test_sock.close()
+        diags['af_packet_available'] = True
+    except (OSError, AttributeError) as e:
+        diags['issues'].append(f'AF_PACKET socket not available: {e}')
+
+    # Check if interface supports monitor mode
+    iface = get_state('interface')
+    if iface:
+        diags['interface'] = iface
+        try:
+            result = subprocess.run(['ip', 'link', 'show', iface], capture_output=True, timeout=2)
+            if result.returncode == 0:
+                diags['interface_exists'] = True
+            else:
+                diags['issues'].append(f'Interface {iface} not found')
+        except Exception as e:
+            diags['issues'].append(f'Cannot check interface: {e}')
+
+    # Check if network is accessible
+    try:
+        test_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        test_sock.connect(('1.1.1.1', 53))
+        test_sock.close()
+        diags['network_accessible'] = True
+    except:
+        diags['issues'].append('Network may be down or unavailable')
+
+    if not diags['capturing']:
+        diags['issues'].append('Traffic capture not running; start weapon 5 (Traffic Capture) on Attacks tab')
+
+    if not diags['entries_count']:
+        if diags['capturing']:
+            diags['issues'].append('Capture running but no traffic received yet')
+
+    return jsonify({'success': True, 'diagnostics': diags})
+
 @app.route('/api/traffic_stats', methods=['GET'])
 @require_auth
 def api_traffic_stats():
@@ -10056,6 +10115,54 @@ def api_gateway_proxy_start():
 def api_gateway_proxy_stop():
     stop_gateway_proxy()
     return jsonify({'success': True, 'status': 'Proxy stopped'})
+
+@app.route('/api/gateway/start_all', methods=['POST'])
+@require_auth
+def api_gateway_start_all():
+    """Start all gateway services (DNS + Proxy) with unified configuration."""
+    try:
+        add_log('info', 'Starting unified gateway services (DNS + Proxy)...')
+        start_gateway_dns()
+        time.sleep(0.5)
+        start_gateway_proxy()
+        time.sleep(0.5)
+
+        local_ip = get_local_ip()
+        dns_status = gateway_dns_status()
+        proxy_status = gateway_proxy_status()
+
+        status_msg = f"Gateway services started. "
+        status_msg += f"Access proxy at {local_ip}:{GW_PROXY_PORT}, "
+        status_msg += f"DNS at {local_ip}:{dns_status.get('port', 53)}"
+
+        add_log('success', status_msg)
+        return jsonify({
+            'success': True,
+            'message': status_msg,
+            'gateway_ip': local_ip,
+            'proxy_port': GW_PROXY_PORT,
+            'dns_port': dns_status.get('port', 53),
+            'dns': dns_status,
+            'proxy': proxy_status
+        })
+    except Exception as e:
+        add_log('error', f'Gateway start failed: {e}')
+        return jsonify({'success': False, 'error': str(e)}), 500
+
+@app.route('/api/gateway/stop_all', methods=['POST'])
+@require_auth
+def api_gateway_stop_all():
+    """Stop all gateway services (DNS + Proxy)."""
+    try:
+        add_log('info', 'Stopping gateway services...')
+        stop_gateway_proxy()
+        time.sleep(0.3)
+        stop_gateway_dns()
+        add_log('success', 'All gateway services stopped')
+        return jsonify({'success': True, 'message': 'All gateway services stopped'})
+    except Exception as e:
+        add_log('error', f'Gateway stop failed: {e}')
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 def ddns_config_masked():
     with STATE_LOCK:
