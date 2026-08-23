@@ -2902,6 +2902,16 @@ def verify_capabilities_on_startup():
     else:
         add_log('warn', 'Port forwarding not available; ip command or routing tables may be missing')
 
+    # Verify Android runtime integration
+    if ANDROID_RUNTIME.detect_platform():
+        add_log('success', f'Android/Termux platform detected (Phase 10) - {ANDROID_RUNTIME.get_status()["selinux"]["context"] or "unknown context"}')
+        selinux_status = ANDROID_RUNTIME.check_selinux_constraints()
+        if selinux_status.get('issues'):
+            for issue in selinux_status['issues']:
+                add_log('warn', f'Android: {issue}')
+    else:
+        add_log('info', 'Not running on Android/Termux; Phase 10 features not active')
+
 # ---------- Process group management (Phase 6: Subprocess Isolation) ----------
 class ProcessGroup:
     """Manages subprocess lifecycle with resource limits, automatic cleanup, and graceful restart."""
@@ -3691,6 +3701,169 @@ class PortForwardingManager:
 
 # Global port forwarding manager instance
 PORT_FORWARDING_MANAGER = PortForwardingManager()
+
+# ---------- Android Runtime Integration (Phase 10) ----------
+class AndroidRuntime:
+    """Manages Android/Termux-specific runtime constraints and subprocess isolation.
+
+    Handles SELinux contexts, capability management, signal handling, and
+    ProcessGroup lifecycle within Termux confined environment.
+    """
+
+    def __init__(self):
+        self.is_termux = os.environ.get('PREFIX') and 'termux' in os.environ.get('PREFIX', '').lower()
+        self.selinux_context = None
+        self.process_groups = {}  # Track ProcessGroup instances
+        self.confined = self.is_termux
+        self.lock = threading.RLock()
+
+    def detect_platform(self):
+        """Detect if running on Android/Termux."""
+        platform_signals = [
+            os.path.exists('/data/data/com.termux'),
+            os.path.exists('/system/build.prop'),
+            'TERMUX_VERSION' in os.environ,
+            os.environ.get('PREFIX', '').endswith('com.termux'),
+        ]
+        return any(platform_signals)
+
+    def get_selinux_context(self):
+        """Get current SELinux context."""
+        try:
+            result = subprocess.run(
+                ['id', '-Z'],
+                capture_output=True, timeout=2, text=True
+            )
+            if result.returncode == 0:
+                context = result.stdout.strip()
+                self.selinux_context = context
+                return context
+        except Exception:
+            pass
+        return None
+
+    def check_selinux_constraints(self):
+        """Identify SELinux constraints affecting packet capture."""
+        constraints = {
+            'selinux_enabled': False,
+            'context': self.get_selinux_context(),
+            'issues': []
+        }
+
+        # Check if SELinux is enforcing
+        try:
+            result = subprocess.run(
+                ['getenforce'],
+                capture_output=True, timeout=2, text=True
+            )
+            if result.returncode == 0:
+                mode = result.stdout.strip()
+                constraints['selinux_enabled'] = mode in ('Enforcing', 'Permissive')
+                if mode == 'Enforcing':
+                    constraints['issues'].append('SELinux in Enforcing mode may block raw sockets')
+        except Exception:
+            pass
+
+        # Check for specific denials that block packet capture
+        try:
+            result = subprocess.run(
+                ['dmesg'],
+                capture_output=True, timeout=2, text=True
+            )
+            if 'avc: denied' in result.stdout.lower():
+                constraints['issues'].append('SELinux denials detected in dmesg')
+        except Exception:
+            pass
+
+        return constraints
+
+    def handle_subprocess_signal(self, signum, frame):
+        """Handle signals in subprocesses (SIGTERM, SIGINT, etc.)."""
+        add_log('dev', f'Subprocess received signal {signum}')
+        # Propagate to child processes in all groups
+        with self.lock:
+            for group_name, group in self.process_groups.items():
+                if hasattr(group, 'terminate_all'):
+                    try:
+                        group.terminate_all()
+                    except Exception as e:
+                        add_log('warn', f'Error terminating {group_name}: {e}')
+
+    def setup_subprocess_environment(self):
+        """Setup environment for subprocesses in confined mode."""
+        env = os.environ.copy()
+
+        # Android/Termux specific: ensure standard paths exist
+        if self.is_termux:
+            prefixes = [
+                os.environ.get('PREFIX'),
+                '/data/data/com.termux/files/usr',
+                '/storage/emulated/0'
+            ]
+            for prefix in prefixes:
+                if prefix and os.path.exists(prefix):
+                    if 'PATH' not in env:
+                        env['PATH'] = prefix + '/bin'
+                    elif prefix + '/bin' not in env['PATH']:
+                        env['PATH'] = prefix + '/bin:' + env['PATH']
+
+            # Set HOME for tools that expect it
+            if 'HOME' not in env and os.environ.get('PREFIX'):
+                home_candidate = os.path.join(os.environ.get('PREFIX'), 'home')
+                if os.path.exists(home_candidate):
+                    env['HOME'] = home_candidate
+
+        return env
+
+    def register_process_group(self, name, group):
+        """Register a ProcessGroup for lifecycle management."""
+        with self.lock:
+            self.process_groups[name] = group
+        add_log('dev', f'Registered ProcessGroup: {name}')
+
+    def unregister_process_group(self, name):
+        """Unregister a ProcessGroup."""
+        with self.lock:
+            if name in self.process_groups:
+                del self.process_groups[name]
+        add_log('dev', f'Unregistered ProcessGroup: {name}')
+
+    def cleanup_all_processes(self):
+        """Cleanup all registered ProcessGroups."""
+        try:
+            with self.lock:
+                groups_to_cleanup = list(self.process_groups.items())
+
+            for group_name, group in groups_to_cleanup:
+                try:
+                    if hasattr(group, 'terminate_all'):
+                        group.terminate_all()
+                    self.unregister_process_group(group_name)
+                except Exception as e:
+                    add_log('warn', f'Error cleaning up {group_name}: {e}')
+
+            add_log('success', 'All ProcessGroups cleaned up')
+            return True
+        except Exception as e:
+            add_log('error', f'Cleanup failed: {e}')
+            return False
+
+    def get_status(self):
+        """Get Android runtime status."""
+        with self.lock:
+            status = {
+                'is_termux': self.is_termux,
+                'platform_detected': self.detect_platform(),
+                'confined': self.confined,
+                'selinux': self.check_selinux_constraints(),
+                'process_groups': len(self.process_groups),
+                'process_group_names': list(self.process_groups.keys())
+            }
+
+        return status
+
+# Global Android runtime instance
+ANDROID_RUNTIME = AndroidRuntime()
 
 # ---------- Python DNS forwarder (Unbound fallback) ----------
 class PythonDNSForwarder:
@@ -10012,6 +10185,57 @@ def api_portforward_cleanup():
         return jsonify({'success': True, 'message': 'All port forwarding rules cleaned up'})
     else:
         return jsonify({'success': False, 'error': 'Cleanup partially failed'}), 500
+
+# ---------- Phase 10: Android Runtime API Endpoints ----------
+@app.route('/api/android/status', methods=['GET'])
+@require_auth
+def api_android_status():
+    """Get Android runtime status and constraints."""
+    return jsonify({'success': True, 'android': ANDROID_RUNTIME.get_status()})
+
+@app.route('/api/android/selinux', methods=['GET'])
+@require_auth
+def api_android_selinux():
+    """Get detailed SELinux constraints and issues."""
+    constraints = ANDROID_RUNTIME.check_selinux_constraints()
+    return jsonify({'success': True, 'selinux': constraints})
+
+@app.route('/api/android/processes', methods=['GET'])
+@require_auth
+def api_android_processes():
+    """List all registered ProcessGroups and their status."""
+    with ANDROID_RUNTIME.lock:
+        groups = {}
+        for name, group in ANDROID_RUNTIME.process_groups.items():
+            status = 'unknown'
+            if hasattr(group, 'get_status'):
+                status = group.get_status()
+            groups[name] = {
+                'name': name,
+                'status': status,
+                'has_terminate': hasattr(group, 'terminate_all')
+            }
+
+    return jsonify({'success': True, 'process_groups': groups, 'count': len(groups)})
+
+@app.route('/api/android/cleanup', methods=['POST'])
+@require_auth
+def api_android_cleanup():
+    """Clean up all ProcessGroups and terminate subprocesses."""
+    if ANDROID_RUNTIME.cleanup_all_processes():
+        return jsonify({'success': True, 'message': 'All ProcessGroups cleaned up'})
+    else:
+        return jsonify({'success': False, 'error': 'Cleanup partially failed'}), 500
+
+@app.route('/api/android/subprocess_env', methods=['GET'])
+@require_auth
+def api_android_subprocess_env():
+    """Get subprocess environment configuration for Android."""
+    env = ANDROID_RUNTIME.setup_subprocess_environment()
+    # Only return safe environment variables (not secrets/paths)
+    safe_vars = ['PATH', 'HOME', 'PREFIX', 'TERMUX_VERSION', 'LANG']
+    safe_env = {k: v for k, v in env.items() if k in safe_vars}
+    return jsonify({'success': True, 'environment': safe_env, 'is_termux': ANDROID_RUNTIME.is_termux})
 
 @app.route('/api/https_injection/rules', methods=['GET'])
 @require_auth
