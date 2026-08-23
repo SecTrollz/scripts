@@ -5672,38 +5672,15 @@ def start_attack_monitor(targets, port, iface):
     with open(path, 'w') as f:
         f.write(script)
     try:
-        log_file = open(log_path, 'w')
+        log_file = open(log_path, 'w', buffering=1)  # Line-buffered output
     except Exception as e:
         raise RuntimeError(f'Cannot open log file {log_path}: {e}')
-    # Capture stderr to file to check for startup errors (avoids PIPE deadlock)
-    stderr_path = log_path + '.err'
-    try:
-        stderr_file = open(stderr_path, 'w')
-    except Exception as e:
-        raise RuntimeError(f'Cannot open stderr log {stderr_path}: {e}')
-
-    proc = subprocess.Popen(['python3', path], stdout=log_file, stderr=stderr_file)
+    # Use DEVNULL for stderr - safest approach to avoid any file handle issues
+    # Traffic capture script writes JSON to stdout, errors go to /dev/null
+    proc = subprocess.Popen(['python3', path], stdout=log_file, stderr=subprocess.DEVNULL, preexec_fn=os.setsid)
     time.sleep(0.5)
     if proc.poll() is not None:
-        # Process exited - check stderr for error details
-        try:
-            stderr_file.flush()
-            stderr_file.close()
-            with open(stderr_path, 'r') as f:
-                err_msg = f.read()[:500]
-            if err_msg:
-                add_log('error', f'Traffic capture failed: {err_msg}')
-                raise RuntimeError(f'Monitor script failed: {err_msg}')
-            else:
-                raise RuntimeError('Monitor script exited immediately with no error message')
-        except:
-            raise RuntimeError('Monitor script exited immediately')
-    # Close stderr file since process is running - it will handle its own stderr now
-    try:
-        stderr_file.close()
-        os.unlink(stderr_path)
-    except:
-        pass
+        raise RuntimeError('Monitor script exited immediately')
     update_state('monitor_log_path', log_path)
     threading.Thread(target=lambda: (proc.wait(), log_file.close(), os.unlink(path)), daemon=True).start()
     def update_monitor_log():
