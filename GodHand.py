@@ -4211,12 +4211,13 @@ def start_gateway_dns():
                                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             try:
                 _, err_bytes = dnscrypt_proc.communicate(timeout=2)
+                # Process exited immediately (bad - initialization error)
                 err = err_bytes.decode(errors='ignore')[-400:] if err_bytes else ''
                 add_log('warning', f'dnscrypt-proxy failed to start: {err}, falling back to unbound only')
                 dnscrypt_proc = None
             except subprocess.TimeoutExpired:
-                dnscrypt_proc.kill()
-                dnscrypt_proc.wait(timeout=1)
+                # Process still running after timeout (good - initialization succeeded)
+                pass
         except Exception as e:
             add_log('warning', f'Failed to start dnscrypt-proxy: {e}, falling back to unbound only')
             dnscrypt_proc = None
@@ -4225,13 +4226,14 @@ def start_gateway_dns():
                                      stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     try:
         _, err_bytes = unbound_proc.communicate(timeout=2)
+        # Process exited immediately (bad - initialization error)
         err = err_bytes.decode(errors='ignore')[-400:] if err_bytes else ''
         if dnscrypt_proc:
             stop_proc('dnscrypt-proxy')
         raise RuntimeError(f'unbound failed to start: {err}')
     except subprocess.TimeoutExpired:
-        unbound_proc.kill()
-        unbound_proc.wait(timeout=1)
+        # Process still running after timeout (good - initialization succeeded)
+        pass
 
     if dnscrypt_proc:
         add_log('success', 'Gateway DNS stack started (Unbound + DNSCrypt-proxy)')
@@ -4301,11 +4303,12 @@ def start_gateway_proxy():
                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     try:
         _, err_bytes = proc.communicate(timeout=2)
+        # Process exited immediately (bad - initialization error)
         err = err_bytes.decode(errors='ignore')[-400:] if err_bytes else ''
         raise RuntimeError(f'tinyproxy failed to start: {err}')
     except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=1)
+        # Process still running after timeout (good - initialization succeeded)
+        pass
     add_log('success', f'Gateway proxy started on port {GW_PROXY_PORT}')
 
 def stop_gateway_proxy():
@@ -4444,11 +4447,12 @@ def start_ngrok_tunnel(port, authtoken=None):
                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     try:
         _, err_bytes = proc.communicate(timeout=3)
+        # Process exited immediately (bad - initialization error)
         err = err_bytes.decode(errors='ignore')[-400:] if err_bytes else ''
         raise RuntimeError(f'ngrok failed to start: {err}')
     except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait(timeout=1)
+        # Process still running after timeout (good - initialization succeeded)
+        pass
     return proc
 
 def get_ngrok_public_url():
@@ -4849,28 +4853,30 @@ def start_attack_arp_freeze(targets, gateway, iface):
             proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             try:
                 _, err_bytes = proc.communicate(timeout=0.5)
+                # Process exited immediately (bad - initialization error)
                 stderr = err_bytes.decode(errors='ignore').strip() if err_bytes else ''
                 error_msg = f'arpspoof failed for target {t}'
                 if stderr:
                     error_msg += f': {stderr}'
                 raise RuntimeError(error_msg)
             except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=1)
+                # Process still running after timeout (good - initialization succeeded)
+                pass
             pids.append(proc)
         for t in targets:
             cmd = ['arpspoof', '-i', iface, '-t', gateway, t]
             proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             try:
                 _, err_bytes = proc.communicate(timeout=0.5)
+                # Process exited immediately (bad - initialization error)
                 stderr = err_bytes.decode(errors='ignore').strip() if err_bytes else ''
                 error_msg = f'arpspoof failed for gateway {gateway}'
                 if stderr:
                     error_msg += f': {stderr}'
                 raise RuntimeError(error_msg)
             except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait(timeout=1)
+                # Process still running after timeout (good - initialization succeeded)
+                pass
             pids.append(proc)
         return pids
     else:
@@ -4936,11 +4942,12 @@ def start_attack_arp_freeze(targets, gateway, iface):
         proc = subprocess.Popen(['python3', path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             _, err_bytes = proc.communicate(timeout=0.5)
+            # Process exited immediately (bad - initialization error)
             stderr = err_bytes.decode(errors='ignore') if err_bytes else ''
             raise RuntimeError(f'ARP fallback script exited immediately: {stderr}')
         except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait(timeout=1)
+            # Process still running after timeout (good - initialization succeeded)
+            pass
         # Monitor stderr from the ARP script in background
         def monitor_arp_fallback(proc_ref, path_ref):
             try:
