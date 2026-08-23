@@ -5708,16 +5708,41 @@ def assess_attack_risk(weapon_id, targets, gateway, iface):
         )
     return ' '.join(notes) if notes else None
 
-def kill_attack(pids):
+def kill_attack(pids, timeout_per_process=1.0, max_total_timeout=10.0):
+    """Kill attack processes with aggressive timeout handling.
+
+    Args:
+        pids: List of Popen objects to terminate
+        timeout_per_process: Max seconds to wait for graceful termination per process
+        max_total_timeout: Max total seconds for entire kill operation
+    """
+    import time
+    start_time = time.time()
+
     for proc in pids:
+        # Check if we've exceeded total timeout
+        elapsed = time.time() - start_time
+        if elapsed >= max_total_timeout:
+            add_log('warn', f'Process termination timeout exceeded ({elapsed:.1f}s), forcing kill')
+            break
+
         try:
-            proc.terminate()
-            proc.wait(timeout=2)
-        except:
-            try:
-                proc.kill()
-            except:
-                pass
+            # Try graceful termination first
+            if proc.poll() is None:  # Process still running
+                proc.terminate()
+                try:
+                    # Wait with reduced timeout
+                    remaining = max(0.1, max_total_timeout - elapsed)
+                    proc.wait(timeout=min(timeout_per_process, remaining))
+                except subprocess.TimeoutExpired:
+                    # Graceful termination timed out, use SIGKILL
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=0.5)
+                    except:
+                        pass  # Give up on this process
+        except Exception as e:
+            add_log('dev', f'Error terminating process: {e}')
 
 # ---------- kick & block with verification ----------
 def arp_kick_burst(ip, gateway, iface, duration=6):
@@ -8534,11 +8559,40 @@ async function launchAttack(confirmRisk) {
     showToast('Failed: ' + res.error, 'error');
   }
 }
+let stopInProgress = false;
 async function confirmStopAttack() {
+  if (stopInProgress) {
+    showToast('Attack stop already in progress...', 'info');
+    return;
+  }
   openModal('Stop Attack', 'Stop all running attacks?', async () => {
-    const res = await apiCall('stop_attack', 'POST');
-    showToast(res.status, res.success ? 'success' : 'error');
-    pollAttackStatus();
+    try {
+      stopInProgress = true;
+      document.getElementById('stop-btn').disabled = true;
+      showToast('Stopping attacks...', 'info');
+
+      const res = await apiCall('stop_attack', 'POST');
+      if (res.success) {
+        showToast('Termination in progress (will complete in background)', 'success');
+        // Poll more frequently while stopping
+        for (let i = 0; i < 30; i++) {
+          await new Promise(r => setTimeout(r, 200));
+          await pollAttackStatus();
+          const status = await apiCall('attack_status');
+          if (!Object.values(status.attacks).some(v => v)) {
+            showToast('All attacks stopped', 'success');
+            break;
+          }
+        }
+      } else {
+        showToast(res.error || 'Failed to stop attacks', 'error');
+      }
+    } catch (e) {
+      showToast('Error: ' + e.message, 'error');
+    } finally {
+      stopInProgress = false;
+      pollAttackStatus();
+    }
   });
 }
 
@@ -9575,26 +9629,40 @@ def api_stop_network_port_monitor():
 
 def _terminate_attacks_async(attack_pids_copy, interface_to_reset_val):
     """Terminate all attack processes asynchronously (runs in daemon thread)."""
+    import time
+    max_thread_time = 15.0  # Hard limit for entire operation
+    start_time = time.time()
+
     try:
+        # Terminate all processes with per-process and total timeouts
         for weapon, pids in attack_pids_copy.items():
+            elapsed = time.time() - start_time
+            if elapsed >= max_thread_time:
+                add_log('warn', f'Async termination timeout, skipping weapon {weapon}')
+                break
+
             add_log('dev', f'Terminating {len(pids)} process(es) for weapon {weapon}')
             try:
-                kill_attack(pids)
+                # Use aggressive timeouts: 1s per process, 12s total
+                remaining_timeout = max_thread_time - elapsed
+                kill_attack(pids, timeout_per_process=1.0, max_total_timeout=remaining_timeout)
                 add_log('dev', f'Weapon {weapon} terminated successfully')
             except Exception as e:
                 add_log('error', f'Failed to terminate weapon {weapon}: {e}')
 
-        # Reset monitor mode if needed
+        # Reset monitor mode if needed (quick operation, shouldn't timeout)
         if interface_to_reset_val:
             try:
-                set_monitor(interface_to_reset_val, False)
-                with STATE_LOCK:
-                    update_state('monitor_mode_active', False)
-                add_log('dev', f'Monitor mode reset on {interface_to_reset_val}')
+                elapsed = time.time() - start_time
+                if elapsed < max_thread_time - 1:
+                    set_monitor(interface_to_reset_val, False)
+                    with STATE_LOCK:
+                        update_state('monitor_mode_active', False)
+                    add_log('dev', f'Monitor mode reset on {interface_to_reset_val}')
             except Exception as e:
                 add_log('warn', f'Failed to reset monitor mode: {e}')
 
-        # Cleanup: clear attack state
+        # Cleanup: clear attack state (atomic under lock)
         with STATE_LOCK:
             STATE['attack_pids'] = {}
             STATE['attack_status'] = {}
@@ -9605,9 +9673,14 @@ def _terminate_attacks_async(attack_pids_copy, interface_to_reset_val):
                     pass
                 STATE['monitor_log_path'] = None
 
-        add_log('info', 'All attacks stopped and cleaned up')
+        elapsed = time.time() - start_time
+        add_log('info', f'All attacks stopped and cleaned up (took {elapsed:.1f}s)')
     except Exception as e:
         add_log('error', f'Fatal error in attack termination thread: {e}')
+        # Ensure state is cleared even on error
+        with STATE_LOCK:
+            STATE['attack_pids'] = {}
+            STATE['attack_status'] = {}
 
 @app.route('/api/stop_attack', methods=['POST'])
 @require_auth
