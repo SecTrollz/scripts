@@ -5675,7 +5675,8 @@ def start_attack_monitor(targets, port, iface):
         log_file = open(log_path, 'w')
     except Exception as e:
         raise RuntimeError(f'Cannot open log file {log_path}: {e}')
-    proc = subprocess.Popen(['python3', path], stdout=log_file, stderr=subprocess.PIPE)
+    # Use DEVNULL for stderr to avoid deadlock if script writes >64KB to stderr
+    proc = subprocess.Popen(['python3', path], stdout=log_file, stderr=subprocess.DEVNULL)
     time.sleep(0.5)
     if proc.poll() is not None:
         raise RuntimeError('Monitor script exited immediately')
