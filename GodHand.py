@@ -1571,7 +1571,24 @@ class HTTPSInterceptProxy:
         try:
             server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server_socket.bind(('0.0.0.0', self.listen_port))
+
+            # Try to bind to configured port, or fallback to alternate ports if busy
+            ports_to_try = [self.listen_port, 8889, 8890, 8891, 8892]
+            bound = False
+            for port in ports_to_try:
+                try:
+                    server_socket.bind(('0.0.0.0', port))
+                    self.listen_port = port  # Update actual port
+                    bound = True
+                    break
+                except OSError as e:
+                    if port == ports_to_try[-1]:
+                        raise  # All ports failed, raise error
+                    continue  # Try next port
+
+            if not bound:
+                raise OSError(f'Could not bind to any port from {ports_to_try}')
+
             server_socket.listen(10)
             add_log('info', f'MITM proxy listening on port {self.listen_port}')
 
@@ -2056,12 +2073,14 @@ def serve_pac_file():
     """Serve PAC (Proxy Auto-Config) file for browser/device proxy settings.
 
     Browsers will fetch this file and use it to determine which traffic
-    routes through the MITM proxy (port 8888).
+    routes through the MITM proxy.
 
     Access: http://pac.installCA.lan/pac or http://<device-ip>:5000/pac
     """
     device_ip = request.host.split(':')[0]
-    pac_content = generate_pac_file(proxy_host=device_ip, proxy_port=8888)
+    # Use actual port that HTTPS proxy is listening on (may not be 8888 if port conflict)
+    proxy_port = HTTPS_PROXY.listen_port if HTTPS_PROXY else 8888
+    pac_content = generate_pac_file(proxy_host=device_ip, proxy_port=proxy_port)
     return Response(pac_content, mimetype='application/x-ns-proxy-autoconfig')
 
 @app.route('/ca-cert', methods=['GET'])
@@ -10083,7 +10102,9 @@ def api_transparent_https_enable():
     """Enable transparent HTTPS interception."""
     data = request.json or {}
     target_ips = data.get('target_ips')  # None = all traffic
-    proxy_port = data.get('proxy_port', 8888)
+    # Use actual port from HTTPS proxy (may not be 8888 if port conflict occurred)
+    default_port = HTTPS_PROXY.listen_port if HTTPS_PROXY else 8888
+    proxy_port = data.get('proxy_port', default_port)
 
     if not TRANSPARENT_INTERCEPTOR.is_available():
         return jsonify({'success': False, 'error': 'iptables not available'}), 500
