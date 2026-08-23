@@ -4209,23 +4209,29 @@ def start_gateway_dns():
         try:
             dnscrypt_proc = subprocess.Popen(['dnscrypt-proxy', '-config', GW_DNSCRYPT_CONF],
                                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            time.sleep(1.5)
-            if dnscrypt_proc.poll() is not None:
-                err = dnscrypt_proc.stderr.read().decode(errors='ignore')[-400:]
+            try:
+                _, err_bytes = dnscrypt_proc.communicate(timeout=2)
+                err = err_bytes.decode(errors='ignore')[-400:] if err_bytes else ''
                 add_log('warning', f'dnscrypt-proxy failed to start: {err}, falling back to unbound only')
                 dnscrypt_proc = None
+            except subprocess.TimeoutExpired:
+                dnscrypt_proc.kill()
+                dnscrypt_proc.wait(timeout=1)
         except Exception as e:
             add_log('warning', f'Failed to start dnscrypt-proxy: {e}, falling back to unbound only')
             dnscrypt_proc = None
 
     unbound_proc = subprocess.Popen(['unbound', '-c', GW_UNBOUND_CONF, '-d'],
                                      stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    time.sleep(1)
-    if unbound_proc.poll() is not None:
-        err = unbound_proc.stderr.read().decode(errors='ignore')[-400:]
+    try:
+        _, err_bytes = unbound_proc.communicate(timeout=2)
+        err = err_bytes.decode(errors='ignore')[-400:] if err_bytes else ''
         if dnscrypt_proc:
             stop_proc('dnscrypt-proxy')
         raise RuntimeError(f'unbound failed to start: {err}')
+    except subprocess.TimeoutExpired:
+        unbound_proc.kill()
+        unbound_proc.wait(timeout=1)
 
     if dnscrypt_proc:
         add_log('success', 'Gateway DNS stack started (Unbound + DNSCrypt-proxy)')
@@ -4293,10 +4299,13 @@ def start_gateway_proxy():
     time.sleep(0.3)
     proc = subprocess.Popen(['tinyproxy', '-c', GW_TINYPROXY_CONF, '-d'],
                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    time.sleep(1)
-    if proc.poll() is not None:
-        err = proc.stderr.read().decode(errors='ignore')[-400:]
+    try:
+        _, err_bytes = proc.communicate(timeout=2)
+        err = err_bytes.decode(errors='ignore')[-400:] if err_bytes else ''
         raise RuntimeError(f'tinyproxy failed to start: {err}')
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=1)
     add_log('success', f'Gateway proxy started on port {GW_PROXY_PORT}')
 
 def stop_gateway_proxy():
@@ -4433,10 +4442,13 @@ def start_ngrok_tunnel(port, authtoken=None):
     time.sleep(0.3)
     proc = subprocess.Popen(['ngrok', 'http', str(port), '--log=stdout'],
                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    time.sleep(2)
-    if proc.poll() is not None:
-        err = proc.stderr.read().decode(errors='ignore')[-400:] if proc.stderr else ''
+    try:
+        _, err_bytes = proc.communicate(timeout=3)
+        err = err_bytes.decode(errors='ignore')[-400:] if err_bytes else ''
         raise RuntimeError(f'ngrok failed to start: {err}')
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait(timeout=1)
     return proc
 
 def get_ngrok_public_url():
@@ -9547,14 +9559,15 @@ def api_start_attack():
         if risk:
             return jsonify({'success': False, 'requires_confirmation': True,
                              'error': f'{risk} Start {weapon_names_pre[weapon]} anyway?'})
-    if weapon in STATE['attack_pids']:
-        kill_attack(STATE['attack_pids'][weapon])
-        del STATE['attack_pids'][weapon]
     try:
-        pids = run_attack(weapon, STATE['targets'], STATE['gateway'], STATE['port'], STATE['interface'])
-        if not pids:
-            raise RuntimeError('Attack launcher returned no processes')
         with STATE_LOCK:
+            if weapon in STATE['attack_pids']:
+                kill_attack(STATE['attack_pids'][weapon])
+                del STATE['attack_pids'][weapon]
+
+            pids = run_attack(weapon, STATE['targets'], STATE['gateway'], STATE['port'], STATE['interface'])
+            if not pids:
+                raise RuntimeError('Attack launcher returned no processes')
             STATE['attack_pids'][weapon] = pids
             STATE['attack_status'][weapon] = 'running'
         weapon_names = {1:'ARP Freeze',2:'Deauth Flood',3:'SYN Flood',4:'DHCP Storm',5:'Traffic Capture'}
@@ -9693,9 +9706,13 @@ def _terminate_attacks_async(attack_pids_copy, interface_to_reset_val):
                 add_log('warn', f'Failed to reset monitor mode: {e}')
 
         # Cleanup: clear attack state (atomic under lock)
+        # Only clear the weapons we actually terminated, not any new attacks started after snapshot
         with STATE_LOCK:
-            STATE['attack_pids'] = {}
-            STATE['attack_status'] = {}
+            for weapon in attack_pids_copy.keys():
+                if weapon in STATE['attack_pids']:
+                    del STATE['attack_pids'][weapon]
+                if weapon in STATE['attack_status']:
+                    del STATE['attack_status'][weapon]
             if STATE['monitor_log_path']:
                 try:
                     os.unlink(STATE['monitor_log_path'])
@@ -9925,6 +9942,8 @@ def api_gateway_add_lan_domain():
     with STATE_LOCK:
         if domain not in STATE['lan_domains']:
             STATE['lan_domains'].append(domain)
+            if len(STATE['lan_domains']) > 100:
+                STATE['lan_domains'] = STATE['lan_domains'][-100:]
         lan_domains = list(STATE['lan_domains'])
 
     # Regenerate gateway configs with new domains
@@ -10373,6 +10392,8 @@ def api_injection_create_rule():
 
     with STATE_LOCK:
         STATE['injection_rules'].append(rule)
+        if len(STATE['injection_rules']) > 500:
+            STATE['injection_rules'] = STATE['injection_rules'][-500:]
 
     add_log('info', f'Created injection rule: {rule_id} ({rule["action_type"]})')
     return jsonify({'success': True, 'rule': rule})
