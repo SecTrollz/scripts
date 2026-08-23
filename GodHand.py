@@ -2970,8 +2970,8 @@ class ProcessGroup:
                 proc = subprocess.Popen(
                     cmd,
                     shell=shell,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
                     preexec_fn=os.setsid if not shell else None,  # Create process group
                     text=True
                 )
