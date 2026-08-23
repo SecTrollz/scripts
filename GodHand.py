@@ -2896,6 +2896,12 @@ def verify_capabilities_on_startup():
     else:
         add_log('warn', 'Transparent iptables interception not available; iptables or netfilter may be missing')
 
+    # Verify port forwarding (ip rule/route) availability
+    if PORT_FORWARDING_MANAGER.is_available():
+        add_log('success', 'Kernel-level port forwarding available (Phase 9)')
+    else:
+        add_log('warn', 'Port forwarding not available; ip command or routing tables may be missing')
+
 # ---------- Process group management (Phase 6: Subprocess Isolation) ----------
 class ProcessGroup:
     """Manages subprocess lifecycle with resource limits, automatic cleanup, and graceful restart."""
@@ -3350,6 +3356,341 @@ class TransparentInterceptor:
 
 # Global transparent interceptor instance
 TRANSPARENT_INTERCEPTOR = TransparentInterceptor()
+
+# ---------- Port forwarding via kernel routing (Phase 9) ----------
+class PortForwardingManager:
+    """Kernel-level port forwarding via ip rule and ip route.
+
+    Complements iptables-based interception by managing Linux routing tables
+    for flexible, policy-based packet forwarding without ARP spoofing.
+    """
+
+    def __init__(self, name="GODHAND", table_base=100, rule_priority_base=1000):
+        self.name = name
+        self.table_base = table_base  # Start routing tables at 100 (custom range)
+        self.rule_priority_base = rule_priority_base  # Start rules at priority 1000
+        self.active_tables = {}  # {table_id: {'name': str, 'rules': [], 'routes': []}}
+        self.active_rules = {}  # {rule_id: {'priority': int, 'selector': dict, 'table': int}}
+        self.next_table_id = table_base
+        self.next_rule_id = 0
+        self.lock = threading.RLock()
+
+    def is_available(self):
+        """Check if ip command and routing table support are available."""
+        try:
+            result = subprocess.run(
+                ['ip', 'rule', 'list'],
+                capture_output=True, timeout=3
+            )
+            return result.returncode == 0
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return False
+
+    def allocate_table(self, name):
+        """Allocate a new routing table ID."""
+        with self.lock:
+            table_id = self.next_table_id
+            self.next_table_id += 1
+            self.active_tables[table_id] = {
+                'name': name,
+                'rules': [],
+                'routes': []
+            }
+            add_log('dev', f'Allocated routing table {table_id} for {name}')
+            return table_id
+
+    def add_rule(self, from_ip=None, to_ip=None, iface=None, table_id=None, priority=None):
+        """Add a routing rule to direct traffic to a specific table.
+
+        Args:
+            from_ip: Source IP to match (e.g., '192.168.1.0/24')
+            to_ip: Destination IP to match
+            iface: Interface name to match
+            table_id: Target routing table
+            priority: Rule priority (lower = checked first)
+
+        Returns:
+            Rule ID if successful
+        """
+        try:
+            if not self.is_available():
+                return None
+
+            if table_id is None:
+                add_log('warn', 'add_rule: table_id required')
+                return None
+
+            with self.lock:
+                rule_id = self.next_rule_id
+                self.next_rule_id += 1
+                priority = priority or (self.rule_priority_base + rule_id)
+
+            # Build ip rule command
+            cmd = ['ip', 'rule', 'add']
+            selector = {}
+
+            if from_ip:
+                cmd.extend(['from', from_ip])
+                selector['from'] = from_ip
+            if to_ip:
+                cmd.extend(['to', to_ip])
+                selector['to'] = to_ip
+            if iface:
+                cmd.extend(['iif', iface])
+                selector['iif'] = iface
+
+            cmd.extend(['priority', str(priority), 'table', str(table_id)])
+
+            result = subprocess.run(cmd, capture_output=True, timeout=3, check=False)
+
+            if result.returncode == 0:
+                with self.lock:
+                    self.active_rules[rule_id] = {
+                        'priority': priority,
+                        'selector': selector,
+                        'table': table_id,
+                        'cmd': cmd
+                    }
+                add_log('dev', f'Routing rule {rule_id} added: {selector} -> table {table_id}')
+                return rule_id
+            else:
+                add_log('warn', f'Failed to add routing rule: {result.stderr.decode()}')
+                return None
+
+        except Exception as e:
+            add_log('warn', f'Error adding routing rule: {e}')
+            return None
+
+    def add_route(self, dest_ip, via_ip, table_id, iface=None, metric=100):
+        """Add a route to a routing table.
+
+        Args:
+            dest_ip: Destination IP/CIDR (e.g., '10.0.0.0/24' or 'default')
+            via_ip: Gateway IP to route through
+            table_id: Target routing table
+            iface: Interface to use
+            metric: Route metric/priority
+
+        Returns:
+            Route index if successful
+        """
+        try:
+            if not self.is_available():
+                return None
+
+            # Build ip route command
+            cmd = ['ip', 'route', 'add', dest_ip, 'via', via_ip]
+
+            if iface:
+                cmd.extend(['dev', iface])
+
+            cmd.extend(['metric', str(metric), 'table', str(table_id)])
+
+            result = subprocess.run(cmd, capture_output=True, timeout=3, check=False)
+
+            if result.returncode == 0:
+                with self.lock:
+                    if table_id in self.active_tables:
+                        route_entry = {
+                            'dest': dest_ip,
+                            'via': via_ip,
+                            'iface': iface,
+                            'metric': metric,
+                            'cmd': cmd
+                        }
+                        self.active_tables[table_id]['routes'].append(route_entry)
+
+                add_log('dev', f'Route added to table {table_id}: {dest_ip} via {via_ip}')
+                return len(self.active_tables[table_id]['routes']) - 1
+            else:
+                add_log('warn', f'Failed to add route: {result.stderr.decode()}')
+                return None
+
+        except Exception as e:
+            add_log('warn', f'Error adding route: {e}')
+            return None
+
+    def enable_port_redirect(self, local_port, dest_port, dest_ip=None, protocol='tcp',
+                            source_ip=None, table_id=None):
+        """Enable port forwarding using routing rules.
+
+        Combines policy-based routing (ip rule) with route table manipulation.
+
+        Args:
+            local_port: Local port receiving traffic
+            dest_port: Destination port to forward to
+            dest_ip: Destination IP (None = all hosts)
+            protocol: 'tcp' or 'udp'
+            source_ip: Source IP to match (optional)
+            table_id: Target routing table (auto-allocated if None)
+
+        Returns:
+            Table ID if successful
+        """
+        try:
+            if table_id is None:
+                table_id = self.allocate_table(f'PORT_{protocol.upper()}_{local_port}')
+
+            # Add rule to route marked traffic to this table
+            rule_id = self.add_rule(
+                from_ip=source_ip,
+                iface=None,
+                table_id=table_id,
+                priority=self.rule_priority_base
+            )
+
+            if rule_id is None:
+                add_log('warn', 'Failed to create routing rule for port forwarding')
+                return None
+
+            # Add default route through local forwarding
+            self.add_route('0.0.0.0/0', '127.0.0.1', table_id, metric=100)
+
+            add_log('success', f'Port forwarding enabled: {protocol} {local_port} -> {dest_port}')
+            return table_id
+
+        except Exception as e:
+            add_log('error', f'Port redirect setup failed: {e}')
+            return None
+
+    def enable_gateway_forwarding(self, gateway_ip, target_network=None, iface=None,
+                                  table_id=None):
+        """Enable traffic forwarding to gateway (e.g., for MITM proxy).
+
+        Args:
+            gateway_ip: Gateway IP address (routed device IP)
+            target_network: Target network to forward (None = all)
+            iface: Interface to match (optional)
+            table_id: Target routing table (auto-allocated if None)
+
+        Returns:
+            Table ID if successful
+        """
+        try:
+            if table_id is None:
+                table_id = self.allocate_table(f'GATEWAY_{gateway_ip}')
+
+            # Add rule for traffic from specific interface/network
+            rule_id = self.add_rule(
+                to_ip=target_network,
+                iface=iface,
+                table_id=table_id,
+                priority=self.rule_priority_base
+            )
+
+            if rule_id is None:
+                add_log('warn', 'Failed to create routing rule for gateway forwarding')
+                return None
+
+            # Add route to gateway for all traffic
+            self.add_route('0.0.0.0/0', gateway_ip, table_id, iface=iface, metric=100)
+
+            add_log('success', f'Gateway forwarding enabled to {gateway_ip} via table {table_id}')
+            return table_id
+
+        except Exception as e:
+            add_log('error', f'Gateway forwarding setup failed: {e}')
+            return None
+
+    def disable_table(self, table_id):
+        """Remove all rules and routes associated with a table."""
+        try:
+            with self.lock:
+                if table_id not in self.active_tables:
+                    add_log('warn', f'Table {table_id} not found')
+                    return False
+
+                table_info = self.active_tables[table_id]
+
+            # Remove all routes from this table
+            for route in table_info.get('routes', []):
+                try:
+                    cmd = ['ip', 'route', 'del', route['dest'], 'table', str(table_id)]
+                    subprocess.run(cmd, capture_output=True, timeout=3, check=False)
+                except Exception as e:
+                    add_log('dev', f'Route cleanup: {e}')
+
+            # Remove all rules pointing to this table
+            rules_to_remove = []
+            with self.lock:
+                for rule_id, rule_info in self.active_rules.items():
+                    if rule_info['table'] == table_id:
+                        rules_to_remove.append((rule_id, rule_info))
+
+            for rule_id, rule_info in rules_to_remove:
+                try:
+                    cmd = ['ip', 'rule', 'del', 'priority', str(rule_info['priority'])]
+                    subprocess.run(cmd, capture_output=True, timeout=3, check=False)
+                    with self.lock:
+                        if rule_id in self.active_rules:
+                            del self.active_rules[rule_id]
+                except Exception as e:
+                    add_log('dev', f'Rule cleanup: {e}')
+
+            # Flush and delete the table
+            try:
+                subprocess.run(
+                    ['ip', 'route', 'flush', 'table', str(table_id)],
+                    capture_output=True, timeout=3, check=False
+                )
+            except Exception as e:
+                add_log('dev', f'Table flush: {e}')
+
+            with self.lock:
+                if table_id in self.active_tables:
+                    del self.active_tables[table_id]
+
+            add_log('dev', f'Routing table {table_id} disabled and cleaned up')
+            return True
+
+        except Exception as e:
+            add_log('warn', f'Failed to disable table {table_id}: {e}')
+            return False
+
+    def cleanup_all(self):
+        """Remove all forwarding rules and routing tables."""
+        try:
+            with self.lock:
+                tables_to_remove = list(self.active_tables.keys())
+
+            for table_id in tables_to_remove:
+                self.disable_table(table_id)
+
+            add_log('success', 'All port forwarding rules cleaned up')
+            return True
+        except Exception as e:
+            add_log('error', f'Cleanup failed: {e}')
+            return False
+
+    def get_status(self):
+        """Get status of all active port forwarding rules."""
+        with self.lock:
+            status = {
+                'available': self.is_available(),
+                'active_tables': len(self.active_tables),
+                'active_rules': len(self.active_rules),
+                'tables': {},
+                'rules': {}
+            }
+
+            for table_id, table_info in self.active_tables.items():
+                status['tables'][table_id] = {
+                    'name': table_info['name'],
+                    'routes': len(table_info['routes']),
+                    'route_list': table_info['routes']
+                }
+
+            for rule_id, rule_info in self.active_rules.items():
+                status['rules'][rule_id] = {
+                    'priority': rule_info['priority'],
+                    'selector': rule_info['selector'],
+                    'table': rule_info['table']
+                }
+
+            return status
+
+# Global port forwarding manager instance
+PORT_FORWARDING_MANAGER = PortForwardingManager()
 
 # ---------- Python DNS forwarder (Unbound fallback) ----------
 class PythonDNSForwarder:
@@ -9488,6 +9829,128 @@ def api_transparent_cleanup():
     """Clean up all transparent interceptor rules."""
     if TRANSPARENT_INTERCEPTOR.cleanup_all():
         return jsonify({'success': True, 'message': 'All interceptor rules cleaned up'})
+    else:
+        return jsonify({'success': False, 'error': 'Cleanup partially failed'}), 500
+
+# ---------- Phase 9: Port Forwarding API Endpoints ----------
+@app.route('/api/portforward/status', methods=['GET'])
+@require_auth
+def api_portforward_status():
+    """Get port forwarding status and active rules."""
+    return jsonify({'success': True, 'portforward': PORT_FORWARDING_MANAGER.get_status()})
+
+@app.route('/api/portforward/rule/add', methods=['POST'])
+@require_auth
+def api_portforward_add_rule():
+    """Add a routing rule to forward traffic to a specific table."""
+    data = request.json or {}
+    from_ip = data.get('from_ip')
+    to_ip = data.get('to_ip')
+    iface = data.get('iface')
+    table_id = data.get('table_id')
+    priority = data.get('priority')
+
+    if not PORT_FORWARDING_MANAGER.is_available():
+        return jsonify({'success': False, 'error': 'Port forwarding not available'}), 500
+
+    rule_id = PORT_FORWARDING_MANAGER.add_rule(
+        from_ip=from_ip, to_ip=to_ip, iface=iface, table_id=table_id, priority=priority
+    )
+
+    if rule_id is not None:
+        return jsonify({'success': True, 'rule_id': rule_id, 'message': 'Routing rule added'})
+    else:
+        return jsonify({'success': False, 'error': 'Failed to add routing rule'}), 500
+
+@app.route('/api/portforward/route/add', methods=['POST'])
+@require_auth
+def api_portforward_add_route():
+    """Add a route to a routing table."""
+    data = request.json or {}
+    dest_ip = data.get('dest_ip')
+    via_ip = data.get('via_ip')
+    table_id = data.get('table_id')
+    iface = data.get('iface')
+    metric = data.get('metric', 100)
+
+    if not PORT_FORWARDING_MANAGER.is_available():
+        return jsonify({'success': False, 'error': 'Port forwarding not available'}), 500
+
+    route_idx = PORT_FORWARDING_MANAGER.add_route(
+        dest_ip=dest_ip, via_ip=via_ip, table_id=table_id, iface=iface, metric=metric
+    )
+
+    if route_idx is not None:
+        return jsonify({'success': True, 'route_index': route_idx, 'message': 'Route added'})
+    else:
+        return jsonify({'success': False, 'error': 'Failed to add route'}), 500
+
+@app.route('/api/portforward/redirect/enable', methods=['POST'])
+@require_auth
+def api_portforward_redirect_enable():
+    """Enable port redirection using routing tables."""
+    data = request.json or {}
+    local_port = data.get('local_port')
+    dest_port = data.get('dest_port')
+    dest_ip = data.get('dest_ip')
+    protocol = data.get('protocol', 'tcp')
+    source_ip = data.get('source_ip')
+
+    if not PORT_FORWARDING_MANAGER.is_available():
+        return jsonify({'success': False, 'error': 'Port forwarding not available'}), 500
+
+    table_id = PORT_FORWARDING_MANAGER.enable_port_redirect(
+        local_port=local_port, dest_port=dest_port, dest_ip=dest_ip,
+        protocol=protocol, source_ip=source_ip
+    )
+
+    if table_id is not None:
+        return jsonify({'success': True, 'table_id': table_id, 'message': 'Port redirect enabled'})
+    else:
+        return jsonify({'success': False, 'error': 'Failed to enable port redirect'}), 500
+
+@app.route('/api/portforward/gateway/enable', methods=['POST'])
+@require_auth
+def api_portforward_gateway_enable():
+    """Enable gateway forwarding using routing tables."""
+    data = request.json or {}
+    gateway_ip = data.get('gateway_ip')
+    target_network = data.get('target_network')
+    iface = data.get('iface')
+
+    if not PORT_FORWARDING_MANAGER.is_available():
+        return jsonify({'success': False, 'error': 'Port forwarding not available'}), 500
+
+    table_id = PORT_FORWARDING_MANAGER.enable_gateway_forwarding(
+        gateway_ip=gateway_ip, target_network=target_network, iface=iface
+    )
+
+    if table_id is not None:
+        return jsonify({'success': True, 'table_id': table_id, 'message': 'Gateway forwarding enabled'})
+    else:
+        return jsonify({'success': False, 'error': 'Failed to enable gateway forwarding'}), 500
+
+@app.route('/api/portforward/table/disable', methods=['POST'])
+@require_auth
+def api_portforward_table_disable():
+    """Disable and remove a routing table."""
+    data = request.json or {}
+    table_id = data.get('table_id')
+
+    if table_id is None:
+        return jsonify({'success': False, 'error': 'table_id required'}), 400
+
+    if PORT_FORWARDING_MANAGER.disable_table(table_id):
+        return jsonify({'success': True, 'message': f'Table {table_id} disabled'})
+    else:
+        return jsonify({'success': False, 'error': 'Failed to disable table'}), 500
+
+@app.route('/api/portforward/cleanup', methods=['POST'])
+@require_auth
+def api_portforward_cleanup():
+    """Clean up all port forwarding rules and tables."""
+    if PORT_FORWARDING_MANAGER.cleanup_all():
+        return jsonify({'success': True, 'message': 'All port forwarding rules cleaned up'})
     else:
         return jsonify({'success': False, 'error': 'Cleanup partially failed'}), 500
 
