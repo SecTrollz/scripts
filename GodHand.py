@@ -9,6 +9,7 @@ Run as root.
 
 import os
 import sys
+import stat
 import subprocess
 import time
 import json
@@ -32,6 +33,8 @@ import sqlite3
 import csv
 import ssl
 import gzip
+import signal
+import fnmatch
 from functools import wraps
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
@@ -537,7 +540,7 @@ class ResponseModifier:
 
             if modified:
                 # Update Content-Length if body changed
-                if b'Content-Length' in str(headers).encode():
+                if 'Content-Length' in headers:
                     headers['Content-Length'] = str(len(body))
 
                 return ResponseModifier.rebuild_http_response(status_line, headers, body)
@@ -563,7 +566,6 @@ class ResponseModifier:
             return True
 
         # Convert wildcard pattern to regex
-        import fnmatch
         return fnmatch.fnmatch(hostname, pattern)
 
 # ---------- Traffic Persistence Database ----------
@@ -575,6 +577,7 @@ class TrafficDatabase:
             db_path = os.path.join(GATEWAY_DIR, 'https_traffic.db')
         self.db_path = db_path
         self.lock = threading.Lock()
+        self.initialized = False
         self._init_db()
 
     def _init_db(self):
@@ -606,9 +609,12 @@ class TrafficDatabase:
                 cursor.execute('CREATE INDEX IF NOT EXISTS idx_client_ip ON https_traffic(client_ip)')
                 conn.commit()
                 conn.close()
+                self.initialized = True
                 add_log('info', f'Traffic database initialized: {self.db_path}')
         except Exception as e:
             add_log('error', f'Failed to initialize traffic database: {e}')
+            self.initialized = False
+            raise
 
     def add_entry(self, entry: dict):
         """Add traffic entry to database."""
@@ -756,7 +762,8 @@ class HTTPManipulator:
                 chunk_end = chunk_start + chunk_size
                 result += data[chunk_start:chunk_end]
                 data = data[chunk_end + 2:]
-            except:
+            except Exception as e:
+                add_log('warn', f'Error decoding chunked transfer encoding at offset {len(result)}: {e}')
                 break
         return result
 
@@ -790,8 +797,8 @@ class HTTPManipulator:
             if headers.get('content-encoding', '').lower() == 'gzip':
                 try:
                     body = gzip.decompress(body)
-                except:
-                    pass
+                except Exception as e:
+                    add_log('warn', f'Failed to decompress gzip body ({len(body)} bytes): {e}')
 
             return {
                 'status_line': status_line,
