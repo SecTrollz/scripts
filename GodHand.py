@@ -5508,14 +5508,6 @@ def start_attack_monitor(targets, port, iface):
         add_log('warn', 'Monitor mode could not be enabled; capture may be incomplete')
     with STATE_LOCK:
         STATE['monitor_entries'] = []
-
-    # Check if we can actually use AF_PACKET sockets (Android/Termux may block this)
-    try:
-        test_sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW)
-        test_sock.close()
-    except (OSError, AttributeError) as e:
-        add_log('warn', f'AF_PACKET socket unavailable ({e}), traffic capture may fail or show no data')
-
     # Use a writable temp directory
     tmpdir = tempfile.gettempdir()
     log_path = os.path.join(tmpdir, f"godhand_monitor_{int(time.time())}.log")
@@ -5672,12 +5664,10 @@ def start_attack_monitor(targets, port, iface):
     with open(path, 'w') as f:
         f.write(script)
     try:
-        log_file = open(log_path, 'w', buffering=1)  # Line-buffered output
+        log_file = open(log_path, 'w')
     except Exception as e:
         raise RuntimeError(f'Cannot open log file {log_path}: {e}')
-    # Use DEVNULL for stderr - safest approach to avoid any file handle issues
-    # Traffic capture script writes JSON to stdout, errors go to /dev/null
-    proc = subprocess.Popen(['python3', path], stdout=log_file, stderr=subprocess.DEVNULL, preexec_fn=os.setsid)
+    proc = subprocess.Popen(['python3', path], stdout=log_file, stderr=subprocess.PIPE)
     time.sleep(0.5)
     if proc.poll() is not None:
         raise RuntimeError('Monitor script exited immediately')
