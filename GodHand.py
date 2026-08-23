@@ -9718,7 +9718,9 @@ def api_stop_attack():
 def api_attack_status():
     with STATE_LOCK:
         for weapon, pids in STATE['attack_pids'].items():
-            if any(p.poll() is not None for p in pids):
+            # Mark weapon as dead only if ALL processes have exited (not just one)
+            # This is critical for attacks with multiple processes (e.g., ARP Freeze has 2x processes per target)
+            if all(p.poll() is not None for p in pids) if pids else False:
                 STATE['attack_status'][weapon] = 'dead'
             else:
                 STATE['attack_status'][weapon] = 'running'
