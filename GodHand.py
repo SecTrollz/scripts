@@ -5675,11 +5675,17 @@ def start_attack_monitor(targets, port, iface):
         log_file = open(log_path, 'w')
     except Exception as e:
         raise RuntimeError(f'Cannot open log file {log_path}: {e}')
-    # Use DEVNULL for stderr to avoid deadlock if script writes >64KB to stderr
-    proc = subprocess.Popen(['python3', path], stdout=log_file, stderr=subprocess.DEVNULL)
-    time.sleep(0.5)
-    if proc.poll() is not None:
-        raise RuntimeError('Monitor script exited immediately')
+    # Use PIPE initially to capture startup errors, then handle properly
+    proc = subprocess.Popen(['python3', path], stdout=log_file, stderr=subprocess.PIPE, text=True)
+    try:
+        # Wait briefly to see if subprocess exits immediately with error
+        _, err = proc.communicate(timeout=0.5)
+        if err and err.strip():
+            add_log('error', f'Traffic capture subprocess error: {err[:500]}')
+        raise RuntimeError(f'Monitor script exited immediately: {err[:200] if err else "no error details"}')
+    except subprocess.TimeoutExpired:
+        # Process still running after timeout is good - this means it started successfully
+        pass
     update_state('monitor_log_path', log_path)
     threading.Thread(target=lambda: (proc.wait(), log_file.close(), os.unlink(path)), daemon=True).start()
     def update_monitor_log():
