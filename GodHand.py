@@ -1337,11 +1337,17 @@ class HTTPSInterceptProxy:
                 return
 
             # Connect to upstream server
+            upstream_socket = None
             try:
                 upstream_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 upstream_socket.settimeout(10)
                 upstream_socket.connect((hostname, 443))
             except socket.error as e:
+                if upstream_socket:
+                    try:
+                        upstream_socket.close()
+                    except:
+                        pass
                 add_log('error', f'Failed to connect to {hostname}:443 - {e}')
                 return
 
@@ -1353,6 +1359,11 @@ class HTTPSInterceptProxy:
             try:
                 upstream_tls = upstream_context.wrap_socket(upstream_socket, server_hostname=hostname)
             except ssl.SSLError as e:
+                if upstream_socket:
+                    try:
+                        upstream_socket.close()
+                    except:
+                        pass
                 add_log('error', f'Upstream TLS failed for {hostname}:443: {type(e).__name__}: {e}')
                 return
 
