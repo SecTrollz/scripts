@@ -36,6 +36,15 @@ QUICK START
             --token <secret> --remote-port 20022
         # -> 203.0.113.10:20022  forwards to  127.0.0.1:22
 
+QUICK FILE SERVING
+    Expose a local directory (webapp, static files, etc.) to the internet:
+
+        python3 ngrok_tunnel.py serve-dir /path/to/webapp \\
+            --server 203.0.113.10:9000 --token <secret>
+
+    The directory is automatically served via HTTP and routed through
+    the relay. Directory listings and index.html are automatically handled.
+
 LAN DEPLOYMENT
     Got a home network full of headless boxes (a NAS, a Plex box, a home
     server) you'd like to run the `http`/`tcp` client on, without opening
@@ -79,10 +88,12 @@ import asyncio
 import contextlib
 import functools
 import hmac
+import http.server
 import ipaddress
 import itertools
 import json
 import logging
+import mimetypes
 import os
 import secrets
 import socket
@@ -627,6 +638,147 @@ class TunnelClient:
                 local_writer.close()
             with contextlib.suppress(Exception):
                 await write_frame(control_writer, MSG_CLOSE, stream_id)
+
+
+# --------------------------------------------------------------------------
+# Static file serving
+#
+# Simple HTTP server to serve files/directories locally. Used by serve-dir
+# to expose a webapp or collection of files through an ngrok tunnel.
+# --------------------------------------------------------------------------
+
+class SimpleStaticHandler(http.server.SimpleHTTPRequestHandler):
+    """HTTP request handler that serves files from a configured directory."""
+
+    def translate_path(self, path):
+        """Override to serve from a specific directory instead of cwd."""
+        parts = path.split('/')
+        words = [w for w in parts if w]
+        word_index = 0
+        path = self.directory
+
+        for word in words:
+            if word in (".", ".."):
+                continue
+            path = path / word
+
+        return str(path)
+
+    def do_GET(self):
+        """Handle GET requests with proper CORS for browser access."""
+        self.send_response(200)
+
+        # Guess content type
+        if self.path == "/":
+            path = self.directory / "index.html"
+            if not path.exists():
+                path = self.directory
+        else:
+            path = self.directory / self.path.lstrip("/")
+
+        if path.is_dir():
+            # Serve directory listing or index.html
+            index = path / "index.html"
+            if index.exists():
+                content_type = "text/html"
+                path = index
+            else:
+                # Simple directory listing
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(self._dir_listing(path).encode("utf-8"))
+                return
+        elif path.exists():
+            content_type, _ = mimetypes.guess_type(str(path))
+            if not content_type:
+                content_type = "application/octet-stream"
+        else:
+            self.send_error(404)
+            return
+
+        self.send_header("Content-Type", content_type)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Cache-Control", "public, max-age=3600")
+
+        try:
+            with open(path, "rb") as f:
+                content = f.read()
+            self.send_header("Content-Length", len(content))
+            self.end_headers()
+            self.wfile.write(content)
+        except (OSError, IOError):
+            self.send_error(500)
+
+    def do_OPTIONS(self):
+        """Handle CORS preflight requests."""
+        self.send_response(200)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.end_headers()
+
+    def _dir_listing(self, path: Path) -> str:
+        """Generate a simple HTML directory listing."""
+        items = sorted(path.iterdir())
+        rows = []
+
+        # Parent directory link (if not root)
+        if path.parent != path:
+            rows.append('<tr><td><a href="..">..</a></td><td>-</td></tr>')
+
+        for item in items:
+            name = item.name
+            if item.is_dir():
+                rows.append(f'<tr><td><a href="{name}/">{name}/</a></td><td>DIR</td></tr>')
+            else:
+                size = item.stat().st_size
+                rows.append(f'<tr><td><a href="{name}">{name}</a></td><td>{size:,} bytes</td></tr>')
+
+        table = "\n".join(rows)
+        return f"""
+        <html><head><title>Directory Listing: {path.name}</title></head><body>
+        <h1>Index of {path.name}</h1>
+        <table border="1" cellpadding="5">
+        <tr><th>Name</th><th>Size</th></tr>
+        {table}
+        </table>
+        </body></html>
+        """
+
+    def log_message(self, format, *args):
+        """Suppress default logging; let the relay handle it."""
+        pass
+
+
+async def serve_directory_http(directory: str, port: int) -> None:
+    """Start a local HTTP server serving a directory."""
+    path = Path(directory).resolve()
+
+    if not path.exists():
+        raise SystemExit(f"Path does not exist: {directory}")
+    if not path.is_dir():
+        raise SystemExit(f"Not a directory: {directory}")
+
+    handler = lambda req, addr, dir=path: SimpleStaticHandler(req, addr, dir)
+
+    # Start the local HTTP server
+    loop = asyncio.get_running_loop()
+    server = http.server.HTTPServer(("127.0.0.1", port), handler)
+    server.serve_directory = path
+
+    # Override the handler class to use our custom one
+    class WrappedHandler(SimpleStaticHandler):
+        directory = path
+
+    server.RequestHandlerClass = WrappedHandler
+
+    # Run server in executor so it doesn't block
+    def run_server():
+        server.serve_forever()
+
+    task = loop.run_in_executor(None, run_server)
+    return task, server
 
 
 # --------------------------------------------------------------------------
@@ -1279,7 +1431,85 @@ def build_arg_parser() -> argparse.ArgumentParser:
     sp.add_argument("--iface", default=None,
                      help="network interface to use for ARP spoofing (default: auto-detect)")
 
+    dp = sub.add_parser("serve-dir", help="serve a local directory/webapp through an HTTP tunnel")
+    dp.add_argument("directory", help="local directory path to serve (webapp, static files, etc.)")
+    dp.add_argument("--server", required=True, metavar="HOST:PORT",
+                     help="relay server's control address, e.g. 203.0.113.10:9000")
+    dp.add_argument("--token", default=None,
+                     help="auth token expected by the server")
+    dp.add_argument("--subdomain", default=None,
+                     help="requested subdomain (default: randomly assigned)")
+    dp.add_argument("--local-port", type=int, default=None,
+                     help="local port to use for file server (default: 9876)")
+    dp.add_argument("--tls", action="store_true",
+                     help="use TLS for the control connection to the server")
+
     return parser
+
+
+async def run_serve_dir(args: argparse.Namespace) -> None:
+    """Serve a local directory/webapp through an HTTP tunnel."""
+    directory = args.directory
+    server_addr = args.server
+    token = args.token
+    subdomain = args.subdomain
+    local_port = args.local_port or 9876  # Use a local port for the file server
+
+    path = Path(directory).resolve()
+    if not path.exists():
+        raise SystemExit(f"Path does not exist: {directory}")
+    if not path.is_dir():
+        raise SystemExit(f"Not a directory: {directory}")
+
+    print(f"Serving directory: {path}")
+
+    # Start local HTTP server for the directory
+    loop = asyncio.get_running_loop()
+    handler_class = type("DirHandler", (SimpleStaticHandler,), {"directory": path})
+    server = http.server.HTTPServer(("127.0.0.1", local_port), handler_class)
+
+    def run_server():
+        try:
+            server.serve_forever()
+        except Exception:
+            pass
+
+    server_task = loop.run_in_executor(None, run_server)
+
+    try:
+        # Give the server a moment to start
+        await asyncio.sleep(0.5)
+
+        # Create tunnel arguments and run client
+        args.command = "http"
+        args.local_host = "127.0.0.1"
+        args.local_port = local_port
+        args.tls = False
+
+        if not subdomain:
+            subdomain = f"files-{secrets.token_hex(2)}"
+        args.subdomain = subdomain
+
+        # Parse server address
+        if not server_addr or ":" not in server_addr:
+            raise SystemExit("--server must be HOST:PORT")
+
+        args.server = server_addr
+        args.token = token
+
+        client = TunnelClient(args)
+        print(f"\nStarting HTTP tunnel...")
+        print(f"Press Ctrl+C to stop.\n")
+
+        await client.run()
+    except KeyboardInterrupt:
+        print("\nShutting down...")
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        server.shutdown()
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(server_task, timeout=1.0)
 
 
 async def async_main(args: argparse.Namespace) -> None:
@@ -1293,6 +1523,8 @@ async def async_main(args: argparse.Namespace) -> None:
         await run_lan_wizard(args)
     elif args.command == "lan-spoof":
         await run_lan_spoof_wizard(args)
+    elif args.command == "serve-dir":
+        await run_serve_dir(args)
     else:  # pragma: no cover - argparse guards this
         raise SystemExit(f"unknown command: {args.command}")
 
