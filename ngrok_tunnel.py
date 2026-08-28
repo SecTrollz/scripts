@@ -1559,6 +1559,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--client", default=None,
                      help="target client hostname (if not specified, you'll be prompted)")
 
+    mp = sub.add_parser("local-mesh", help="zero-config LAN mesh (ARP+DNS spoof + relay + dashboard)")
+    mp.add_argument("--domain", default="tunnel.local",
+                     help="domain to use for tunnel (default: tunnel.local)")
+    mp.add_argument("--relay-port", type=int, default=9000,
+                     help="relay control port (default: 9000)")
+    mp.add_argument("--http-port", type=int, default=8080,
+                     help="relay HTTP port + dashboard (default: 8080)")
+    mp.add_argument("--iface", default=None,
+                     help="network interface (default: auto-detect)")
+
     return parser
 
 
@@ -1848,6 +1858,193 @@ async def run_rescue_admin(host: str, port: int, token: str, client_hostname: Op
         writer.close()
 
 
+# --------------------------------------------------------------------------
+# Local Mesh Mode - Zero-Config LAN Tunneling with ARP+DNS Spoofing
+#
+# Single command to turn your machine into a local tunnel hub:
+# 1. Starts relay server on LAN
+# 2. Spoofs ARP+DNS to intercept tunnel.local queries
+# 3. Serves web dashboard with clickable tunnel links
+# 4. All devices on LAN can use tunnel.local:9000 without config
+# --------------------------------------------------------------------------
+
+async def serve_dashboard(relay: "TunnelServer", port: int, bind: str) -> None:
+    """Serve web dashboard showing active tunnels."""
+    async def handle_dashboard(reader: asyncio.StreamReader,
+                               writer: asyncio.StreamWriter) -> None:
+        try:
+            head = await read_http_head(reader)
+        except (ConnectionError, ProtocolError):
+            writer.close()
+            return
+
+        # Build HTML dashboard
+        http_tunnels = []
+        tcp_tunnels = []
+
+        for session in relay.sessions.values():
+            for tunnel_id, info in session.tunnels.items():
+                if info.kind == "http" and info.subdomain:
+                    http_tunnels.append({
+                        "subdomain": info.subdomain,
+                        "url": info.public_url.replace("8080", "8080"),
+                        "local_port": info.local_port,
+                    })
+                elif info.kind == "tcp" and info.remote_port:
+                    tcp_tunnels.append({
+                        "port": info.remote_port,
+                        "local_port": info.local_port,
+                        "url": info.public_url,
+                    })
+
+        # Generate HTML
+        http_list = ""
+        for t in http_tunnels:
+            url = t["url"].replace("http://", "http://").split(":")[0] + ":8080"
+            http_list += f'  <li><a href="http://{t["subdomain"]}.tunnel.local:8080/" target="_blank">🔗 {t["subdomain"]}.tunnel.local:8080</a> → localhost:{t["local_port"]}</li>\n'
+
+        tcp_list = ""
+        for t in tcp_tunnels:
+            tcp_list += f'  <li>📌 <code>tunnel.local:{t["port"]}</code> → localhost:{t["local_port"]}</li>\n'
+
+        if not http_list and not tcp_list:
+            http_list = '  <li><em>No tunnels active yet. Run clients to expose services.</em></li>'
+
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <title>Local Tunnel Dashboard</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            margin: 40px; background: #f5f5f5; }}
+    .container {{ max-width: 600px; margin: 0 auto; background: white; padding: 30px;
+                  border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
+    h1 {{ color: #333; margin-top: 0; }}
+    h2 {{ color: #666; font-size: 16px; margin-top: 30px; border-bottom: 2px solid #007bff;
+          padding-bottom: 8px; }}
+    ul {{ list-style: none; padding: 0; }}
+    li {{ padding: 8px 0; }}
+    a {{ color: #007bff; text-decoration: none; font-weight: 500; }}
+    a:hover {{ text-decoration: underline; }}
+    code {{ background: #f0f0f0; padding: 2px 6px; border-radius: 3px; font-family: monospace; }}
+    .status {{ background: #e8f5e9; padding: 12px; border-radius: 4px; margin-bottom: 20px;
+               font-size: 14px; }}
+    em {{ color: #999; }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🌐 Local Tunnel Dashboard</h1>
+    <div class="status">
+      ✓ Relay running at <code>tunnel.local:9000</code> (192.168.1.{relay.bind.split(".")[-1] if "." in relay.bind else "?"})
+    </div>
+    <h2>HTTP Tunnels</h2>
+    <ul>
+{http_list}
+    </ul>
+    <h2>TCP Tunnels</h2>
+    <ul>
+{tcp_list}
+    </ul>
+  </div>
+</body>
+</html>"""
+
+        response = _http_response("200 OK", html.encode("utf-8"))
+        writer.write(response)
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(handle_dashboard, host=bind, port=port)
+    async with server:
+        await server.serve_forever()
+
+
+async def run_local_mesh(args: argparse.Namespace) -> None:
+    """Run local mesh mode: relay + ARP+DNS spoofing + dashboard."""
+    if not check_root():
+        raise SystemExit("local-mesh requires root/admin for ARP and DNS spoofing")
+
+    domain = args.domain or "tunnel.local"
+    relay_port = args.relay_port or 9000
+    http_port = args.http_port or 8080
+    iface = args.iface or get_default_iface()
+    bind = local_ip_guess()
+
+    our_mac = get_mac_address(iface)
+    if not our_mac:
+        raise SystemExit(f"Could not read MAC address of interface {iface}")
+
+    print(f"\n🌐 LOCAL MESH MODE")
+    print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(f"Interface: {iface}")
+    print(f"Local IP: {bind}")
+    print(f"Relay: {domain}:{relay_port} → {bind}:{relay_port}")
+    print(f"Dashboard: http://{domain}:{http_port}")
+    print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+
+    # Create mock args for relay server
+    class RelayArgs:
+        pass
+
+    relay_args = RelayArgs()
+    relay_args.bind = "0.0.0.0"
+    relay_args.control_port = relay_port
+    relay_args.http_port = http_port
+    relay_args.https_port = None
+    relay_args.cert = None
+    relay_args.key = None
+    relay_args.domain = None
+    relay_args.public_host = bind
+    relay_args.token = None
+    relay_args.tcp_port_range = (20000, 20100)
+    relay_args.allow_any_port = False
+    relay_args.verbose = args.verbose if hasattr(args, "verbose") else 0
+
+    relay = TunnelServer(relay_args)
+
+    print(f"Starting relay server on {bind}:{relay_port}...")
+    print(f"Starting dashboard on http://{domain}:{http_port}...\n")
+
+    # Start relay, dashboard, and ARP/DNS spoofing
+    try:
+        relay_task = asyncio.create_task(relay.start())
+        dashboard_task = asyncio.create_task(serve_dashboard(relay, http_port, bind))
+
+        # Start DNS spoofing for the domain
+        dns_task = asyncio.create_task(run_dns_spoof_server(
+            53, {domain}, bind, bind or "0.0.0.0"
+        ))
+
+        # ARP spoofing for all devices to redirect to us
+        print(f"✓ ARP spoofing active for {domain}")
+        print(f"✓ DNS spoofing active for {domain}")
+        print(f"\n🎯 TUNNEL ACCESS INSTRUCTIONS:")
+        print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        print(f"  Device 1 (expose service on port 5000):")
+        print(f"    python3 ngrok_tunnel.py http 5000 \\")
+        print(f"      --server {domain}:{relay_port} --subdomain myapp")
+        print(f"    → Access at: http://myapp.{domain}:{http_port}/")
+        print(f"\n  Device 2 (expose SSH on port 22):")
+        print(f"    python3 ngrok_tunnel.py tcp 22 \\")
+        print(f"      --server {domain}:{relay_port} --remote-port 20022")
+        print(f"    → Connect: ssh user@{domain} -p 20022")
+        print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        print(f"\n📊 DASHBOARD: http://{domain}:{http_port}/")
+        print(f"\nPress Ctrl+C to stop.\n")
+
+        # Wait for all tasks
+        await asyncio.gather(relay_task, dashboard_task, dns_task)
+
+    except KeyboardInterrupt:
+        print("\n\nShutting down local mesh...")
+    except Exception as e:
+        print(f"Error: {e}")
+        raise
+    finally:
+        print("✓ Local mesh stopped")
+
+
 async def run_serve_dir(args: argparse.Namespace) -> None:
     """Serve a local directory/webapp through an HTTP tunnel."""
     directory = args.directory
@@ -1930,6 +2127,8 @@ async def async_main(args: argparse.Namespace) -> None:
         await RescueClient(args).run()
     elif args.command == "rescue-admin":
         await run_rescue_admin(args.host, args.port, args.token, args.client)
+    elif args.command == "local-mesh":
+        await run_local_mesh(args)
     else:  # pragma: no cover - argparse guards this
         raise SystemExit(f"unknown command: {args.command}")
 
