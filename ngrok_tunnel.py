@@ -154,6 +154,7 @@ MSG_CLOSE = 0x05       # both ways: stream_id finished
 MSG_PING = 0x06
 MSG_PONG = 0x07
 MSG_ERROR = 0x08       # server -> client: {"error": str}
+MSG_ADMIN_CMD = 0x09   # admin command from HTTP endpoint to client
 
 
 class ProtocolError(Exception):
@@ -268,6 +269,7 @@ class TunnelServer:
         self.key = args.key
         self.domain = args.domain
         self.token = args.token
+        self.admin_token = getattr(args, "admin_token", None)
         self.tcp_port_range = args.tcp_port_range
         self.allow_any_port = args.allow_any_port
         self.public_host = args.public_host or (
@@ -278,6 +280,7 @@ class TunnelServer:
         self.used_tcp_ports: set[int] = set()
         self.rescue_clients: dict[str, tuple[asyncio.StreamWriter, str]] = {}  # hostname -> (writer, session_id)
         self.rescue_admins: dict[str, asyncio.StreamWriter] = {}  # admin_id -> writer
+        self.rescue_ports: dict[str, int] = {}  # client_hostname -> allocated_port
 
     # -- lifecycle ---------------------------------------------------
 
@@ -576,6 +579,16 @@ class TunnelServer:
                 writer.close()
             return
 
+        # Parse request line
+        lines = head.split(b"\r\n")
+        request_line = lines[0].decode() if lines else ""
+        method, path, _ = request_line.split(" ", 2) if " " in request_line else ("GET", "/", "HTTP/1.1")
+
+        # Handle admin API endpoints
+        if path.startswith("/admin/"):
+            await self.handle_admin_api(path, head, reader, writer)
+            return
+
         host_header = parse_host_header(head) or ""
         subdomain = host_header.split(":")[0].split(".")[0] if host_header else ""
         route = self.http_routes.get(subdomain)
@@ -592,6 +605,157 @@ class TunnelServer:
         await session.send(MSG_NEW_STREAM, stream_id, json.dumps({"tunnel_id": tunnel_id}).encode())
         await session.send(MSG_DATA, stream_id, head)
         await self.pump_public_to_control(session, stream_id, reader)
+
+    async def handle_admin_api(self, path: str, head: bytes, reader: asyncio.StreamReader,
+                                writer: asyncio.StreamWriter) -> None:
+        """Handle admin API requests (e.g., /admin/rescue)."""
+        try:
+            if path == "/admin/rescue":
+                # Parse Authorization header
+                lines = head.split(b"\r\n")
+                auth_header = None
+                body_start = 0
+                for i, line in enumerate(lines):
+                    if line.lower().startswith(b"authorization:"):
+                        auth_header = line.decode().split(":", 1)[1].strip()
+                    if line == b"":
+                        body_start = head.find(b"\r\n\r\n") + 4
+                        break
+
+                # Check admin token
+                if self.admin_token and not auth_header:
+                    writer.write(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n")
+                    await writer.drain()
+                    writer.close()
+                    return
+
+                if self.admin_token and auth_header != f"Bearer {self.admin_token}":
+                    writer.write(b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n")
+                    await writer.drain()
+                    writer.close()
+                    return
+
+                # Parse JSON body
+                body = head[body_start:] if body_start < len(head) else b""
+                if not body:
+                    # Try to read more from the reader if needed
+                    try:
+                        # Look for Content-Length
+                        for line in lines:
+                            if line.lower().startswith(b"content-length:"):
+                                content_len = int(line.decode().split(":", 1)[1].strip())
+                                remaining = content_len - len(body)
+                                if remaining > 0:
+                                    body += await reader.readexactly(remaining)
+                                break
+                    except Exception:
+                        pass
+
+                try:
+                    req = json.loads(body.decode()) if body else {}
+                except json.JSONDecodeError:
+                    writer.write(b"HTTP/1.1 400 Bad Request\r\nContent-Type: application/json\r\nContent-Length: 16\r\n\r\n{\"error\":\"bad json\"}")
+                    await writer.drain()
+                    writer.close()
+                    return
+
+                client_id = req.get("client_id")
+                rescue_type = req.get("rescue_type", "shell")
+
+                if not client_id or client_id not in self.rescue_clients:
+                    writer.write(b"HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: 24\r\n\r\n{\"error\":\"client not found\"}")
+                    await writer.drain()
+                    writer.close()
+                    return
+
+                # Trigger rescue on the client
+                port = await self.trigger_rescue(client_id, rescue_type)
+                if port is None:
+                    writer.write(b"HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: 24\r\n\r\n{\"error\":\"trigger failed\"}")
+                    await writer.drain()
+                    writer.close()
+                    return
+
+                response = json.dumps({
+                    "status": "ok",
+                    "client_id": client_id,
+                    "port": port,
+                    "connect_to": f"{self.public_host}:{port}"
+                }).encode()
+                writer.write(f"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {len(response)}\r\n\r\n".encode() + response)
+                await writer.drain()
+                writer.close()
+                return
+
+            # Unknown admin endpoint
+            writer.write(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+            await writer.drain()
+            writer.close()
+        except Exception as e:
+            LOG.exception("Error handling admin API: %s", e)
+            with contextlib.suppress(Exception):
+                writer.close()
+
+    async def trigger_rescue(self, client_id: str, rescue_type: str) -> Optional[int]:
+        """Trigger rescue mode on a client, allocate TCP port, return port number."""
+        if client_id not in self.rescue_clients:
+            return None
+
+        # Allocate a TCP port for this rescue session
+        port = await self.allocate_tcp_port_for_rescue()
+        if port is None:
+            return None
+
+        # Create a synthetic session for the rescue client so we can use it for multiplexing
+        rescue_session = ClientSession(secrets.token_hex(8), self.rescue_clients[client_id][0])
+
+        try:
+            # Set up TCP listener for rescue shell
+            listener = await asyncio.start_server(
+                functools.partial(self.on_rescue_shell_conn, rescue_session, client_id),
+                host=self.bind, port=port)
+        except OSError as e:
+            LOG.warning("Could not bind rescue port %d: %s", port, e)
+            self.used_tcp_ports.discard(port)
+            return None
+
+        self.rescue_ports[client_id] = port
+
+        # Send trigger to the rescue client
+        client_writer, _ = self.rescue_clients[client_id]
+        try:
+            trigger_msg = json.dumps({
+                "type": rescue_type
+            }).encode()
+            await write_frame(client_writer, MSG_ADMIN_CMD, 0, trigger_msg)
+        except Exception as e:
+            LOG.warning("Failed to send rescue trigger to %s: %s", client_id, e)
+            listener.close()
+            await listener.wait_closed()
+            self.rescue_ports.pop(client_id, None)
+            self.used_tcp_ports.discard(port)
+            return None
+
+        return port
+
+    async def on_rescue_shell_conn(self, session: ClientSession, client_id: str,
+                                    reader: asyncio.StreamReader,
+                                    writer: asyncio.StreamWriter) -> None:
+        """Handle incoming connection to rescue shell."""
+        stream_id = session.next_stream_id()
+        session.streams[stream_id] = writer
+        await session.send(MSG_NEW_STREAM, stream_id, json.dumps({"tunnel_id": "rescue_shell"}).encode())
+        await self.pump_public_to_control(session, stream_id, reader)
+
+    async def allocate_tcp_port_for_rescue(self, start_port: int = 20000) -> Optional[int]:
+        """Allocate an unused TCP port for rescue session."""
+        max_attempts = 100
+        for offset in range(max_attempts):
+            port = start_port + offset
+            if port not in self.used_tcp_ports:
+                self.used_tcp_ports.add(port)
+                return port
+        return None
 
 
 # --------------------------------------------------------------------------
@@ -1471,6 +1635,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
                           "a placeholder if --bind is 0.0.0.0)")
     sp.add_argument("--token", default=None,
                      help="shared auth token clients must present (strongly recommended)")
+    sp.add_argument("--admin-token", default=None,
+                     help="Bearer token for admin API endpoints (e.g., /admin/rescue)")
     sp.add_argument("--tcp-port-range", type=parse_port_range, default=(20000, 20100),
                      help="allowed port range LOW-HIGH for tcp tunnels (default: 20000-20100)")
     sp.add_argument("--allow-any-port", action="store_true",
@@ -1735,16 +1901,19 @@ class RescueClient:
         LOG.info("Rescue client ready, waiting for admin trigger...")
         print("Rescue mode active. Waiting for admin to trigger shell access...")
 
+        rescue_streams: dict[int, asyncio.Queue] = {}
+
         # Main loop: wait for control messages
         try:
             while True:
                 msg_type, stream_id, payload = await read_frame(reader)
 
-                if msg_type == MSG_DATA and stream_id == 0:
-                    # Control message
+                if msg_type == MSG_ADMIN_CMD and stream_id == 0:
+                    # Admin trigger command
                     try:
                         ctrl = json.loads(payload.decode())
-                        if ctrl.get("type") == "rescue_shell":
+                        rescue_type = ctrl.get("type", "shell")
+                        if rescue_type == "shell":
                             LOG.info("Admin triggered rescue shell")
                             print("\n=== RESCUE SHELL STARTED ===")
                             await run_rescue_mode(reader, writer)
@@ -1752,10 +1921,100 @@ class RescueClient:
                             LOG.info("Rescue shell exited, returning to wait mode")
                     except json.JSONDecodeError:
                         pass
+
+                elif msg_type == MSG_NEW_STREAM:
+                    # Incoming shell connection via TCP tunnel
+                    try:
+                        metadata = json.loads(payload.decode())
+                        tunnel_id = metadata.get("tunnel_id")
+                        if tunnel_id == "rescue_shell":
+                            q: asyncio.Queue = asyncio.Queue()
+                            rescue_streams[stream_id] = q
+                            asyncio.create_task(self.handle_rescue_stream(
+                                writer, rescue_streams, stream_id, q))
+                    except json.JSONDecodeError:
+                        pass
+
+                elif msg_type == MSG_DATA:
+                    # Data for a rescue stream
+                    q = rescue_streams.get(stream_id)
+                    if q is not None:
+                        q.put_nowait(payload)
+
                 elif msg_type == MSG_CLOSE:
-                    break
+                    q = rescue_streams.pop(stream_id, None)
+                    if q is not None:
+                        q.put_nowait(None)  # Signal to close
+
+                else:
+                    if msg_type == MSG_CLOSE:
+                        break
         finally:
             writer.close()
+
+    async def handle_rescue_stream(self, control_writer: asyncio.StreamWriter,
+                                    rescue_streams: dict[int, asyncio.Queue],
+                                    stream_id: int, inbound: asyncio.Queue) -> None:
+        """Handle a rescue shell stream via TCP tunnel."""
+        try:
+            master, pid = spawn_shell_with_pty()
+            LOG.info("Rescue shell spawned on stream %d (pid=%d)", stream_id, pid)
+
+            loop = asyncio.get_running_loop()
+
+            async def pump_shell_output():
+                """Read from shell PTY, send to relay."""
+                try:
+                    while True:
+                        data = await loop.run_in_executor(None, os.read, master, 8192)
+                        if not data:
+                            break
+                        await write_frame(control_writer, MSG_DATA, stream_id, data)
+                except (OSError, Exception):
+                    pass
+                finally:
+                    await write_frame(control_writer, MSG_CLOSE, stream_id)
+
+            async def pump_to_shell():
+                """Read from relay, write to shell PTY."""
+                try:
+                    while True:
+                        item = await inbound.get()
+                        if item is None:
+                            break
+                        try:
+                            os.write(master, item)
+                        except OSError:
+                            break
+                except Exception:
+                    pass
+
+            read_task = asyncio.create_task(pump_shell_output())
+            write_task = asyncio.create_task(pump_to_shell())
+
+            done, pending = await asyncio.wait(
+                [read_task, write_task],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+
+            for task in pending:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+        except Exception as e:
+            LOG.error("Rescue stream error: %s", e)
+        finally:
+            try:
+                os.close(master)
+            except Exception:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except Exception:
+                pass
+            rescue_streams.pop(stream_id, None)
+            LOG.info("Rescue stream %d ended", stream_id)
 
 
 async def run_rescue_admin(host: str, port: int, token: str, client_hostname: Optional[str] = None) -> None:
