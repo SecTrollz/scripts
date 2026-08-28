@@ -436,9 +436,17 @@ class TunnelServer:
         # Operational features
         self.metrics = Metrics()
         self.rate_limiter = RateLimiter()
-        self.access_logger = AccessLogger(getattr(args, "access_log", None))
+        self.access_logger = AccessLogger(getattr(args, "access_log", None),
+                                         getattr(args, "structured_logs", False))
         self.shutdown_requested = False
         self.identity_seed_hash = getattr(args, "identity_seed_hash", None)
+
+        # IP filtering and session management
+        allow_cidrs = getattr(args, "allow_ips", None)
+        deny_cidrs = getattr(args, "deny_ips", None)
+        self.ip_filter = IPFilter(allow_cidrs, deny_cidrs)
+        session_timeout = getattr(args, "session_timeout", 1800)  # 30 minutes default
+        self.session_timeout = SessionTimeout(session_timeout)
 
     # -- lifecycle ---------------------------------------------------
 
@@ -479,6 +487,9 @@ class TunnelServer:
             for s in servers:
                 stack.push_async_callback(s.wait_closed)
                 stack.callback(s.close)
+            # Add cleanup task for idle sessions
+            cleanup_task = asyncio.create_task(self.cleanup_idle_sessions())
+            stack.callback(cleanup_task.cancel)
             await asyncio.gather(*(s.serve_forever() for s in servers))
 
     # -- control connection -------------------------------------------
@@ -486,11 +497,19 @@ class TunnelServer:
     async def handle_control(self, reader: asyncio.StreamReader,
                               writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
+        peer_ip = peer[0] if peer else "unknown"
         session: Optional[ClientSession] = None
         rescue_hostname: Optional[str] = None
         rescue_admin_id: Optional[str] = None
 
         try:
+            # Check IP filter
+            if not self.ip_filter.is_allowed(peer_ip):
+                await write_frame(writer, MSG_ERROR, 0,
+                                   json.dumps({"error": "connection not allowed"}).encode())
+                LOG.warning("rejected control connection from %s: IP filtered", peer)
+                return
+
             msg_type, _, payload = await read_frame(reader)
             if msg_type != MSG_HELLO:
                 raise ProtocolError("expected HELLO as first message")
@@ -582,6 +601,8 @@ class TunnelServer:
 
             await write_frame(writer, MSG_HELLO_ACK, 0, json.dumps({"tunnels": ack_tunnels}).encode())
             self.sessions[session.id] = session
+            self.session_timeout.touch(session.id)  # Track session activity
+            self.metrics.record_connection()
             LOG.info("client %s connected from %s with %d tunnel(s)",
                       session.id, peer, len(ack_tunnels))
             for t in ack_tunnels:
@@ -605,6 +626,7 @@ class TunnelServer:
         while True:
             msg_type, stream_id, payload = await read_frame(reader)
             session.last_seen = time.monotonic()
+            self.session_timeout.touch(session.id)  # Update session activity timestamp
             if msg_type == MSG_DATA:
                 w = session.streams.get(stream_id)
                 if w is not None:
@@ -667,6 +689,8 @@ class TunnelServer:
         if session is None:
             return
         self.sessions.pop(session.id, None)
+        self.session_timeout.remove(session.id)
+        self.metrics.record_disconnect()
         for info in session.tunnels.values():
             if info.kind == "tcp":
                 if info.listener is not None:
@@ -680,6 +704,25 @@ class TunnelServer:
                 w.close()
         session.streams.clear()
         LOG.info("client %s disconnected, tunnels released", session.id)
+
+    async def cleanup_idle_sessions(self) -> None:
+        """Periodically check for and disconnect idle sessions."""
+        while True:
+            try:
+                await asyncio.sleep(60)  # Check every minute
+                expired = self.session_timeout.get_expired()
+                for sid in expired:
+                    session = self.sessions.get(sid)
+                    if session:
+                        LOG.info("closing idle session %s (timeout)", sid)
+                        with contextlib.suppress(Exception):
+                            session.writer.close()
+                            await session.writer.wait_closed()
+                        await self.cleanup_session(session)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                LOG.exception("error in cleanup_idle_sessions")
 
     # -- tunnel registration -------------------------------------------
 
@@ -1877,6 +1920,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                      help="maximum requests per second per IP (default: 100, 0=unlimited)")
     sp.add_argument("--identity-seed-hash", default=None,
                      help="enable identity-based auth: SHA256(seed) of allowed device (hex)")
+    sp.add_argument("--session-timeout", type=int, default=1800,
+                     help="disconnect idle sessions after N seconds (default: 1800/30 min)")
+    sp.add_argument("--allow-ips", type=lambda s: s.split(","), default=None,
+                     help="allow only these CIDR ranges (comma-separated, e.g. 10.0.0.0/8,192.168.0.0/16)")
+    sp.add_argument("--deny-ips", type=lambda s: s.split(","), default=None,
+                     help="deny these CIDR ranges (comma-separated, overrides allow-ips)")
+    sp.add_argument("--structured-logs", action="store_true",
+                     help="output logs in JSON format for structured log collection")
 
     def add_client_args(p: argparse.ArgumentParser) -> None:
         p.add_argument("local_port", type=int, help="local port to expose")
@@ -3151,10 +3202,86 @@ class RateLimiter:
         return True
 
 
+class IPFilter:
+    """IP-based access control using CIDR notation."""
+    def __init__(self, allow_cidrs: Optional[list[str]] = None, deny_cidrs: Optional[list[str]] = None):
+        self.allow_list = []
+        self.deny_list = []
+
+        if allow_cidrs:
+            for cidr in allow_cidrs:
+                try:
+                    self.allow_list.append(ipaddress.ip_network(cidr, strict=False))
+                except ValueError as e:
+                    LOG.warning("Invalid allow CIDR %s: %s", cidr, e)
+
+        if deny_cidrs:
+            for cidr in deny_cidrs:
+                try:
+                    self.deny_list.append(ipaddress.ip_network(cidr, strict=False))
+                except ValueError as e:
+                    LOG.warning("Invalid deny CIDR %s: %s", cidr, e)
+
+    def is_allowed(self, ip_str: str) -> bool:
+        """Check if IP is allowed (deny takes precedence over allow)."""
+        try:
+            ip = ipaddress.ip_address(ip_str)
+        except ValueError:
+            return False
+
+        # Deny list takes precedence
+        for deny_net in self.deny_list:
+            if ip in deny_net:
+                return False
+
+        # If allow list is empty, allow all (unless denied)
+        if not self.allow_list:
+            return True
+
+        # Check allow list
+        for allow_net in self.allow_list:
+            if ip in allow_net:
+                return True
+
+        return False
+
+
+class SessionTimeout:
+    """Track session activity and expire idle connections."""
+    def __init__(self, timeout_seconds: float = 1800):
+        self.timeout_seconds = timeout_seconds
+        self.sessions: dict[str, float] = {}  # session_id -> last_activity_time
+
+    def touch(self, session_id: str) -> None:
+        """Update last activity timestamp for a session."""
+        self.sessions[session_id] = time.time()
+
+    def is_expired(self, session_id: str) -> bool:
+        """Check if session has been idle too long."""
+        if session_id not in self.sessions:
+            return True
+        elapsed = time.time() - self.sessions[session_id]
+        return elapsed > self.timeout_seconds
+
+    def remove(self, session_id: str) -> None:
+        """Remove session from tracking."""
+        self.sessions.pop(session_id, None)
+
+    def get_expired(self) -> list[str]:
+        """Get all expired session IDs."""
+        now = time.time()
+        expired = []
+        for sid, last_activity in list(self.sessions.items()):
+            if now - last_activity > self.timeout_seconds:
+                expired.append(sid)
+        return expired
+
+
 class AccessLogger:
     """Log all tunnel access for auditing."""
-    def __init__(self, log_file: Optional[str] = None):
+    def __init__(self, log_file: Optional[str] = None, structured: bool = False):
         self.log_file = log_file
+        self.structured = structured
         if log_file:
             self.file = open(log_file, "a", buffering=1)
         else:
@@ -3162,8 +3289,23 @@ class AccessLogger:
 
     def log_tunnel(self, client_ip: str, tunnel_type: str, tunnel_id: str, status: str, details: str = ""):
         """Log tunnel event."""
-        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
-        message = f"{timestamp} | {client_ip:15} | {tunnel_type:10} | {tunnel_id:20} | {status:10} | {details}"
+        if self.structured:
+            # Structured JSON log format
+            log_entry = {
+                "timestamp": time.time(),
+                "timestamp_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "client_ip": client_ip,
+                "tunnel_type": tunnel_type,
+                "tunnel_id": tunnel_id,
+                "status": status,
+                "details": details
+            }
+            message = json.dumps(log_entry)
+        else:
+            # Human-readable format
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            message = f"{timestamp} | {client_ip:15} | {tunnel_type:10} | {tunnel_id:20} | {status:10} | {details}"
+
         LOG.info(message)
         if self.file:
             self.file.write(message + "\n")
