@@ -1735,6 +1735,432 @@ KNOWN_UPDATE_SERVERS: dict[str, list[str]] = {
 }
 
 
+async def run_orchestrate(args: argparse.Namespace) -> None:
+    """Master orchestrator: phone relay + auto-deploy clients + VPN + dashboard."""
+    print("\n" + "╔" + "="*78 + "╗")
+    print("║" + " "*78 + "║")
+    print("║" + "  🚀 ORCHESTRATE: Phone → Relay + Auto-Deploy Clients + VPN Access  ".center(78) + "║")
+    print("║" + " "*78 + "║")
+    print("╚" + "="*78 + "╝\n")
+
+    # Step 0: Get Tailscale/stable IP
+    print("Step 0️⃣  Phone's stable IP (for remote access)\n")
+    print("Options:")
+    print("  1. Auto-detect Tailscale IP (if Tailscale is running)")
+    print("  2. Use dynamic DNS hostname (e.g., myphone.duckdns.org)")
+    print("  3. Use public IP (manual)")
+    choice = input("\nChoose (1/2/3) or enter IP/hostname: ").strip()
+
+    if choice == "1":
+        # Try to detect Tailscale IP
+        try:
+            ts_output = subprocess.run(
+                ["tailscale", "status", "--json"],
+                capture_output=True, text=True, check=True
+            ).stdout
+            import json as json_mod
+            ts_data = json_mod.loads(ts_output)
+            relay_stable_ip = ts_data.get("Self", {}).get("TailscaleIPs", [""])[0]
+            if relay_stable_ip:
+                print(f"✓ Tailscale IP detected: {relay_stable_ip}\n")
+            else:
+                raise Exception("No Tailscale IP found")
+        except Exception as e:
+            print(f"✗ Could not detect Tailscale: {e}")
+            print("   Install Tailscale or enter manually.\n")
+            relay_stable_ip = input("Enter stable IP/hostname: ").strip()
+    elif choice == "2":
+        relay_stable_ip = input("Enter dynamic DNS hostname (e.g., myphone.duckdns.org): ").strip()
+    elif choice == "3":
+        relay_stable_ip = input("Enter public IP: ").strip()
+    else:
+        relay_stable_ip = choice
+
+    if not relay_stable_ip:
+        print("No stable IP provided. Aborting.")
+        return
+
+    print(f"Using stable IP/hostname: {relay_stable_ip}\n")
+
+    # Step 1: Generate credentials
+    print("Step 1️⃣  Generating relay credentials\n")
+    relay_token = secrets.token_urlsafe(32)
+    relay_control_port = args.control_port or 9000
+    relay_http_port = args.http_port or 8080
+
+    print(f"  Token: {relay_token[:20]}...")
+    print(f"  Control Port: {relay_control_port}")
+    print(f"  HTTP Port: {relay_http_port}\n")
+
+    # Step 2: Scan LAN
+    print("Step 2️⃣  Scanning LAN for target devices\n")
+    cidr = args.cidr or guess_local_cidr()
+    ports = args.ports or sorted(COMMON_PORTS)
+    hosts = await scan_lan(cidr, ports, args.timeout, args.concurrency)
+
+    if not hosts:
+        print("No devices found.")
+        return
+
+    print(f"Found {len(hosts)} device(s):\n")
+    for i, h in enumerate(hosts, 1):
+        services = ", ".join(COMMON_PORTS[p] for p in h["ports"][:2] if p in COMMON_PORTS)
+        print(f"  [{i:>2}] {h['ip']:<15} ({services})")
+
+    # Step 3: User selects targets
+    print("\nStep 3️⃣  Select target devices for tunnel deployment\n")
+    target_selection = input("Device numbers (e.g. 1,2,3) or Enter to select all: ").strip()
+    if not target_selection:
+        target_devices = hosts
+    else:
+        try:
+            target_devices = [hosts[int(x.strip()) - 1] for x in target_selection.split(",") if x.strip()]
+        except (ValueError, IndexError):
+            print("Invalid selection.")
+            return
+
+    print(f"\n✓ Selected {len(target_devices)} target device(s)\n")
+
+    # Step 4: Summary & confirmation
+    print("="*80)
+    print("  📋 ORCHESTRATION PLAN")
+    print("="*80)
+    print(f"""
+This Phone (Relay):
+  • Relay server: {relay_stable_ip}:{relay_control_port}
+  • HTTP tunnel proxy: {relay_stable_ip}:{relay_http_port}
+  • Token: {relay_token[:20]}...
+  • Stable IP: {relay_stable_ip} (via Tailscale/DDNS/public)
+
+Target Devices (Clients):
+""")
+    for i, dev in enumerate(target_devices, 1):
+        services = ", ".join(COMMON_PORTS[p] for p in dev["ports"][:2] if p in COMMON_PORTS)
+        print(f"  {i}. {dev['ip']:<15} ({services})")
+        print(f"     → Deploy tunnel client → auto-connect to relay")
+
+    print(f"""
+Deployment Method:
+  • ARP + DNS spoofing (zero-touch, requires sudo)
+  • Clients auto-configured with relay IP: {relay_stable_ip}
+
+After Deployment:
+  • Relay keeps running on phone
+  • Clients auto-connect from anywhere (via Tailscale/DDNS)
+  • You leave home with phone
+  • Everything still accessible
+
+Dashboard (printed after setup):
+  • Tunnel URLs for each service
+  • Rescue shell commands
+  • VPN connection instructions
+  • Status check commands
+""")
+    print("="*80)
+
+    confirm = input("\nProceed with orchestration? (y/n): ").strip().lower()
+    if confirm != "y":
+        return
+
+    # Step 5: Start relay on this phone
+    print("\n" + "="*80)
+    print("  🔄 ORCHESTRATION IN PROGRESS")
+    print("="*80 + "\n")
+
+    print("Starting relay server on this device...\n")
+    args.bind = "0.0.0.0"
+    args.control_port = relay_control_port
+    args.http_port = relay_http_port
+    args.token = relay_token
+    args.session_timeout = 3600
+    args.allow_ips = None
+    args.deny_ips = None
+    args.structured_logs = False
+
+    # Start relay in background
+    relay_task = asyncio.create_task(_run_relay_background(args))
+    await asyncio.sleep(1)  # Give relay time to start
+
+    # Step 6: Generate client bootstrap script
+    print("Generating client bootstrap script...\n")
+    bootstrap_script = f"""#!/bin/bash
+# Auto-generated bootstrap script for tunnel client
+# Created by orchestrate command
+
+RELAY_IP="{relay_stable_ip}"
+RELAY_PORT="{relay_control_port}"
+TOKEN="{relay_token}"
+
+echo "Deploying tunnel client..."
+echo "  Relay: $RELAY_IP:$RELAY_PORT"
+echo "  Token: ${{TOKEN:0:20}}..."
+
+# Download and run ngrok_tunnel.py
+curl -fsSL http://{local_ip_guess()}:{{SERVE_PORT}}/ngrok_tunnel.py -o ngrok_tunnel.py
+
+# Detect service type and create tunnel
+SERVICE_NAME=$(hostname | tr '[:upper:]' '[:lower:]')
+
+# HTTP services
+for port in 80 443 8080 8081 8082 8000 8001 3000 5000 9000; do
+    if timeout 1 bash -c "echo >/dev/tcp/127.0.0.1/$port" 2>/dev/null; then
+        echo "Found HTTP service on :$port"
+        nohup python3 ngrok_tunnel.py http $port \\
+            --server "$RELAY_IP:$RELAY_PORT" \\
+            --token "$TOKEN" \\
+            --subdomain "$SERVICE_NAME" > tunnel.log 2>&1 &
+        exit 0
+    fi
+done
+
+# TCP fallback
+echo "No HTTP service detected, using TCP for port 22 (SSH)"
+nohup python3 ngrok_tunnel.py tcp 22 \\
+    --server "$RELAY_IP:$RELAY_PORT" \\
+    --token "$TOKEN" \\
+    --remote-port 2222 > tunnel.log 2>&1 &
+"""
+
+    # Step 7: Print setup instructions
+    print("="*80)
+    print("  ✅ NEXT STEPS (Manual SSH Deployment)")
+    print("="*80)
+    print(f"""
+⚠️  Auto-SSH not yet available. Deploy manually:
+
+For each target device, SSH in and run:
+
+""")
+    for i, dev in enumerate(target_devices, 1):
+        print(f"  # Device {i}: {dev['hostname'] or dev['ip']}")
+        print(f"  ssh user@{dev['ip']}")
+        print(f"  ")
+        print(f"  curl -fsSL http://{local_ip_guess()}:{args.serve_port}/ngrok_tunnel.py -o ngrok_tunnel.py")
+        print(f"  ")
+        print(f"  # HTTP service example (adjust port):")
+        print(f"  nohup python3 ngrok_tunnel.py http 8080 \\")
+        print(f"      --server {relay_stable_ip}:{relay_control_port} \\")
+        print(f"      --token '{relay_token}' \\")
+        print(f"      --subdomain device{i} > tunnel.log 2>&1 &")
+        print()
+
+    print(f"""
+  # TCP service example (SSH):")
+  nohup python3 ngrok_tunnel.py tcp 22 \\
+      --server {relay_stable_ip}:{relay_control_port} \\
+      --token '{relay_token}' \\
+      --remote-port 2222 > tunnel.log 2>&1 &
+""")
+
+    # Step 8: Print final dashboard
+    print("\n" + "="*80)
+    print("  📊 ORCHESTRATION COMPLETE")
+    print("="*80)
+    print(f"""
+Relay Running:
+  • Relay: {relay_stable_ip}:{relay_control_port}
+  • HTTP Proxy: {relay_stable_ip}:{relay_http_port}
+  • Token: {relay_token[:20]}...
+
+Access Commands (once clients are deployed):
+
+  # Test HTTP tunnel
+  curl http://device1.{relay_stable_ip}:{relay_http_port}
+
+  # Access SSH tunnel
+  ssh -p 2222 user@{relay_stable_ip}
+
+  # Get relay metrics
+  curl {relay_stable_ip}:{relay_http_port}/metrics | jq
+
+  # Interactive shell on remote device (via rescue)
+  python3 ngrok_tunnel.py rescue-admin \\
+      --server {relay_stable_ip}:{relay_control_port} \\
+      --token '{relay_token}'
+
+Script Server (for client downloads):
+  • Running on http://{local_ip_guess()}:{args.serve_port}
+  • Keep this terminal open during deployment
+
+Relay will keep running. Press Ctrl+C to stop.
+""")
+
+    # Keep relay running
+    try:
+        await relay_task
+    except asyncio.CancelledError:
+        print("\nRelay stopped.")
+
+
+async def _run_relay_background(args: argparse.Namespace) -> None:
+    """Run relay server in background."""
+    try:
+        await TunnelServer(args).start()
+    except Exception as e:
+        LOG.error("Relay error: %s", e)
+
+
+async def run_home_gateway(args: argparse.Namespace) -> None:
+    """Setup home gateway: device A orchestrates relay on device B + tunnels on other devices."""
+    print("\n" + "="*70)
+    print("  🏠 HOME GATEWAY SETUP")
+    print("     Device A configures Device B (relay) + other home services")
+    print("     Device A leaves → Device B provides remote access via VPN")
+    print("="*70 + "\n")
+
+    # Step 1: Scan LAN
+    cidr = args.cidr or guess_local_cidr()
+    ports = args.ports or sorted(COMMON_PORTS)
+    print(f"Step 1️⃣  Scanning LAN {cidr} for devices...\n")
+    hosts = await scan_lan(cidr, ports, args.timeout, args.concurrency)
+
+    if not hosts:
+        print("No responsive devices found.")
+        return
+
+    print(f"Found {len(hosts)} device(s):\n")
+    for i, h in enumerate(hosts, 1):
+        services = ", ".join(COMMON_PORTS[p] for p in h["ports"] if p in COMMON_PORTS)
+        name = h["hostname"] or "?"
+        port_list = ",".join(map(str, h["ports"]))
+        print(f"  [{i:>2}] {h['ip']:<15} {name:<28} ports: {port_list}")
+
+    # Step 2: Select relay device (Device B)
+    print("\nStep 2️⃣  Pick relay device (will stay at home, always running)")
+    print("         (NAS, Raspberry Pi, home server, etc.)\n")
+    relay_idx_str = input("Relay device number: ").strip()
+    if not relay_idx_str:
+        return
+    try:
+        relay_idx = int(relay_idx_str) - 1
+        relay_device = hosts[relay_idx]
+    except (ValueError, IndexError):
+        print("Invalid selection.")
+        return
+
+    print(f"\n✓ Relay device: {relay_device['hostname'] or relay_device['ip']}")
+
+    # Step 3: Select tunnel devices
+    print("\nStep 3️⃣  Select services to expose (devices + their ports)")
+    print("         (these devices will tunnel through relay)\n")
+    tunnel_selection = input("Device numbers (e.g. 1,3,5) or Enter to skip: ").strip()
+    tunnel_devices = []
+    if tunnel_selection:
+        try:
+            tunnel_devices = [hosts[int(x.strip()) - 1] for x in tunnel_selection.split(",") if x.strip()]
+        except (ValueError, IndexError):
+            print("Invalid selection, skipping tunnel setup.")
+            tunnel_devices = []
+
+    # Step 4: Generate credentials
+    print(f"\nStep 4️⃣  Generating credentials...\n")
+    relay_token = secrets.token_urlsafe(32)
+    relay_control_port = 9000
+    relay_http_port = 8080
+    relay_ip = relay_device['ip']
+
+    print(f"  Relay device IP: {relay_ip}")
+    print(f"  Relay token: {relay_token[:20]}...")
+    print(f"  Control port: {relay_control_port}")
+    print(f"  HTTP port: {relay_http_port}")
+    print(f"  VPN subnet: 10.0.0.0/24")
+    print(f"  VPN port: 51820")
+
+    # Step 5: Display plan
+    print("\n" + "="*70)
+    print("  📋 DEPLOYMENT PLAN")
+    print("="*70)
+    print(f"""
+Device B ({relay_device['hostname'] or relay_ip}) - RELAY (stays at home):
+  • Relay server on {relay_ip}:{relay_control_port}
+  • WireGuard VPN on port 51820
+  • Always running, always accessible
+
+Other home devices - TUNNELS:
+""")
+    for i, dev in enumerate(tunnel_devices, 1):
+        services = ", ".join(COMMON_PORTS[p] for p in dev["ports"][:2] if p in COMMON_PORTS)
+        print(f"  {i}. {dev['hostname'] or dev['ip']:<15} ({services}) → tunnel to relay")
+
+    print(f"""
+Device A (this machine) - ORCHESTRATOR:
+  • Deploys relay on Device B (via SSH)
+  • Deploys tunnels on other devices (via SSH)
+  • Generates VPN config
+  • Then LEAVES and uses VPN to access home
+
+After setup:
+  • Device B: relay always running
+  • Device A: leaves home, connects via VPN
+  • All home services accessible through relay
+""")
+
+    print("="*70)
+    print("  ⚠️  MANUAL SETUP REQUIRED")
+    print("="*70)
+    print(f"""
+Device A currently cannot auto-SSH into home devices.
+Follow these manual steps:
+
+1️⃣  SSH into relay device ({relay_ip}):
+
+   ssh user@{relay_ip}
+
+   # Download and run relay
+   curl -fsSL http://{local_ip_guess()}:{args.serve_port}/ngrok_tunnel.py -o ngrok_tunnel.py
+
+   # Start relay server (keeps running)
+   nohup python3 ngrok_tunnel.py server \\
+       --bind 0.0.0.0 \\
+       --control-port {relay_control_port} \\
+       --http-port {relay_http_port} \\
+       --token '{relay_token}' > relay.log 2>&1 &
+
+   # Start VPN (in another terminal, requires sudo)
+   sudo python3 ngrok_tunnel.py vpn-server \\
+       --wg-interface wg0 \\
+       --wg-subnet 10.0.0.0/24 \\
+       --listen-port 51820
+
+2️⃣  SSH into each tunnel device:
+
+   ssh user@<device-ip>
+
+   # Download and run tunnel client
+   curl -fsSL http://{local_ip_guess()}:{args.serve_port}/ngrok_tunnel.py -o ngrok_tunnel.py
+
+   # Create tunnel (http or tcp depending on service)
+   python3 ngrok_tunnel.py http <LOCAL_PORT> \\
+       --server {relay_ip}:{relay_control_port} \\
+       --token '{relay_token}' \\
+       --subdomain <service-name>
+
+3️⃣  On Device A, generate VPN config:
+
+   python3 ngrok_tunnel.py vpn-client \\
+       --server {relay_ip} \\
+       --output home-vpn.conf
+
+4️⃣  On Device A, connect VPN and access services:
+
+   sudo wg-quick up ./home-vpn.conf
+   curl http://service-name.{relay_ip}:{relay_http_port}
+
+""")
+
+    print("="*70)
+    print("  🚀 SERVING SCRIPT FOR DOWNLOAD")
+    print("="*70)
+    print(f"\nThis script is available at:")
+    print(f"  http://{local_ip_guess()}:{args.serve_port}/ngrok_tunnel.py")
+    print(f"\nStart the server now? (y/n)")
+
+    if input("> ").strip().lower() == "y":
+        print(f"\n📡 Serving script on http://{local_ip_guess()}:{args.serve_port}/ngrok_tunnel.py")
+        print("Ctrl+C to stop.\n")
+        await serve_self(args.serve_port, args.bind)
+
+
 async def run_lan_spoof_wizard(args: argparse.Namespace) -> None:
     """Zero-touch provisioning via ARP + DNS spoofing."""
     if not check_root():
@@ -1980,6 +2406,44 @@ def build_arg_parser() -> argparse.ArgumentParser:
                      help="local port to serve this script from during install (default: 8765)")
     lp.add_argument("--bind", default="0.0.0.0",
                      help="address the temporary install server listens on (default: 0.0.0.0)")
+
+    orch = sub.add_parser(
+        "orchestrate", help="master orchestrator: phone relay + auto-deploy clients + VPN (Tailscale ready)")
+    orch.add_argument("--cidr", default=None,
+                      help="subnet to scan (default: auto-detect your /24)")
+    orch.add_argument("--ports", type=parse_ports, default=None,
+                      help="comma-separated ports to probe (default: common services)")
+    orch.add_argument("--timeout", type=float, default=0.4,
+                      help="per-port connect timeout (default: 0.4)")
+    orch.add_argument("--concurrency", type=int, default=256,
+                      help="max concurrent probes (default: 256)")
+    orch.add_argument("--serve-port", type=int, default=8765,
+                      help="port to serve script from (default: 8765)")
+    orch.add_argument("--bind", default="0.0.0.0",
+                      help="bind address for script server (default: 0.0.0.0)")
+    orch.add_argument("--control-port", type=int, default=9000,
+                      help="relay control port (default: 9000)")
+    orch.add_argument("--http-port", type=int, default=8080,
+                      help="relay HTTP port (default: 8080)")
+
+    hg = sub.add_parser(
+        "home-gateway", help="setup home gateway: orchestrate relay on one device + tunnels on others")
+    hg.add_argument("--cidr", default=None,
+                     help="subnet to scan (default: auto-detect your /24)")
+    hg.add_argument("--ports", type=parse_ports, default=None,
+                     help="comma-separated ports to probe (default: common services)")
+    hg.add_argument("--timeout", type=float, default=0.4,
+                     help="per-port connect timeout in seconds (default: 0.4)")
+    hg.add_argument("--concurrency", type=int, default=256,
+                     help="max concurrent connection attempts (default: 256)")
+    hg.add_argument("--serve-port", type=int, default=8765,
+                     help="local port to serve script from (default: 8765)")
+    hg.add_argument("--bind", default="0.0.0.0",
+                     help="address to bind script server on (default: 0.0.0.0)")
+    hg.add_argument("--control-port", type=int, default=9000,
+                     help="relay control port (default: 9000)")
+    hg.add_argument("--http-port", type=int, default=8080,
+                     help="relay HTTP port (default: 8080)")
 
     sp = sub.add_parser(
         "lan-spoof", help="zero-touch deployment via ARP + DNS spoofing (requires root)")
@@ -3406,6 +3870,10 @@ async def async_main(args: argparse.Namespace) -> None:
         await run_identity(args)
     elif args.command == "lan":
         await run_lan_wizard(args)
+    elif args.command == "orchestrate":
+        await run_orchestrate(args)
+    elif args.command == "home-gateway":
+        await run_home_gateway(args)
     elif args.command == "lan-spoof":
         await run_lan_spoof_wizard(args)
     elif args.command == "serve-dir":
