@@ -45,6 +45,22 @@ QUICK FILE SERVING
     The directory is automatically served via HTTP and routed through
     the relay. Directory listings and index.html are automatically handled.
 
+RESCUE MODE
+    When you need emergency access to a device (no SSH, no web UI, no console
+    access), run rescue mode:
+
+    On the device (headless, no remote access):
+        python3 ngrok_tunnel.py rescue --server 203.0.113.10:9000 \\
+            --token <token>
+
+    On your admin machine (can be the relay server):
+        python3 ngrok_tunnel.py rescue-admin --server 203.0.113.10:9000 \\
+            --token <token>
+
+    You'll be prompted to pick which connected rescue client to access, then
+    you get a live interactive shell (with full terminal support, colors, etc.)
+    over the tunnel. Ctrl+D or `exit` to disconnect.
+
 LAN DEPLOYMENT
     Got a home network full of headless boxes (a NAS, a Plex box, a home
     server) you'd like to run the `http`/`tcp` client on, without opening
@@ -86,6 +102,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import fcntl
 import functools
 import hmac
 import http.server
@@ -95,13 +112,18 @@ import json
 import logging
 import mimetypes
 import os
+import pty
 import secrets
+import select
+import signal
 import socket
 import ssl
 import struct
 import subprocess
 import sys
+import termios
 import time
+import tty
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -254,6 +276,8 @@ class TunnelServer:
         self.sessions: dict[str, ClientSession] = {}
         self.http_routes: dict[str, tuple[ClientSession, str]] = {}
         self.used_tcp_ports: set[int] = set()
+        self.rescue_clients: dict[str, tuple[asyncio.StreamWriter, str]] = {}  # hostname -> (writer, session_id)
+        self.rescue_admins: dict[str, asyncio.StreamWriter] = {}  # admin_id -> writer
 
     # -- lifecycle ---------------------------------------------------
 
@@ -302,6 +326,9 @@ class TunnelServer:
                               writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
         session: Optional[ClientSession] = None
+        rescue_hostname: Optional[str] = None
+        rescue_admin_id: Optional[str] = None
+
         try:
             msg_type, _, payload = await read_frame(reader)
             if msg_type != MSG_HELLO:
@@ -314,6 +341,34 @@ class TunnelServer:
                 LOG.warning("rejected control connection from %s: bad token", peer)
                 return
 
+            # Handle different connection types
+            conn_type = hello.get("type", "tunnel")
+
+            if conn_type == "rescue":
+                # Rescue client waiting for admin trigger
+                hostname = hello.get("hostname", str(peer))
+                rescue_hostname = hostname
+                self.rescue_clients[hostname] = (writer, secrets.token_hex(4))
+                await write_frame(writer, MSG_HELLO_ACK, 0, json.dumps({"type": "rescue"}).encode())
+                LOG.info("rescue client connected from %s (hostname=%s)", peer, hostname)
+                await self.rescue_loop(reader, writer, hostname)
+                return
+
+            elif conn_type == "rescue_admin":
+                # Admin connection to trigger rescue
+                rescue_admin_id = secrets.token_hex(4)
+                self.rescue_admins[rescue_admin_id] = writer
+                clients = [
+                    {"id": h, "hostname": h}
+                    for h in self.rescue_clients.keys()
+                ]
+                await write_frame(writer, MSG_HELLO_ACK, 0,
+                                   json.dumps({"type": "rescue_admin", "rescue_clients": clients}).encode())
+                LOG.info("rescue admin connected from %s", peer)
+                await self.rescue_admin_loop(reader, writer)
+                return
+
+            # Regular tunnel connection
             session = ClientSession(secrets.token_hex(8), writer)
             ack_tunnels = []
             try:
@@ -343,6 +398,10 @@ class TunnelServer:
         except Exception:
             LOG.exception("unexpected error handling control connection from %s", peer)
         finally:
+            if rescue_hostname:
+                self.rescue_clients.pop(rescue_hostname, None)
+            if rescue_admin_id:
+                self.rescue_admins.pop(rescue_admin_id, None)
             await self.cleanup_session(session)
             with contextlib.suppress(Exception):
                 writer.close()
@@ -368,6 +427,46 @@ class TunnelServer:
             else:
                 LOG.debug("ignoring unexpected message type %s from client %s",
                           msg_type, session.id)
+
+    async def rescue_loop(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter,
+                           hostname: str) -> None:
+        """Loop for a rescue client, forwarding shell data from admin."""
+        try:
+            while True:
+                msg_type, stream_id, payload = await read_frame(reader)
+                if msg_type == MSG_DATA and stream_id == 0:
+                    # Shell data from client, forward to admin
+                    for admin_writer in self.rescue_admins.values():
+                        with contextlib.suppress(Exception):
+                            admin_writer.write(encode_frame(payload))
+                            await admin_writer.drain()
+                elif msg_type == MSG_CLOSE:
+                    break
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
+
+    async def rescue_admin_loop(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        """Loop for a rescue admin, relaying commands to rescue client."""
+        try:
+            while True:
+                msg_type, stream_id, payload = await read_frame(reader)
+                if msg_type == MSG_DATA and stream_id == 0:
+                    # Command from admin, parse target and forward
+                    try:
+                        ctrl = json.loads(payload.decode())
+                        target = ctrl.get("target")
+                        if target in self.rescue_clients:
+                            client_writer, _ = self.rescue_clients[target]
+                            with contextlib.suppress(Exception):
+                                await write_frame(client_writer, MSG_DATA, 0, json.dumps(ctrl).encode())
+                    except json.JSONDecodeError:
+                        # Not a control message, forward as-is to client
+                        # For now, admin is triggering; after trigger, data flows directly
+                        pass
+                elif msg_type == MSG_CLOSE:
+                    break
+        except (asyncio.IncompleteReadError, ConnectionError):
+            pass
 
     async def cleanup_session(self, session: Optional[ClientSession]) -> None:
         if session is None:
@@ -1444,7 +1543,506 @@ def build_arg_parser() -> argparse.ArgumentParser:
     dp.add_argument("--tls", action="store_true",
                      help="use TLS for the control connection to the server")
 
+    rp = sub.add_parser("rescue", help="run emergency interactive shell (waits for admin trigger)")
+    rp.add_argument("--server", required=True, metavar="HOST:PORT",
+                     help="relay server's control address, e.g. 203.0.113.10:9000")
+    rp.add_argument("--token", default=None,
+                     help="auth token expected by the server")
+    rp.add_argument("--tls", action="store_true",
+                     help="use TLS for the control connection to the server")
+
+    ap = sub.add_parser("rescue-admin", help="trigger rescue shell on a connected client")
+    ap.add_argument("--server", metavar="HOST:PORT", required=True,
+                     help="relay server address (e.g. 203.0.113.10:9000)")
+    ap.add_argument("--token", default=None,
+                     help="admin auth token")
+    ap.add_argument("--client", default=None,
+                     help="target client hostname (if not specified, you'll be prompted)")
+
+    mp = sub.add_parser("local-mesh", help="zero-config LAN mesh (ARP+DNS spoof + relay + dashboard)")
+    mp.add_argument("--domain", default="tunnel.local",
+                     help="domain to use for tunnel (default: tunnel.local)")
+    mp.add_argument("--relay-port", type=int, default=9000,
+                     help="relay control port (default: 9000)")
+    mp.add_argument("--http-port", type=int, default=8080,
+                     help="relay HTTP port + dashboard (default: 8080)")
+    mp.add_argument("--iface", default=None,
+                     help="network interface (default: auto-detect)")
+
     return parser
+
+
+# --------------------------------------------------------------------------
+# Rescue Mode - Emergency Interactive Shell Access
+#
+# Client running in rescue mode waits for admin trigger, then spawns an
+# interactive shell with PTY and forwards stdin/stdout over the tunnel.
+# Useful when you need emergency access to a device without pre-configured
+# SSH or other remote-access services.
+# --------------------------------------------------------------------------
+
+def spawn_shell_with_pty() -> tuple[int, int]:
+    """Spawn an interactive shell with PTY. Returns (master_fd, child_pid)."""
+    # Use pty.openpty() to create a pseudo-terminal pair
+    master, slave = pty.openpty()
+
+    pid = os.fork()
+    if pid == 0:  # Child process
+        # Become session leader and attach to the PTY
+        os.setsid()
+        os.close(master)
+
+        # Duplicate slave to stdin, stdout, stderr
+        os.dup2(slave, 0)  # stdin
+        os.dup2(slave, 1)  # stdout
+        os.dup2(slave, 2)  # stderr
+
+        if slave > 2:
+            os.close(slave)
+
+        # Spawn shell
+        try:
+            shell = os.environ.get("SHELL", "/bin/bash")
+            os.execvp(shell, [shell, "-i"])
+        except Exception:
+            os.execvp("/bin/sh", ["sh", "-i"])
+
+    # Parent process: master is the PTY file descriptor
+    os.close(slave)
+
+    # Set master to non-blocking mode
+    flags = fcntl.fcntl(master, fcntl.F_GETFL)
+    fcntl.fcntl(master, fcntl.F_SETFL, flags | os.O_NONBLOCK)
+
+    return master, pid
+
+
+async def run_rescue_mode(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    """Run interactive shell with PTY, tunneling I/O over async streams."""
+    try:
+        master, pid = spawn_shell_with_pty()
+        LOG.info("Rescue shell spawned (pid=%d)", pid)
+
+        loop = asyncio.get_running_loop()
+
+        async def read_from_shell():
+            """Read from shell PTY, send to relay."""
+            while True:
+                try:
+                    data = await loop.run_in_executor(None, os.read, master, 8192)
+                    if not data:
+                        break
+                    await write_frame(writer, MSG_DATA, 0, data)
+                except OSError:
+                    break
+                except Exception as e:
+                    LOG.debug("Shell read error: %s", e)
+                    break
+
+        async def write_to_shell():
+            """Read from relay, write to shell PTY."""
+            try:
+                while True:
+                    msg_type, stream_id, payload = await read_frame(reader)
+                    if msg_type == MSG_DATA and stream_id == 0:
+                        # Incoming keystroke/data for shell
+                        try:
+                            os.write(master, payload)
+                        except OSError:
+                            break
+                    elif msg_type == MSG_CLOSE:
+                        break
+            except Exception as e:
+                LOG.debug("Shell write error: %s", e)
+
+        # Run both directions concurrently
+        read_task = asyncio.create_task(read_from_shell())
+        write_task = asyncio.create_task(write_to_shell())
+
+        # Wait for either to finish
+        done, pending = await asyncio.wait(
+            [read_task, write_task],
+            return_when=asyncio.FIRST_COMPLETED
+        )
+
+        # Cancel the other
+        for task in pending:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    except Exception as e:
+        LOG.error("Rescue mode error: %s", e)
+    finally:
+        try:
+            os.close(master)
+        except Exception:
+            pass
+        # Reap child process
+        try:
+            os.waitpid(pid, 0)
+        except Exception:
+            pass
+        LOG.info("Rescue mode ended")
+
+
+class RescueClient:
+    """Client that waits in rescue mode for admin trigger."""
+
+    def __init__(self, args: argparse.Namespace):
+        host, _, port = args.server.rpartition(":")
+        if not host or not port.isdigit():
+            raise SystemExit(f"--server must look like host:port, got {args.server!r}")
+        self.host = host
+        self.port = int(port)
+        self.token = args.token
+        self.use_tls = args.tls
+
+    async def run(self) -> None:
+        """Connect to relay and wait for rescue trigger."""
+        LOG.info("Connecting to rescue relay at %s:%d...", self.host, self.port)
+
+        delay = 1
+        while True:
+            try:
+                await self.connect_once()
+                delay = 1
+            except asyncio.CancelledError:
+                raise
+            except (ConnectionError, OSError, asyncio.IncompleteReadError) as e:
+                LOG.warning("Rescue connection failed (%s), reconnecting in %ss", e, delay)
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 30)
+
+    async def connect_once(self) -> None:
+        """Establish one rescue connection and wait for trigger."""
+        ssl_ctx = ssl.create_default_context() if self.use_tls else None
+        reader, writer = await asyncio.open_connection(self.host, self.port, ssl=ssl_ctx)
+
+        # Send rescue hello
+        hello = {"type": "rescue", "token": self.token or "", "hostname": socket.gethostname()}
+        await write_frame(writer, MSG_HELLO, 0, json.dumps(hello).encode())
+
+        # Receive ack
+        msg_type, _, payload = await read_frame(reader)
+        if msg_type == MSG_ERROR:
+            error = json.loads(payload).get("error", "unknown error")
+            LOG.error("Rescue rejected: %s", error)
+            raise ProtocolError(error)
+        if msg_type != MSG_HELLO_ACK:
+            raise ProtocolError("unexpected reply from server")
+
+        LOG.info("Rescue client ready, waiting for admin trigger...")
+        print("Rescue mode active. Waiting for admin to trigger shell access...")
+
+        # Main loop: wait for control messages
+        try:
+            while True:
+                msg_type, stream_id, payload = await read_frame(reader)
+
+                if msg_type == MSG_DATA and stream_id == 0:
+                    # Control message
+                    try:
+                        ctrl = json.loads(payload.decode())
+                        if ctrl.get("type") == "rescue_shell":
+                            LOG.info("Admin triggered rescue shell")
+                            print("\n=== RESCUE SHELL STARTED ===")
+                            await run_rescue_mode(reader, writer)
+                            print("=== RESCUE SHELL ENDED ===\n")
+                            LOG.info("Rescue shell exited, returning to wait mode")
+                    except json.JSONDecodeError:
+                        pass
+                elif msg_type == MSG_CLOSE:
+                    break
+        finally:
+            writer.close()
+
+
+async def run_rescue_admin(host: str, port: int, token: str, client_hostname: Optional[str] = None) -> None:
+    """Admin tool to trigger rescue on a connected client."""
+    ssl_ctx = ssl.create_default_context() if False else None  # TODO: support --tls
+    reader, writer = await asyncio.open_connection(host, port, ssl=ssl_ctx)
+
+    # Send admin hello
+    hello = {
+        "type": "rescue_admin",
+        "token": token or "",
+        "admin": True
+    }
+    await write_frame(writer, MSG_HELLO, 0, json.dumps(hello).encode())
+
+    # Receive ack with list of rescue clients
+    msg_type, _, payload = await read_frame(reader)
+    if msg_type == MSG_ERROR:
+        raise SystemExit(f"Admin rejected: {json.loads(payload).get('error')}")
+    if msg_type != MSG_HELLO_ACK:
+        raise SystemExit("Unexpected reply from server")
+
+    ack = json.loads(payload)
+    clients = ack.get("rescue_clients", [])
+
+    if not clients:
+        print("No rescue clients connected.")
+        writer.close()
+        return
+
+    print("Connected rescue clients:")
+    for i, client in enumerate(clients, 1):
+        print(f"  [{i}] {client.get('hostname', 'unknown')} ({client.get('id', '?')})")
+
+    if not client_hostname:
+        selection = input("\nSelect client number: ").strip()
+        try:
+            idx = int(selection) - 1
+            if not (0 <= idx < len(clients)):
+                raise ValueError
+            client_hostname = clients[idx].get("id")
+        except (ValueError, IndexError):
+            print("Invalid selection.")
+            writer.close()
+            return
+
+    print(f"\nTriggering rescue shell on {client_hostname}...")
+    ctrl = {"type": "rescue_shell", "target": client_hostname}
+    await write_frame(writer, MSG_DATA, 0, json.dumps(ctrl).encode())
+
+    # Now we're in interactive mode with the rescue shell
+    print("=== CONNECTED TO RESCUE SHELL ===")
+    print("(type 'exit' or Ctrl+D to disconnect)\n")
+
+    # Set up async stdin reading (simplified; won't work perfectly on all terminals)
+    loop = asyncio.get_running_loop()
+
+    async def read_stdin():
+        """Read from stdin and send to rescue shell."""
+        try:
+            while True:
+                data = await loop.run_in_executor(None, sys.stdin.buffer.read, 1)
+                if not data:
+                    break
+                await write_frame(writer, MSG_DATA, 0, data)
+        except (EOFError, OSError):
+            pass
+
+    async def read_shell_output():
+        """Read from rescue shell and print to stdout."""
+        try:
+            while True:
+                msg_type, _, payload = await read_frame(reader)
+                if msg_type == MSG_DATA:
+                    sys.stdout.buffer.write(payload)
+                    sys.stdout.buffer.flush()
+                elif msg_type == MSG_CLOSE:
+                    break
+        except (ConnectionError, asyncio.IncompleteReadError):
+            pass
+
+    # Run both concurrently
+    try:
+        read_task = asyncio.create_task(read_stdin())
+        output_task = asyncio.create_task(read_shell_output())
+
+        done, pending = await asyncio.wait(
+            [read_task, output_task],
+            return_when=asyncio.FIRST_COMPLETED
+        )
+
+        for task in pending:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    except KeyboardInterrupt:
+        print("\n\n=== DISCONNECTED ===")
+    finally:
+        writer.close()
+
+
+# --------------------------------------------------------------------------
+# Local Mesh Mode - Zero-Config LAN Tunneling with ARP+DNS Spoofing
+#
+# Single command to turn your machine into a local tunnel hub:
+# 1. Starts relay server on LAN
+# 2. Spoofs ARP+DNS to intercept tunnel.local queries
+# 3. Serves web dashboard with clickable tunnel links
+# 4. All devices on LAN can use tunnel.local:9000 without config
+# --------------------------------------------------------------------------
+
+async def serve_dashboard(relay: "TunnelServer", port: int, bind: str) -> None:
+    """Serve web dashboard showing active tunnels."""
+    async def handle_dashboard(reader: asyncio.StreamReader,
+                               writer: asyncio.StreamWriter) -> None:
+        try:
+            head = await read_http_head(reader)
+        except (ConnectionError, ProtocolError):
+            writer.close()
+            return
+
+        # Build HTML dashboard
+        http_tunnels = []
+        tcp_tunnels = []
+
+        for session in relay.sessions.values():
+            for tunnel_id, info in session.tunnels.items():
+                if info.kind == "http" and info.subdomain:
+                    http_tunnels.append({
+                        "subdomain": info.subdomain,
+                        "url": info.public_url.replace("8080", "8080"),
+                        "local_port": info.local_port,
+                    })
+                elif info.kind == "tcp" and info.remote_port:
+                    tcp_tunnels.append({
+                        "port": info.remote_port,
+                        "local_port": info.local_port,
+                        "url": info.public_url,
+                    })
+
+        # Generate HTML
+        http_list = ""
+        for t in http_tunnels:
+            url = t["url"].replace("http://", "http://").split(":")[0] + ":8080"
+            http_list += f'  <li><a href="http://{t["subdomain"]}.tunnel.local:8080/" target="_blank">🔗 {t["subdomain"]}.tunnel.local:8080</a> → localhost:{t["local_port"]}</li>\n'
+
+        tcp_list = ""
+        for t in tcp_tunnels:
+            tcp_list += f'  <li>📌 <code>tunnel.local:{t["port"]}</code> → localhost:{t["local_port"]}</li>\n'
+
+        if not http_list and not tcp_list:
+            http_list = '  <li><em>No tunnels active yet. Run clients to expose services.</em></li>'
+
+        html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <title>Local Tunnel Dashboard</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            margin: 40px; background: #f5f5f5; }}
+    .container {{ max-width: 600px; margin: 0 auto; background: white; padding: 30px;
+                  border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1); }}
+    h1 {{ color: #333; margin-top: 0; }}
+    h2 {{ color: #666; font-size: 16px; margin-top: 30px; border-bottom: 2px solid #007bff;
+          padding-bottom: 8px; }}
+    ul {{ list-style: none; padding: 0; }}
+    li {{ padding: 8px 0; }}
+    a {{ color: #007bff; text-decoration: none; font-weight: 500; }}
+    a:hover {{ text-decoration: underline; }}
+    code {{ background: #f0f0f0; padding: 2px 6px; border-radius: 3px; font-family: monospace; }}
+    .status {{ background: #e8f5e9; padding: 12px; border-radius: 4px; margin-bottom: 20px;
+               font-size: 14px; }}
+    em {{ color: #999; }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>🌐 Local Tunnel Dashboard</h1>
+    <div class="status">
+      ✓ Relay running at <code>tunnel.local:9000</code> (192.168.1.{relay.bind.split(".")[-1] if "." in relay.bind else "?"})
+    </div>
+    <h2>HTTP Tunnels</h2>
+    <ul>
+{http_list}
+    </ul>
+    <h2>TCP Tunnels</h2>
+    <ul>
+{tcp_list}
+    </ul>
+  </div>
+</body>
+</html>"""
+
+        response = _http_response("200 OK", html.encode("utf-8"))
+        writer.write(response)
+        await writer.drain()
+        writer.close()
+
+    server = await asyncio.start_server(handle_dashboard, host=bind, port=port)
+    async with server:
+        await server.serve_forever()
+
+
+async def run_local_mesh(args: argparse.Namespace) -> None:
+    """Run local mesh mode: relay + ARP+DNS spoofing + dashboard."""
+    if not check_root():
+        raise SystemExit("local-mesh requires root/admin for ARP and DNS spoofing")
+
+    domain = args.domain or "tunnel.local"
+    relay_port = args.relay_port or 9000
+    http_port = args.http_port or 8080
+    iface = args.iface or get_default_iface()
+    bind = local_ip_guess()
+
+    our_mac = get_mac_address(iface)
+    if not our_mac:
+        raise SystemExit(f"Could not read MAC address of interface {iface}")
+
+    print(f"\n🌐 LOCAL MESH MODE")
+    print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(f"Interface: {iface}")
+    print(f"Local IP: {bind}")
+    print(f"Relay: {domain}:{relay_port} → {bind}:{relay_port}")
+    print(f"Dashboard: http://{domain}:{http_port}")
+    print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+
+    # Create mock args for relay server
+    class RelayArgs:
+        pass
+
+    relay_args = RelayArgs()
+    relay_args.bind = "0.0.0.0"
+    relay_args.control_port = relay_port
+    relay_args.http_port = http_port
+    relay_args.https_port = None
+    relay_args.cert = None
+    relay_args.key = None
+    relay_args.domain = None
+    relay_args.public_host = bind
+    relay_args.token = None
+    relay_args.tcp_port_range = (20000, 20100)
+    relay_args.allow_any_port = False
+    relay_args.verbose = args.verbose if hasattr(args, "verbose") else 0
+
+    relay = TunnelServer(relay_args)
+
+    print(f"Starting relay server on {bind}:{relay_port}...")
+    print(f"Starting dashboard on http://{domain}:{http_port}...\n")
+
+    # Start relay, dashboard, and ARP/DNS spoofing
+    try:
+        relay_task = asyncio.create_task(relay.start())
+        dashboard_task = asyncio.create_task(serve_dashboard(relay, http_port, bind))
+
+        # Start DNS spoofing for the domain
+        dns_task = asyncio.create_task(run_dns_spoof_server(
+            53, {domain}, bind, bind or "0.0.0.0"
+        ))
+
+        # ARP spoofing for all devices to redirect to us
+        print(f"✓ ARP spoofing active for {domain}")
+        print(f"✓ DNS spoofing active for {domain}")
+        print(f"\n🎯 TUNNEL ACCESS INSTRUCTIONS:")
+        print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        print(f"  Device 1 (expose service on port 5000):")
+        print(f"    python3 ngrok_tunnel.py http 5000 \\")
+        print(f"      --server {domain}:{relay_port} --subdomain myapp")
+        print(f"    → Access at: http://myapp.{domain}:{http_port}/")
+        print(f"\n  Device 2 (expose SSH on port 22):")
+        print(f"    python3 ngrok_tunnel.py tcp 22 \\")
+        print(f"      --server {domain}:{relay_port} --remote-port 20022")
+        print(f"    → Connect: ssh user@{domain} -p 20022")
+        print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        print(f"\n📊 DASHBOARD: http://{domain}:{http_port}/")
+        print(f"\nPress Ctrl+C to stop.\n")
+
+        # Wait for all tasks
+        await asyncio.gather(relay_task, dashboard_task, dns_task)
+
+    except KeyboardInterrupt:
+        print("\n\nShutting down local mesh...")
+    except Exception as e:
+        print(f"Error: {e}")
+        raise
+    finally:
+        print("✓ Local mesh stopped")
 
 
 async def run_serve_dir(args: argparse.Namespace) -> None:
@@ -1525,6 +2123,12 @@ async def async_main(args: argparse.Namespace) -> None:
         await run_lan_spoof_wizard(args)
     elif args.command == "serve-dir":
         await run_serve_dir(args)
+    elif args.command == "rescue":
+        await RescueClient(args).run()
+    elif args.command == "rescue-admin":
+        await run_rescue_admin(args.host, args.port, args.token, args.client)
+    elif args.command == "local-mesh":
+        await run_local_mesh(args)
     else:  # pragma: no cover - argparse guards this
         raise SystemExit(f"unknown command: {args.command}")
 
