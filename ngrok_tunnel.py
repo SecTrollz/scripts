@@ -432,6 +432,12 @@ class TunnelServer:
         self.rescue_admins: dict[str, asyncio.StreamWriter] = {}  # admin_id -> writer
         self.rescue_ports: dict[str, int] = {}  # client_hostname -> allocated_port
 
+        # Operational features
+        self.metrics = Metrics()
+        self.rate_limiter = RateLimiter()
+        self.access_logger = AccessLogger(getattr(args, "access_log", None))
+        self.shutdown_requested = False
+
     # -- lifecycle ---------------------------------------------------
 
     async def start(self) -> None:
@@ -733,6 +739,21 @@ class TunnelServer:
         lines = head.split(b"\r\n")
         request_line = lines[0].decode() if lines else ""
         method, path, _ = request_line.split(" ", 2) if " " in request_line else ("GET", "/", "HTTP/1.1")
+
+        # Handle built-in endpoints
+        if path == "/health":
+            response = json.dumps({"status": "ok", "uptime": int(self.metrics.uptime())}).encode()
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + str(len(response)).encode() + b"\r\n\r\n" + response)
+            await writer.drain()
+            writer.close()
+            return
+
+        if path == "/metrics":
+            response = json.dumps(self.metrics.to_dict()).encode()
+            writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + str(len(response)).encode() + b"\r\n\r\n" + response)
+            await writer.drain()
+            writer.close()
+            return
 
         # Handle admin API endpoints
         if path.startswith("/admin/"):
@@ -1791,6 +1812,14 @@ def build_arg_parser() -> argparse.ArgumentParser:
                      help="allowed port range LOW-HIGH for tcp tunnels (default: 20000-20100)")
     sp.add_argument("--allow-any-port", action="store_true",
                      help="let clients request any remote TCP port, ignoring --tcp-port-range")
+    sp.add_argument("--config", default=None,
+                     help="load server settings from config file (JSON or KEY=VALUE format)")
+    sp.add_argument("--access-log", default=None,
+                     help="log all tunnel access to file for auditing")
+    sp.add_argument("--max-connections-per-ip", type=int, default=10,
+                     help="maximum concurrent connections per IP (default: 10, 0=unlimited)")
+    sp.add_argument("--max-requests-per-second", type=int, default=100,
+                     help="maximum requests per second per IP (default: 100, 0=unlimited)")
 
     def add_client_args(p: argparse.ArgumentParser) -> None:
         p.add_argument("local_port", type=int, help="local port to expose")
@@ -2668,8 +2697,152 @@ async def run_serve_dir(args: argparse.Namespace) -> None:
             await asyncio.wait_for(server_task, timeout=1.0)
 
 
+# -- Operations & Monitoring ------------------------------------------------
+
+class Metrics:
+    """Track tunnel metrics for monitoring."""
+    def __init__(self):
+        self.connections_total = 0
+        self.connections_active = 0
+        self.bytes_in = 0
+        self.bytes_out = 0
+        self.errors = 0
+        self.start_time = time.time()
+
+    def record_connection(self):
+        self.connections_total += 1
+        self.connections_active += 1
+
+    def record_disconnect(self):
+        self.connections_active = max(0, self.connections_active - 1)
+
+    def record_bytes(self, inbound: int, outbound: int):
+        self.bytes_in += inbound
+        self.bytes_out += outbound
+
+    def record_error(self):
+        self.errors += 1
+
+    def uptime(self) -> float:
+        return time.time() - self.start_time
+
+    def to_dict(self) -> dict:
+        return {
+            "uptime_seconds": int(self.uptime()),
+            "connections_total": self.connections_total,
+            "connections_active": self.connections_active,
+            "bytes_in": self.bytes_in,
+            "bytes_out": self.bytes_out,
+            "errors": self.errors,
+            "throughput_mbps": (self.bytes_in + self.bytes_out) * 8 / (self.uptime() or 1) / 1_000_000,
+        }
+
+
+class RateLimiter:
+    """Per-IP rate limiting to prevent abuse."""
+    def __init__(self, max_connections_per_ip: int = 10, max_requests_per_second: int = 100):
+        self.max_connections = max_connections_per_ip
+        self.max_rps = max_requests_per_second
+        self.connections: dict[str, int] = {}
+        self.request_log: dict[str, list[float]] = {}
+
+    def allow_connection(self, ip: str) -> bool:
+        """Check if IP is allowed to create new connection."""
+        count = self.connections.get(ip, 0)
+        if count >= self.max_connections:
+            LOG.warning("Rate limit exceeded for %s (connections)", ip)
+            return False
+        self.connections[ip] = count + 1
+        return True
+
+    def release_connection(self, ip: str):
+        """Release a connection for this IP."""
+        self.connections[ip] = max(0, self.connections.get(ip, 1) - 1)
+
+    def allow_request(self, ip: str) -> bool:
+        """Check if request from IP is allowed."""
+        now = time.time()
+        log = self.request_log.get(ip, [])
+        log = [t for t in log if now - t < 1.0]  # Keep 1-second window
+        if len(log) >= self.max_rps:
+            LOG.warning("Rate limit exceeded for %s (requests/sec)", ip)
+            return False
+        log.append(now)
+        self.request_log[ip] = log
+        return True
+
+
+class AccessLogger:
+    """Log all tunnel access for auditing."""
+    def __init__(self, log_file: Optional[str] = None):
+        self.log_file = log_file
+        if log_file:
+            self.file = open(log_file, "a", buffering=1)
+        else:
+            self.file = None
+
+    def log_tunnel(self, client_ip: str, tunnel_type: str, tunnel_id: str, status: str, details: str = ""):
+        """Log tunnel event."""
+        timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        message = f"{timestamp} | {client_ip:15} | {tunnel_type:10} | {tunnel_id:20} | {status:10} | {details}"
+        LOG.info(message)
+        if self.file:
+            self.file.write(message + "\n")
+
+    def close(self):
+        if self.file:
+            self.file.close()
+
+
+class ConfigLoader:
+    """Load server configuration from JSON/YAML files."""
+    @staticmethod
+    def load(config_file: str) -> dict:
+        """Load configuration from file."""
+        try:
+            with open(config_file) as f:
+                if config_file.endswith(".json"):
+                    import json
+                    return json.load(f)
+                else:
+                    # Simple key=value format
+                    config = {}
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"):
+                            continue
+                        if "=" in line:
+                            k, v = line.split("=", 1)
+                            config[k.strip()] = v.strip()
+                    return config
+        except Exception as e:
+            LOG.error("Failed to load config: %s", e)
+            return {}
+
+    @staticmethod
+    def apply(config: dict, args: argparse.Namespace) -> None:
+        """Apply config values to args, with CLI args taking precedence."""
+        for key, value in config.items():
+            if not hasattr(args, key):
+                continue
+            if getattr(args, key) is not None:
+                continue  # CLI arg takes precedence
+            # Try to convert value to appropriate type
+            if value.lower() in ("true", "false"):
+                setattr(args, key, value.lower() == "true")
+            elif value.isdigit():
+                setattr(args, key, int(value))
+            else:
+                setattr(args, key, value)
+
+
 async def async_main(args: argparse.Namespace) -> None:
     if args.command == "server":
+        # Load config file if provided
+        if args.config:
+            config = ConfigLoader.load(args.config)
+            ConfigLoader.apply(config, args)
+            LOG.info("Loaded config from %s", args.config)
         await TunnelServer(args).start()
     elif args.command in ("http", "tcp"):
         await TunnelClient(args).run()
