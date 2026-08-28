@@ -2502,7 +2502,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
                      help="address the temporary install server listens on (default: 0.0.0.0)")
 
     orch = sub.add_parser(
-        "orchestrate", help="master orchestrator: phone relay + auto-deploy clients + VPN (Tailscale ready)")
+        "orchestrate", help="master orchestrator: phone relay + DDNS + WireGuard VPN (100% open-source)")
     orch.add_argument("--cidr", default=None,
                       help="subnet to scan (default: auto-detect your /24)")
     orch.add_argument("--ports", type=parse_ports, default=None,
