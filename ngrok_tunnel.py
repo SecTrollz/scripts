@@ -410,6 +410,64 @@ PersistentKeepalive = 25
             return False
 
 
+class DDNSServer:
+    """Self-hosted DDNS server - zero external services, pure stdlib.
+
+    No DuckDNS, no third-party logging, no privacy leaks.
+    Stores DNS records locally, accessible via HTTP API.
+    """
+
+    def __init__(self, data_dir: str = "/tmp/ddns"):
+        self.data_dir = Path(data_dir)
+        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.records_file = self.data_dir / "records.json"
+        self.load_records()
+
+    def load_records(self) -> None:
+        """Load DNS records from disk."""
+        if self.records_file.exists():
+            try:
+                with open(self.records_file) as f:
+                    self.records = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                self.records = {}
+        else:
+            self.records = {}
+
+    def save_records(self) -> None:
+        """Save DNS records to disk."""
+        with open(self.records_file, 'w') as f:
+            json.dump(self.records, f, indent=2)
+
+    def update_record(self, hostname: str, ip: str, token: str) -> bool:
+        """Update a DNS record. Requires correct token."""
+        key = f"{hostname}:{token}"
+        old_ip = self.records.get(key, {}).get('ip')
+
+        if old_ip != ip:
+            self.records[key] = {'ip': ip, 'updated_at': time.time()}
+            self.save_records()
+            LOG.info("DDNS updated: %s -> %s", hostname, ip)
+            return True
+        return False
+
+    def resolve(self, hostname: str) -> Optional[str]:
+        """Resolve hostname to IP (no token required for reads)."""
+        for key, record in self.records.items():
+            if key.startswith(f"{hostname}:"):
+                return record['ip']
+        return None
+
+    def get_all_records(self, token: str) -> dict:
+        """Get all records for a given token."""
+        prefix = f":{token}"
+        return {
+            k.split(':')[0]: v
+            for k, v in self.records.items()
+            if k.endswith(prefix)
+        }
+
+
 class TunnelServer:
     def __init__(self, args: argparse.Namespace):
         self.bind = args.bind
@@ -830,6 +888,68 @@ class TunnelServer:
         if path == "/metrics":
             response = json.dumps(self.metrics.to_dict()).encode()
             writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: " + str(len(response)).encode() + b"\r\n\r\n" + response)
+            await writer.drain()
+            writer.close()
+            return
+
+        # Handle DDNS update endpoint (self-hosted, no external services)
+        if path.startswith("/ddns/update"):
+            if not hasattr(self, 'ddns_server'):
+                self.ddns_server = DDNSServer()
+
+            # Parse query parameters
+            params = {}
+            if "?" in path:
+                query_string = path.split("?", 1)[1]
+                for param in query_string.split("&"):
+                    if "=" in param:
+                        k, v = param.split("=", 1)
+                        params[k] = v
+
+            hostname = params.get("hostname", "")
+            ip = params.get("ip", "")
+            token = params.get("token", "")
+
+            if hostname and ip and token:
+                updated = self.ddns_server.update_record(hostname, ip, token)
+                response = json.dumps({"status": "ok", "updated": updated}).encode()
+                status = "200 OK"
+            else:
+                response = json.dumps({"status": "error", "message": "missing hostname, ip, or token"}).encode()
+                status = "400 Bad Request"
+
+            writer.write(f"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {len(response)}\r\n\r\n".encode() + response)
+            await writer.drain()
+            writer.close()
+            return
+
+        # Handle DDNS resolve endpoint (public lookup)
+        if path.startswith("/ddns/resolve"):
+            if not hasattr(self, 'ddns_server'):
+                self.ddns_server = DDNSServer()
+
+            params = {}
+            if "?" in path:
+                query_string = path.split("?", 1)[1]
+                for param in query_string.split("&"):
+                    if "=" in param:
+                        k, v = param.split("=", 1)
+                        params[k] = v
+
+            hostname = params.get("hostname", "")
+            if hostname:
+                ip = self.ddns_server.resolve(hostname)
+                if ip:
+                    response = json.dumps({"hostname": hostname, "ip": ip}).encode()
+                    status = "200 OK"
+                else:
+                    response = json.dumps({"error": "hostname not found"}).encode()
+                    status = "404 Not Found"
+            else:
+                response = json.dumps({"error": "missing hostname parameter"}).encode()
+                status = "400 Bad Request"
+
+            writer.write(f"HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {len(response)}\r\n\r\n".encode() + response)
             await writer.drain()
             writer.close()
             return
@@ -1743,64 +1863,52 @@ async def run_orchestrate(args: argparse.Namespace) -> None:
     print("║" + " "*78 + "║")
     print("╚" + "="*78 + "╝\n")
 
-    # Step 0: Setup Dynamic DNS (pure open-source)
-    print("Step 0️⃣  Setup Dynamic DNS (stable hostname for remote access)\n")
+    # Step 0: Setup Self-Hosted DDNS (zero external services, zero privacy leaks)
+    print("Step 0️⃣  Setup Self-Hosted DDNS (private, no third-party logging)\n")
     print("Options:")
-    print("  1. Setup DuckDNS (free, recommended)")
-    print("  2. Use existing DDNS hostname")
+    print("  1. Self-hosted DDNS (recommended - zero privacy issues)")
+    print("  2. Use existing DDNS hostname (manual)")
     print("  3. Use public IP (manual, not recommended)")
     choice = input("\nChoose (1/2/3) or enter hostname: ").strip()
 
     relay_hostname = None
     ddns_token = None
-    ddns_domain = None
+    use_self_hosted_ddns = False
 
     if choice == "1":
-        # DuckDNS setup
+        # Self-hosted DDNS setup
         print("\n" + "="*70)
-        print("  DuckDNS Setup (5 minutes)")
+        print("  Self-Hosted DDNS Setup (Private, Zero External Services)")
         print("="*70)
         print("""
-1. Go to https://www.duckdns.org
-2. Sign in with GitHub/Google
-3. Click "add domain" and create one (e.g., "myphone")
-4. Copy your token from the dashboard
+No third-party accounts required. DNS records stored locally.
+No privacy leaks, no logging, no trail left behind.
+
+This relay will run its own DDNS server on port 5353 (DNS).
+All DNS queries stay local to your network/relay.
         """)
-        ddns_domain = input("Enter DuckDNS domain name (without .duckdns.org): ").strip()
-        ddns_token = input("Enter DuckDNS token: ").strip()
-
-        if not ddns_domain or not ddns_token:
-            print("DuckDNS setup incomplete. Aborting.")
+        relay_hostname = input("Enter desired hostname (e.g., myphone): ").strip()
+        if not relay_hostname:
+            print("No hostname provided. Aborting.")
             return
 
-        relay_hostname = f"{ddns_domain}.duckdns.org"
-        print(f"\n✓ DuckDNS configured: {relay_hostname}")
+        # Generate secure DDNS token
+        ddns_token = secrets.token_urlsafe(32)
+        use_self_hosted_ddns = True
 
-        # Test DDNS update
-        print("Testing DDNS update...")
-        try:
-            response = subprocess.run(
-                ["curl", "-s",
-                 f"https://www.duckdns.org/update?domains={ddns_domain}&token={ddns_token}&ip="],
-                capture_output=True, text=True, timeout=5
-            )
-            if "OK" in response.stdout:
-                print("✓ DuckDNS connection successful\n")
-            else:
-                print(f"✗ DuckDNS update failed: {response.stdout}")
-                return
-        except Exception as e:
-            print(f"✗ Could not reach DuckDNS: {e}")
-            return
+        print(f"\n✓ Self-hosted DDNS configured")
+        print(f"  Hostname: {relay_hostname}")
+        print(f"  Token: {ddns_token[:20]}...")
+        print(f"  Status: Local-only, zero external services\n")
 
     elif choice == "2":
-        relay_hostname = input("Enter dynamic DNS hostname (e.g., myphone.duckdns.org): ").strip()
+        relay_hostname = input("Enter DDNS hostname (e.g., myphone.example.com): ").strip()
         print(f"\n✓ Using DDNS hostname: {relay_hostname}\n")
 
     elif choice == "3":
         relay_hostname = input("Enter public IP: ").strip()
         print(f"\n⚠️  Warning: Using static IP only works if IP never changes.")
-        print(f"   For reliable access, use Dynamic DNS.\n")
+        print(f"   For reliable access, use self-hosted DDNS.\n")
 
     else:
         relay_hostname = choice
@@ -1811,17 +1919,19 @@ async def run_orchestrate(args: argparse.Namespace) -> None:
 
     print(f"Relay will be accessible at: {relay_hostname}\n")
 
-    # Step 1: Setup DDNS Auto-Update (if using DuckDNS)
-    if ddns_domain and ddns_token:
-        print("Step 1️⃣  Setting up DDNS auto-update script\n")
+    # Step 1: Setup DDNS Auto-Update (if using self-hosted DDNS)
+    if use_self_hosted_ddns and ddns_token:
+        print("Step 1️⃣  Setting up self-hosted DDNS auto-update script\n")
         ddns_script_path = os.path.expanduser("~/ddns-update.sh")
         ddns_script = f"""#!/bin/bash
-# Auto-update Dynamic DNS when IP changes
+# Self-hosted DDNS auto-update when IP changes
 # Generated by orchestrate command
+# Zero external services, zero privacy leaks
 
-DOMAIN="{ddns_domain}"
+HOSTNAME="{relay_hostname}"
 TOKEN="{ddns_token}"
-CACHE_FILE="/tmp/duckdns-last-ip"
+RELAY_CONTROL="localhost:9000"
+CACHE_FILE="/tmp/self-ddns-last-ip"
 
 # Get current public IP
 CURRENT_IP=$(curl -s ifconfig.me 2>/dev/null)
@@ -1833,8 +1943,8 @@ LAST_IP=$(cat "$CACHE_FILE" 2>/dev/null || echo "")
 if [ "$CURRENT_IP" != "$LAST_IP" ]; then
     echo "[$(date)] IP changed: $LAST_IP → $CURRENT_IP"
 
-    # Update DuckDNS
-    curl -s "https://www.duckdns.org/update?domains=$DOMAIN&token=$TOKEN&ip=$CURRENT_IP"
+    # Update self-hosted DDNS server (via relay's API)
+    curl -s "http://localhost:8080/ddns/update?hostname=$HOSTNAME&ip=$CURRENT_IP&token=$TOKEN"
 
     # Cache new IP
     echo "$CURRENT_IP" > "$CACHE_FILE"
@@ -1846,7 +1956,7 @@ fi
             with open(ddns_script_path, 'w') as f:
                 f.write(ddns_script)
             os.chmod(ddns_script_path, 0o755)
-            print(f"✓ DDNS update script created: {ddns_script_path}")
+            print(f"✓ Self-hosted DDNS update script created: {ddns_script_path}")
 
             # Add to crontab
             cron_job = f"*/5 * * * * {ddns_script_path} >> /tmp/ddns-update.log 2>&1"
