@@ -1934,6 +1934,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     vpst.add_argument("--wg-interface", default="wg0",
                        help="WireGuard interface name (default: wg0)")
 
+    info = sub.add_parser("info", help="show operational status and build information")
+    info.add_argument("--json", action="store_true", help="output in JSON format")
+
     return parser
 
 
@@ -2632,6 +2635,55 @@ async def run_vpn_status(args: argparse.Namespace) -> None:
         print(f"Make sure the interface '{interface}' is active: sudo wg-quick up /etc/wireguard/{interface}.conf")
 
 
+async def run_info(args: argparse.Namespace) -> None:
+    """Show build and operational information."""
+    info = {
+        "version": "1.0.0",
+        "features": [
+            "reverse-tunnel",
+            "http-routing",
+            "tcp-forwarding",
+            "rescue-mode",
+            "wireguard-vpn",
+            "lan-discovery",
+            "zero-touch-provisioning",
+            "metrics-collection",
+            "rate-limiting",
+            "access-logging",
+            "config-files",
+            "graceful-shutdown",
+        ],
+        "endpoints": {
+            "health": "GET /health - health check with uptime",
+            "metrics": "GET /metrics - operational metrics (JSON)",
+            "admin_rescue": "POST /admin/rescue - trigger remote rescue shell",
+        },
+        "python_version": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        "dependencies": "zero (pure stdlib)",
+    }
+
+    if args.json:
+        print(json.dumps(info, indent=2))
+    else:
+        print("\n📊 NGROK_TUNNEL.PY - Build Information")
+        print("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        print(f"Version: {info['version']}")
+        print(f"Python: {info['python_version']}")
+        print(f"Dependencies: {info['dependencies']}")
+        print(f"\nFeatures ({len(info['features'])}):")
+        for feature in info['features']:
+            print(f"  ✓ {feature}")
+        print(f"\nMonitoring Endpoints:")
+        for endpoint, desc in info['endpoints'].items():
+            print(f"  • {desc}")
+        print(f"\nQuick Start:")
+        print(f"  Server:     python3 ngrok_tunnel.py server --token <secret>")
+        print(f"  Tunnel:     python3 ngrok_tunnel.py http 5000 --server <host>:9000 --token <secret>")
+        print(f"  Health:     curl http://<server>:8080/health")
+        print(f"  Metrics:    curl http://<server>:8080/metrics")
+        print(f"\nDocumentation: python3 ngrok_tunnel.py --help")
+
+
 async def run_serve_dir(args: argparse.Namespace) -> None:
     """Serve a local directory/webapp through an HTTP tunnel."""
     directory = args.directory
@@ -2836,6 +2888,39 @@ class ConfigLoader:
                 setattr(args, key, value)
 
 
+class GracefulShutdown:
+    """Manage graceful shutdown with connection draining."""
+    def __init__(self):
+        self.shutdown_event = asyncio.Event()
+        self.active_connections = 0
+        self.drain_timeout = 30  # seconds
+
+    def request_shutdown(self):
+        """Request graceful shutdown."""
+        self.shutdown_event.set()
+        LOG.info("Graceful shutdown requested, draining %d connections", self.active_connections)
+
+    async def wait_shutdown(self):
+        """Wait for shutdown request."""
+        await self.shutdown_event.wait()
+
+    async def drain_connections(self):
+        """Wait for active connections to close with timeout."""
+        start = time.time()
+        while self.active_connections > 0 and time.time() - start < self.drain_timeout:
+            await asyncio.sleep(0.1)
+        if self.active_connections > 0:
+            LOG.warning("Timeout draining connections, %d still active", self.active_connections)
+
+    def add_connection(self):
+        """Track new connection."""
+        self.active_connections += 1
+
+    def remove_connection(self):
+        """Untrack closed connection."""
+        self.active_connections = max(0, self.active_connections - 1)
+
+
 async def async_main(args: argparse.Namespace) -> None:
     if args.command == "server":
         # Load config file if provided
@@ -2866,6 +2951,8 @@ async def async_main(args: argparse.Namespace) -> None:
         await run_vpn_client(args)
     elif args.command == "vpn-status":
         await run_vpn_status(args)
+    elif args.command == "info":
+        await run_info(args)
     else:  # pragma: no cover - argparse guards this
         raise SystemExit(f"unknown command: {args.command}")
 
