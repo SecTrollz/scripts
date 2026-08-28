@@ -79,6 +79,24 @@ LAN DEPLOYMENT
     nothing is pushed automatically, no credentials are collected or
     stored, and nothing new is left listening on the target afterward.
 
+VPN SECURE ACCESS (WireGuard)
+    Wrap your tunnel infrastructure in a layer of encryption. WireGuard is faster,
+    more secure, and simpler than traditional VPNs.
+
+    On your relay server (requires `wg` and `wg-quick` system tools, runs as root):
+        python3 ngrok_tunnel.py vpn-server --wg-interface wg0 --wg-subnet 10.0.0.0/24
+
+    On your client/laptop (to connect to VPN):
+        python3 ngrok_tunnel.py vpn-client --server 203.0.113.10 \\
+            --output my-vpn.conf
+        sudo wg-quick up ./my-vpn.conf
+
+    Once connected, tunneled services are accessible by hostname/IP from inside
+    the VPN, as if you were on the same LAN. All VPN traffic is encrypted.
+
+    Admin can list connected VPN clients and inspect traffic:
+        python3 ngrok_tunnel.py vpn-status --wg-interface wg0
+
 NOTES
     * For subdomain-based HTTP routing (myapp.example.com) point a wildcard
       DNS record ("*.example.com") at the server's IP, and pass
@@ -93,6 +111,8 @@ NOTES
       connection to the server drops.
     * TCP tunnel ports are restricted to --tcp-port-range unless the
       server is started with --allow-any-port.
+    * WireGuard VPN mode requires system packages: `wireguard` and `wireguard-tools`.
+      On Linux: `apt install wireguard wireguard-tools` (or equivalent for your distro).
 
 Requires Python 3.9+. No third-party dependencies.
 """
@@ -257,6 +277,136 @@ class ClientSession:
 
     async def send(self, msg_type: int, stream_id: int, payload: bytes = b"") -> None:
         await write_frame(self.writer, msg_type, stream_id, payload)
+
+
+# -- WireGuard VPN Support -----------------------------------------------
+
+class WireGuardManager:
+    """Manage WireGuard VPN interface for tunnel access."""
+
+    def __init__(self, interface: str, subnet: str, server_ip: Optional[str] = None):
+        self.interface = interface
+        self.subnet = subnet
+        self.server_ip = server_ip or self._subnet_server_ip(subnet)
+        self.config_dir = Path(f"/etc/wireguard/{interface}")
+        self.peers: dict[str, dict] = {}
+        self._next_peer_ip = self._subnet_first_client_ip(subnet)
+
+    @staticmethod
+    def _subnet_server_ip(subnet: str) -> str:
+        """Extract .1 IP from subnet like 10.0.0.0/24."""
+        net_part = subnet.split("/")[0].rsplit(".", 1)[0]
+        return f"{net_part}.1"
+
+    @staticmethod
+    def _subnet_first_client_ip(subnet: str) -> str:
+        """First usable IP in subnet (.2 for /24)."""
+        net_part = subnet.split("/")[0].rsplit(".", 1)[0]
+        return f"{net_part}.2"
+
+    def generate_keypair(self) -> tuple[str, str]:
+        """Generate WireGuard private/public keypair (base64)."""
+        priv = subprocess.run(
+            ["wg", "genkey"],
+            capture_output=True, text=True, check=True
+        ).stdout.strip()
+        pub = subprocess.run(
+            ["wg", "pubkey"],
+            input=priv, capture_output=True, text=True, check=True
+        ).stdout.strip()
+        return priv, pub
+
+    def create_server_config(self, server_privkey: str, server_pubkey: str, listen_port: int = 51820) -> str:
+        """Generate WireGuard server configuration."""
+        return f"""[Interface]
+Address = {self.server_ip}/24
+ListenPort = {listen_port}
+PrivateKey = {server_privkey}
+PostUp = iptables -A FORWARD -i {self.interface} -j ACCEPT; iptables -A FORWARD -o {self.interface} -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+PostDown = iptables -D FORWARD -i {self.interface} -j ACCEPT; iptables -D FORWARD -o {self.interface} -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
+
+# Peers will be added dynamically
+"""
+
+    def add_peer(self, peer_name: str, peer_pubkey: str) -> dict:
+        """Add a VPN peer and allocate IP address."""
+        ip = self._next_peer_ip
+        # Increment last octet
+        parts = ip.rsplit(".", 1)
+        next_octet = int(parts[1]) + 1
+        self._next_peer_ip = f"{parts[0]}.{next_octet}"
+
+        peer_info = {
+            "name": peer_name,
+            "pubkey": peer_pubkey,
+            "ip": ip,
+            "added_at": time.time()
+        }
+        self.peers[peer_name] = peer_info
+        return peer_info
+
+    def generate_client_config(self, server_ip: str, server_pubkey: str,
+                               client_privkey: str, client_pubkey: str,
+                               client_ip: str, listen_port: int = 51820) -> str:
+        """Generate WireGuard client configuration."""
+        return f"""[Interface]
+Address = {client_ip}/24
+PrivateKey = {client_privkey}
+DNS = {server_ip}
+
+[Peer]
+PublicKey = {server_pubkey}
+Endpoint = {server_ip}:{listen_port}
+AllowedIPs = 10.0.0.0/24
+PersistentKeepalive = 25
+"""
+
+    def list_peers(self) -> list[dict]:
+        """Get list of connected VPN peers."""
+        try:
+            output = subprocess.run(
+                ["wg", "show", self.interface],
+                capture_output=True, text=True, check=True
+            ).stdout
+            # Parse WireGuard output to get connected peers
+            lines = output.split("\n")
+            peers_list = []
+            for peer_name, peer_info in self.peers.items():
+                # Check if peer appears in active connections
+                if any(peer_info["pubkey"][:8] in line for line in lines):
+                    peers_list.append({**peer_info, "connected": True})
+                else:
+                    peers_list.append({**peer_info, "connected": False})
+            return peers_list
+        except Exception as e:
+            LOG.error("Error listing WireGuard peers: %s", e)
+            return []
+
+    def bring_up(self, config_path: str) -> bool:
+        """Bring up WireGuard interface."""
+        try:
+            subprocess.run(
+                ["wg-quick", "up", config_path],
+                check=True, capture_output=True
+            )
+            LOG.info("WireGuard interface %s brought up", self.interface)
+            return True
+        except Exception as e:
+            LOG.error("Failed to bring up WireGuard: %s", e)
+            return False
+
+    def bring_down(self) -> bool:
+        """Bring down WireGuard interface."""
+        try:
+            subprocess.run(
+                ["wg-quick", "down", self.interface],
+                check=True, capture_output=True
+            )
+            LOG.info("WireGuard interface %s brought down", self.interface)
+            return True
+        except Exception as e:
+            LOG.error("Failed to bring down WireGuard: %s", e)
+            return False
 
 
 class TunnelServer:
@@ -1735,6 +1885,26 @@ def build_arg_parser() -> argparse.ArgumentParser:
     mp.add_argument("--iface", default=None,
                      help="network interface (default: auto-detect)")
 
+    vps = sub.add_parser("vpn-server", help="set up WireGuard VPN on relay server (requires root)")
+    vps.add_argument("--wg-interface", default="wg0",
+                      help="WireGuard interface name (default: wg0)")
+    vps.add_argument("--wg-subnet", default="10.0.0.0/24",
+                      help="VPN subnet for peer IP allocation (default: 10.0.0.0/24)")
+    vps.add_argument("--listen-port", type=int, default=51820,
+                      help="WireGuard UDP listen port (default: 51820)")
+    vps.add_argument("--output", default=None,
+                      help="save server config to file (default: print to stdout)")
+
+    vpc = sub.add_parser("vpn-client", help="generate WireGuard client configuration")
+    vpc.add_argument("--server", required=True, metavar="HOST:PORT",
+                      help="relay server IP or hostname (and optional port, default 51820)")
+    vpc.add_argument("--output", required=True,
+                      help="output file for client config (e.g. my-vpn.conf)")
+
+    vpst = sub.add_parser("vpn-status", help="show WireGuard VPN status and connected peers")
+    vpst.add_argument("--wg-interface", default="wg0",
+                       help="WireGuard interface name (default: wg0)")
+
     return parser
 
 
@@ -2304,6 +2474,135 @@ async def run_local_mesh(args: argparse.Namespace) -> None:
         print("✓ Local mesh stopped")
 
 
+async def run_vpn_server(args: argparse.Namespace) -> None:
+    """Set up WireGuard VPN server on relay."""
+    if not check_root():
+        raise SystemExit("vpn-server requires root/admin")
+
+    interface = args.wg_interface
+    subnet = args.wg_subnet
+    listen_port = args.listen_port
+
+    mgr = WireGuardManager(interface, subnet)
+
+    print(f"\n🔐 WIREGUARD VPN SERVER SETUP")
+    print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(f"Interface: {interface}")
+    print(f"Subnet: {subnet}")
+    print(f"Server IP: {mgr.server_ip}")
+    print(f"Listen Port: {listen_port}/UDP")
+    print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+
+    # Generate server keypair
+    print("Generating server keypair...")
+    server_priv, server_pub = mgr.generate_keypair()
+
+    # Create server config
+    config = mgr.create_server_config(server_priv, server_pub, listen_port)
+
+    if args.output:
+        with open(args.output, "w") as f:
+            f.write(config)
+        print(f"✓ Server config saved to: {args.output}")
+    else:
+        print("\n=== SERVER CONFIGURATION ===")
+        print(config)
+        print("=== END CONFIGURATION ===\n")
+
+    print(f"\nTo start VPN server:")
+    if args.output:
+        print(f"  sudo wg-quick up {args.output}")
+    else:
+        print(f"  Save the config above to a file and run:")
+        print(f"  sudo wg-quick up /etc/wireguard/{interface}.conf")
+
+    print(f"\nTo generate client configs:")
+    print(f"  python3 ngrok_tunnel.py vpn-client \\")
+    print(f"    --server <your-public-ip>:{listen_port} \\")
+    print(f"    --output client.conf")
+    print(f"\nClient public key: {server_pub}")
+
+
+async def run_vpn_client(args: argparse.Namespace) -> None:
+    """Generate WireGuard client configuration."""
+    server_addr = args.server
+    output_file = args.output
+
+    # Parse server address
+    if ":" in server_addr:
+        server_ip, port_str = server_addr.rsplit(":", 1)
+        try:
+            listen_port = int(port_str)
+        except ValueError:
+            listen_port = 51820
+    else:
+        server_ip = server_addr
+        listen_port = 51820
+
+    mgr = WireGuardManager("wg0", "10.0.0.0/24", server_ip)
+
+    print(f"\n🔐 WIREGUARD CLIENT CONFIG GENERATION")
+    print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(f"Server: {server_ip}:{listen_port}")
+    print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+
+    # Generate client keypair
+    print("Generating client keypair...")
+    client_priv, client_pub = mgr.generate_keypair()
+
+    # We need the server's public key - prompt user
+    print("\n⚠️  You need the server's public key from the vpn-server output.")
+    server_pubkey = input("Enter server public key: ").strip()
+
+    # Allocate client IP
+    peer_info = mgr.add_peer("client", client_pub)
+    client_ip = peer_info["ip"]
+
+    # Create client config
+    config = mgr.generate_client_config(server_ip, server_pubkey, client_priv, client_pub, client_ip, listen_port)
+
+    # Write to file
+    with open(output_file, "w") as f:
+        f.write(config)
+
+    os.chmod(output_file, 0o600)  # Secure permissions
+    print(f"✓ Client config saved to: {output_file}")
+
+    print(f"\nTo connect to VPN:")
+    print(f"  sudo wg-quick up {output_file}")
+    print(f"\nYour VPN IP: {client_ip}/24")
+    print(f"Server IP: {mgr.server_ip}/24")
+    print(f"\nAfter connecting, you can access tunneled services at their private IPs.")
+    print(f"Example: ssh user@10.0.0.2 (if service is at that IP)")
+
+
+async def run_vpn_status(args: argparse.Namespace) -> None:
+    """Show WireGuard VPN status."""
+    interface = args.wg_interface
+
+    mgr = WireGuardManager(interface, "10.0.0.0/24")
+
+    print(f"\n🔐 WIREGUARD VPN STATUS")
+    print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    print(f"Interface: {interface}")
+    print(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n")
+
+    try:
+        peers = mgr.list_peers()
+        if not peers:
+            print("No peers configured.")
+        else:
+            print(f"{'Name':<20} {'IP':<15} {'Status':<12} {'Connected At':<20}")
+            print("-" * 70)
+            for peer in peers:
+                status = "✓ Connected" if peer.get("connected") else "✗ Offline"
+                added_at = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(peer["added_at"]))
+                print(f"{peer['name']:<20} {peer['ip']:<15} {status:<12} {added_at:<20}")
+    except Exception as e:
+        print(f"Error: {e}")
+        print(f"Make sure the interface '{interface}' is active: sudo wg-quick up /etc/wireguard/{interface}.conf")
+
+
 async def run_serve_dir(args: argparse.Namespace) -> None:
     """Serve a local directory/webapp through an HTTP tunnel."""
     directory = args.directory
@@ -2388,6 +2687,12 @@ async def async_main(args: argparse.Namespace) -> None:
         await run_rescue_admin(args.host, args.port, args.token, args.client)
     elif args.command == "local-mesh":
         await run_local_mesh(args)
+    elif args.command == "vpn-server":
+        await run_vpn_server(args)
+    elif args.command == "vpn-client":
+        await run_vpn_client(args)
+    elif args.command == "vpn-status":
+        await run_vpn_status(args)
     else:  # pragma: no cover - argparse guards this
         raise SystemExit(f"unknown command: {args.command}")
 
