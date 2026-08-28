@@ -1766,18 +1766,82 @@ async def scan_lan(cidr: str, ports: list[int], timeout: float,
     return sorted((r for r in results if r), key=lambda r: ipaddress.ip_address(r["ip"]))
 
 
-async def serve_self(port: int, bind: str) -> None:
+async def serve_self(port: int, bind: str, provisioning_config: dict = None, device_a_ip: str = None) -> None:
     script_bytes = Path(__file__).read_bytes()
-    header = (
-        f"HTTP/1.1 200 OK\r\nContent-Type: text/x-python\r\n"
-        f"Content-Length: {len(script_bytes)}\r\nConnection: close\r\n\r\n"
-    ).encode("ascii")
 
     async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         with contextlib.suppress(ConnectionError, ProtocolError):
-            await read_http_head(reader)  # drain the request; every path serves the same file
-            writer.write(header + script_bytes)
-            await writer.drain()
+            req_line = await read_http_head(reader)
+
+            if not req_line:
+                return
+
+            path = req_line.split()[1] if len(req_line.split()) > 1 else "/"
+
+            # Get client IP from socket
+            client_ip = None
+            try:
+                client_ip = writer.get_extra_info('peername')[0]
+            except:
+                pass
+
+            # Handle provisioning endpoints
+            if path == "/provisioning" or path.startswith("/provisioning"):
+                if provisioning_config is None:
+                    # No provisioning config available
+                    resp = b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\nNo provisioning config"
+                    writer.write(resp)
+                else:
+                    # Detect which device is requesting by its source IP
+                    relay_config = provisioning_config.get("relay", {})
+                    device_script = None
+
+                    # Check if this is the relay device
+                    if client_ip and client_ip == relay_config.get("device_ip"):
+                        device_script = "\n".join(relay_config.get("commands", []))
+                    else:
+                        # Look in tunnel devices
+                        for tunnel in provisioning_config.get("tunnels", []):
+                            if client_ip and client_ip == tunnel.get("device_ip"):
+                                device_script = "\n".join(tunnel.get("commands", []))
+                                break
+
+                    if device_script:
+                        script_text = f"#!/bin/bash\nset -e\n# Auto-generated deployment script for {client_ip}\n{device_script}\n"
+                        script_bytes_resp = script_text.encode("utf-8")
+                        header = (
+                            f"HTTP/1.1 200 OK\r\nContent-Type: application/x-bash\r\n"
+                            f"Content-Length: {len(script_bytes_resp)}\r\nConnection: close\r\n\r\n"
+                        ).encode("ascii")
+                        writer.write(header + script_bytes_resp)
+                    else:
+                        error_msg = f"Device {client_ip} not in provisioning config. Available devices:\n"
+                        error_msg += f"  Relay: {relay_config.get('device_ip')}\n"
+                        for tunnel in provisioning_config.get("tunnels", []):
+                            error_msg += f"  Tunnel: {tunnel.get('device_ip')}\n"
+                        error_bytes = error_msg.encode("utf-8")
+                        resp = (
+                            f"HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n"
+                            f"Content-Length: {len(error_bytes)}\r\nConnection: close\r\n\r\n"
+                        ).encode("ascii") + error_bytes
+                        writer.write(resp)
+
+                await writer.drain()
+                return
+
+            # Default: serve ngrok_tunnel.py script
+            if path in ["/", "/ngrok_tunnel.py"]:
+                header = (
+                    f"HTTP/1.1 200 OK\r\nContent-Type: text/x-python\r\n"
+                    f"Content-Length: {len(script_bytes)}\r\nConnection: close\r\n\r\n"
+                ).encode("ascii")
+                writer.write(header + script_bytes)
+                await writer.drain()
+            else:
+                resp = b"HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\n404 Not Found"
+                writer.write(resp)
+                await writer.drain()
+
         with contextlib.suppress(Exception):
             writer.close()
 
@@ -2205,11 +2269,12 @@ async def _run_relay_background(args: argparse.Namespace) -> None:
 
 
 async def run_home_gateway(args: argparse.Namespace) -> None:
-    """Setup home gateway: device A orchestrates relay on device B + tunnels on other devices."""
+    """Setup home gateway: Device A provisions Device B (relay) + other devices WITHOUT SSH."""
     print("\n" + "="*70)
-    print("  🏠 HOME GATEWAY SETUP")
-    print("     Device A configures Device B (relay) + other home services")
-    print("     Device A leaves → Device B provides remote access via VPN")
+    print("  🏠 HOME GATEWAY SETUP (Zero-SSH Provisioning)")
+    print("     Device A = provisioning server on LAN")
+    print("     Devices self-discover, fetch config, self-deploy")
+    print("     Device A leaves → everything keeps running")
     print("="*70 + "\n")
 
     # Step 1: Scan LAN
@@ -2242,11 +2307,11 @@ async def run_home_gateway(args: argparse.Namespace) -> None:
         print("Invalid selection.")
         return
 
-    print(f"\n✓ Relay device: {relay_device['hostname'] or relay_device['ip']}")
+    relay_ip = relay_device['ip']
+    print(f"\n✓ Relay device: {relay_device['hostname'] or relay_ip}")
 
     # Step 3: Select tunnel devices
-    print("\nStep 3️⃣  Select services to expose (devices + their ports)")
-    print("         (these devices will tunnel through relay)\n")
+    print("\nStep 3️⃣  Select services to expose (devices will tunnel through relay)\n")
     tunnel_selection = input("Device numbers (e.g. 1,3,5) or Enter to skip: ").strip()
     tunnel_devices = []
     if tunnel_selection:
@@ -2257,112 +2322,133 @@ async def run_home_gateway(args: argparse.Namespace) -> None:
             tunnel_devices = []
 
     # Step 4: Generate credentials
-    print(f"\nStep 4️⃣  Generating credentials...\n")
+    print(f"\nStep 4️⃣  Generating security credentials...\n")
     relay_token = secrets.token_urlsafe(32)
     relay_control_port = 9000
     relay_http_port = 8080
-    relay_ip = relay_device['ip']
 
-    print(f"  Relay device IP: {relay_ip}")
+    print(f"  Relay device: {relay_ip}")
     print(f"  Relay token: {relay_token[:20]}...")
     print(f"  Control port: {relay_control_port}")
     print(f"  HTTP port: {relay_http_port}")
     print(f"  VPN subnet: 10.0.0.0/24")
     print(f"  VPN port: 51820")
 
-    # Step 5: Display plan
+    # Step 5: Display deployment plan
     print("\n" + "="*70)
-    print("  📋 DEPLOYMENT PLAN")
+    print("  📋 DEPLOYMENT PLAN (Zero-SSH)")
     print("="*70)
     print(f"""
-Device B ({relay_device['hostname'] or relay_ip}) - RELAY (stays at home):
-  • Relay server on {relay_ip}:{relay_control_port}
-  • WireGuard VPN on port 51820
-  • Always running, always accessible
+ARCHITECTURE:
+  Device A (this machine): Provisioning server on LAN
+  Device B ({relay_ip}): Relay server (stays home forever)
+  Other devices: Tunnels through Device B
 
-Other home devices - TUNNELS:
-""")
-    for i, dev in enumerate(tunnel_devices, 1):
-        services = ", ".join(COMMON_PORTS[p] for p in dev["ports"][:2] if p in COMMON_PORTS)
-        print(f"  {i}. {dev['hostname'] or dev['ip']:<15} ({services}) → tunnel to relay")
+HOW IT WORKS:
+  1. Device A starts provisioning server on this machine
+  2. Devices on LAN discover Device A's provisioning server
+  3. Each device fetches its deployment script from Device A
+  4. Devices self-execute: relay, tunnels, VPN, etc.
+  5. No SSH needed anywhere
+  6. Device A leaves → everything keeps running
+  7. Access home via VPN from anywhere
 
-    print(f"""
-Device A (this machine) - ORCHESTRATOR:
-  • Deploys relay on Device B (via SSH)
-  • Deploys tunnels on other devices (via SSH)
-  • Generates VPN config
-  • Then LEAVES and uses VPN to access home
-
-After setup:
-  • Device B: relay always running
-  • Device A: leaves home, connects via VPN
-  • All home services accessible through relay
+NO SSH REQUIRED - The only "hole" is the relay on Device B
 """)
 
+    # Step 6: Start provisioning server
     print("="*70)
-    print("  ⚠️  MANUAL SETUP REQUIRED")
+    print("  🚀 PROVISIONING SERVER")
     print("="*70)
-    print(f"""
-Device A currently cannot auto-SSH into home devices.
-Follow these manual steps:
 
-1️⃣  SSH into relay device ({relay_ip}):
+    device_a_ip = local_ip_guess()
+    print(f"\nDevice A (provisioning server): {device_a_ip}:{args.serve_port}")
+    print(f"Devices will connect to: http://{device_a_ip}:{args.serve_port}/provisioning")
+    print(f"\nStarting provisioning server...\n")
 
-   ssh user@{relay_ip}
+    # Create provisioning configurations for each device
+    provisioning_config = {
+        "relay": {
+            "device_ip": relay_ip,
+            "device_hostname": relay_device.get("hostname", "relay"),
+            "role": "relay",
+            "relay_token": relay_token,
+            "relay_control_port": relay_control_port,
+            "relay_http_port": relay_http_port,
+            "commands": [
+                f"# Start relay server on {relay_ip}",
+                f"nohup python3 ngrok_tunnel.py server \\",
+                f"    --bind 0.0.0.0 \\",
+                f"    --control-port {relay_control_port} \\",
+                f"    --http-port {relay_http_port} \\",
+                f"    --token '{relay_token}' > relay.log 2>&1 &",
+                f"",
+                f"# Start WireGuard VPN on {relay_ip} (separate terminal, needs sudo)",
+                f"sudo python3 ngrok_tunnel.py vpn-server \\",
+                f"    --wg-interface wg0 \\",
+                f"    --wg-subnet 10.0.0.0/24 \\",
+                f"    --listen-port 51820"
+            ]
+        },
+        "tunnels": []
+    }
 
-   # Download and run relay
-   curl -fsSL http://{local_ip_guess()}:{args.serve_port}/ngrok_tunnel.py -o ngrok_tunnel.py
+    for dev in tunnel_devices:
+        provisioning_config["tunnels"].append({
+            "device_ip": dev['ip'],
+            "device_hostname": dev.get("hostname", "tunnel"),
+            "ports": dev.get("ports", []),
+            "relay_ip": relay_ip,
+            "relay_control_port": relay_control_port,
+            "relay_token": relay_token,
+            "commands": [
+                f"# Create tunnel on {dev['ip']} → {relay_ip}",
+                f"# Detect local ports and create tunnels",
+                f"for port in {','.join(map(str, dev.get('ports', [8000, 22])[:2]))}; do",
+                f"  nohup python3 ngrok_tunnel.py tcp $port \\",
+                f"    --server {relay_ip}:{relay_control_port} \\",
+                f"    --token '{relay_token}' > tunnel-$port.log 2>&1 &",
+                f"done"
+            ]
+        })
 
-   # Start relay server (keeps running)
-   nohup python3 ngrok_tunnel.py server \\
-       --bind 0.0.0.0 \\
-       --control-port {relay_control_port} \\
-       --http-port {relay_http_port} \\
-       --token '{relay_token}' > relay.log 2>&1 &
+    print("✓ Provisioning config generated")
+    print(f"✓ Relay on Device B ({relay_ip})")
+    print(f"✓ {len(tunnel_devices)} tunnel device(s)")
+    print(f"\nDevices on LAN can now connect and fetch their deployment script:")
+    print(f"  curl http://{device_a_ip}:{args.serve_port}/provisioning/{relay_ip}")
+    print(f"  curl http://{device_a_ip}:{args.serve_port}/provisioning/<device-ip>")
 
-   # Start VPN (in another terminal, requires sudo)
-   sudo python3 ngrok_tunnel.py vpn-server \\
-       --wg-interface wg0 \\
-       --wg-subnet 10.0.0.0/24 \\
-       --listen-port 51820
+    print(f"\n" + "="*70)
+    print(f"  📡 PROVISIONING SERVER RUNNING")
+    print(f"="*70)
+    print(f"\nWaiting for devices to connect...")
+    print(f"Device provisioning URL: http://{device_a_ip}:{args.serve_port}/provisioning")
+    print(f"\nOn each device, run:")
+    print(f"  curl http://{device_a_ip}:{args.serve_port}/provisioning/$(hostname -I | awk '{{print $1}}') | bash")
+    print(f"\nOr if that doesn't work, manually:")
+    print(f"  curl http://{device_a_ip}:{args.serve_port}/ngrok_tunnel.py -o ngrok_tunnel.py")
+    print(f"  python3 ngrok_tunnel.py server --bind 0.0.0.0 --control-port 9000 --http-port 8080 --token '{relay_token}'")
+    print(f"\nPress Ctrl+C when all devices are configured.\n")
 
-2️⃣  SSH into each tunnel device:
-
-   ssh user@<device-ip>
-
-   # Download and run tunnel client
-   curl -fsSL http://{local_ip_guess()}:{args.serve_port}/ngrok_tunnel.py -o ngrok_tunnel.py
-
-   # Create tunnel (http or tcp depending on service)
-   python3 ngrok_tunnel.py http <LOCAL_PORT> \\
-       --server {relay_ip}:{relay_control_port} \\
-       --token '{relay_token}' \\
-       --subdomain <service-name>
-
-3️⃣  On Device A, generate VPN config:
-
-   python3 ngrok_tunnel.py vpn-client \\
-       --server {relay_ip} \\
-       --output home-vpn.conf
-
-4️⃣  On Device A, connect VPN and access services:
-
-   sudo wg-quick up ./home-vpn.conf
-   curl http://service-name.{relay_ip}:{relay_http_port}
-
-""")
-
-    print("="*70)
-    print("  🚀 SERVING SCRIPT FOR DOWNLOAD")
-    print("="*70)
-    print(f"\nThis script is available at:")
-    print(f"  http://{local_ip_guess()}:{args.serve_port}/ngrok_tunnel.py")
-    print(f"\nStart the server now? (y/n)")
-
-    if input("> ").strip().lower() == "y":
-        print(f"\n📡 Serving script on http://{local_ip_guess()}:{args.serve_port}/ngrok_tunnel.py")
-        print("Ctrl+C to stop.\n")
-        await serve_self(args.serve_port, args.bind)
+    # Start serving script and provisioning configs
+    try:
+        await serve_self(args.serve_port, args.bind, provisioning_config, device_a_ip)
+    except KeyboardInterrupt:
+        print("\n\n" + "="*70)
+        print("  ✅ PROVISIONING COMPLETE")
+        print("="*70)
+        print(f"\nRelay on Device B ({relay_ip}) should now be running.")
+        print(f"\nTo generate VPN config and access home from anywhere:")
+        print(f"  python3 ngrok_tunnel.py vpn-client \\")
+        print(f"    --server {relay_ip} \\")
+        print(f"    --output home-vpn.conf")
+        print(f"\nTo connect from remote:")
+        print(f"  sudo wg-quick up ./home-vpn.conf")
+        print(f"\nThen access services:")
+        print(f"  curl http://service.{relay_ip}:{relay_http_port}")
+        print(f"  ssh user@{relay_ip} -p 2222  # if SSH tunnel is on relay")
+        print()
 
 
 async def run_lan_spoof_wizard(args: argparse.Namespace) -> None:
