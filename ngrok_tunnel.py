@@ -36,6 +36,24 @@ QUICK START
             --token <secret> --remote-port 20022
         # -> 203.0.113.10:20022  forwards to  127.0.0.1:22
 
+LAN DEPLOYMENT
+    Got a home network full of headless boxes (a NAS, a Plex box, a home
+    server) you'd like to run the `http`/`tcp` client on, without opening
+    SSH or any other standing remote-access service on each one just to
+    get the script over there? `lan` discovers them and hands you a
+    copy-paste install command instead of pushing anything for you:
+
+        python3 ngrok_tunnel.py lan
+
+    It scans your local subnet with plain TCP connect probes (no root
+    needed -- works fine under Termux), lists what it finds, and for the
+    devices you pick, serves this script from a temporary local HTTP
+    listener plus prints a `curl | ...` one-liner for each. You paste
+    that into whatever session you already use to reach that device
+    (Termux, a console, an SSH session you open and close yourself) --
+    nothing is pushed automatically, no credentials are collected or
+    stored, and nothing new is left listening on the target afterward.
+
 NOTES
     * For subdomain-based HTTP routing (myapp.example.com) point a wildcard
       DNS record ("*.example.com") at the server's IP, and pass
@@ -61,15 +79,18 @@ import asyncio
 import contextlib
 import functools
 import hmac
+import ipaddress
 import itertools
 import json
 import logging
 import secrets
+import socket
 import ssl
 import struct
 import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 LOG = logging.getLogger("tunnel")
@@ -607,6 +628,162 @@ class TunnelClient:
 
 
 # --------------------------------------------------------------------------
+# LAN discovery + pull-install
+#
+# Finds devices on your local subnet and, for the ones you pick, serves
+# this script from a temporary local HTTP listener plus prints a one-liner
+# to run on each device. It never opens a connection *to* a device beyond
+# a handful of short TCP probes, never pushes code anywhere, and never
+# collects or stores credentials -- you fetch and run the install command
+# yourself, from whatever session you already have on that box.
+# --------------------------------------------------------------------------
+
+COMMON_PORTS: dict[int, str] = {
+    21: "FTP", 22: "SSH", 23: "Telnet", 80: "HTTP", 139: "SMB", 443: "HTTPS",
+    445: "SMB", 548: "AFP", 2049: "NFS", 3389: "RDP", 5000: "Synology DSM / UPnP",
+    5001: "Synology DSM (HTTPS)", 6443: "Kubernetes API", 7878: "Radarr",
+    8006: "Proxmox", 8080: "HTTP-alt", 8096: "Jellyfin", 8123: "Home Assistant",
+    8384: "Syncthing", 8989: "Sonarr", 9000: "Portainer", 9091: "Transmission",
+    9100: "Printer (JetDirect)", 32400: "Plex",
+}
+
+MAX_LAN_SCAN_HOSTS = 4096  # refuse anything bigger than a handful of /22s
+
+
+def local_ip_guess() -> str:
+    """Best-effort local LAN IP, found without sending any packets (a UDP
+    'connect' just asks the OS to pick a route -- it never touches the wire)."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("203.0.113.1", 80))  # TEST-NET-3, RFC 5737 -- unroutable, never dialed
+        return s.getsockname()[0]
+    except OSError:
+        return "127.0.0.1"
+    finally:
+        s.close()
+
+
+def guess_local_cidr() -> str:
+    return str(ipaddress.ip_network(f"{local_ip_guess()}/24", strict=False))
+
+
+def parse_ports(spec: str) -> list[int]:
+    try:
+        return sorted({int(p.strip()) for p in spec.split(",") if p.strip()})
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"invalid --ports value: {spec!r}")
+
+
+async def probe_host(ip: str, ports: list[int], timeout: float,
+                      sem: asyncio.Semaphore) -> Optional[dict]:
+    async def check(port: int) -> Optional[int]:
+        async with sem:
+            try:
+                _, w = await asyncio.wait_for(asyncio.open_connection(ip, port), timeout)
+            except (OSError, asyncio.TimeoutError):
+                return None
+            with contextlib.suppress(Exception):
+                w.close()
+                await w.wait_closed()
+            return port
+
+    open_ports = sorted(p for p in await asyncio.gather(*(check(p) for p in ports)) if p)
+    if not open_ports:
+        return None
+
+    hostname = None
+    with contextlib.suppress(Exception):
+        loop = asyncio.get_running_loop()
+        hostname = (await loop.run_in_executor(None, socket.gethostbyaddr, ip))[0]
+    return {"ip": ip, "ports": open_ports, "hostname": hostname}
+
+
+async def scan_lan(cidr: str, ports: list[int], timeout: float,
+                    concurrency: int) -> list[dict]:
+    network = ipaddress.ip_network(cidr, strict=False)
+    hosts = list(network.hosts())
+    if len(hosts) > MAX_LAN_SCAN_HOSTS:
+        raise SystemExit(
+            f"{cidr} has {len(hosts)} addresses -- too large to scan; use a smaller --cidr")
+    sem = asyncio.Semaphore(concurrency)
+    results = await asyncio.gather(*(probe_host(str(ip), ports, timeout, sem) for ip in hosts))
+    return sorted((r for r in results if r), key=lambda r: ipaddress.ip_address(r["ip"]))
+
+
+async def serve_self(port: int, bind: str) -> None:
+    script_bytes = Path(__file__).read_bytes()
+    header = (
+        f"HTTP/1.1 200 OK\r\nContent-Type: text/x-python\r\n"
+        f"Content-Length: {len(script_bytes)}\r\nConnection: close\r\n\r\n"
+    ).encode("ascii")
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        with contextlib.suppress(ConnectionError, ProtocolError):
+            await read_http_head(reader)  # drain the request; every path serves the same file
+            writer.write(header + script_bytes)
+            await writer.drain()
+        with contextlib.suppress(Exception):
+            writer.close()
+
+    server = await asyncio.start_server(handle, host=bind, port=port)
+    async with server:
+        LOG.info("serving %s on %s:%s -- press Ctrl+C when you're done installing",
+                  Path(__file__).name, bind, port)
+        await server.serve_forever()
+
+
+async def run_lan_wizard(args: argparse.Namespace) -> None:
+    cidr = args.cidr or guess_local_cidr()
+    ports = args.ports or sorted(COMMON_PORTS)
+    port_desc = "common ports" if not args.ports else "ports"
+    print(f"Scanning {cidr} ({len(ports)} {port_desc}, no root needed)...")
+    print("Note: this only finds devices already running some network service on the "
+          "probed ports -- a fully silent device won't show up. Widen --ports or use "
+          "--cidr to target a specific host if something you expect is missing.\n")
+
+    hosts = await scan_lan(cidr, ports, args.timeout, args.concurrency)
+    if not hosts:
+        print("No responsive devices found.")
+        return
+
+    print(f"Found {len(hosts)} device(s):\n")
+    for i, h in enumerate(hosts, 1):
+        services = ", ".join(COMMON_PORTS[p] for p in h["ports"] if p in COMMON_PORTS)
+        name = h["hostname"] or "?"
+        port_list = ",".join(map(str, h["ports"]))
+        print(f"  [{i:>2}] {h['ip']:<15} {name:<28} ports: {port_list}  ({services})")
+
+    print(
+        "\nPick the devices you want to install onto. This will NOT connect to, "
+        "push anything to, or authenticate against any of them -- it only serves "
+        "this script locally and prints a command for you to run yourself, on "
+        "each device's own already-authorized session.\n"
+    )
+    selection = input("Device numbers (e.g. 1,3), or Enter to quit: ").strip()
+    if not selection:
+        return
+    try:
+        chosen = [hosts[int(x.strip()) - 1] for x in selection.split(",") if x.strip()]
+    except (ValueError, IndexError):
+        print("Could not parse that selection.")
+        return
+
+    serve_url = f"http://{local_ip_guess()}:{args.serve_port}/ngrok_tunnel.py"
+    print(f"\nServing this script at {serve_url}\n")
+    print("Run one of these on each device (fill in your relay server/token):\n")
+    for h in chosen:
+        name = h["hostname"] or h["ip"]
+        print(f"  # {name}")
+        print(f"  curl -fsSL {serve_url} -o ngrok_tunnel.py && python3 ngrok_tunnel.py tcp "
+              f"<local_port> --server <relay-host>:<control-port> --token <token>")
+        print(f"  # (or 'http <local_port> ... --subdomain <name>' for an HTTP tunnel)\n")
+
+    print("Ctrl+C to stop serving once every device has fetched it.\n")
+    with contextlib.suppress(asyncio.CancelledError):
+        await serve_self(args.serve_port, args.bind)
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 
@@ -666,6 +843,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("gen-token", help="print a random secure token for --token")
 
+    lp = sub.add_parser(
+        "lan", help="discover LAN devices and print pull-install commands for the ones you pick")
+    lp.add_argument("--cidr", default=None,
+                     help="subnet to scan, e.g. 192.168.1.0/24 (default: auto-detect your /24)")
+    lp.add_argument("--ports", type=parse_ports, default=None,
+                     help="comma-separated ports to probe (default: a built-in common-services list)")
+    lp.add_argument("--timeout", type=float, default=0.4,
+                     help="per-port connect timeout in seconds (default: 0.4)")
+    lp.add_argument("--concurrency", type=int, default=256,
+                     help="max concurrent connection attempts (default: 256)")
+    lp.add_argument("--serve-port", type=int, default=8765,
+                     help="local port to serve this script from during install (default: 8765)")
+    lp.add_argument("--bind", default="0.0.0.0",
+                     help="address the temporary install server listens on (default: 0.0.0.0)")
+
     return parser
 
 
@@ -676,6 +868,8 @@ async def async_main(args: argparse.Namespace) -> None:
         await TunnelClient(args).run()
     elif args.command == "gen-token":
         print(secrets.token_urlsafe(32))
+    elif args.command == "lan":
+        await run_lan_wizard(args)
     else:  # pragma: no cover - argparse guards this
         raise SystemExit(f"unknown command: {args.command}")
 
