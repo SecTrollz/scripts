@@ -1,13 +1,17 @@
-# Quick Start: LAN Relay + WireGuard VPN (5 Minutes)
+# Quick Start: Mobile Relay + WireGuard VPN (5 Minutes)
 
 ## The Goal
-Access local services from anywhere via WireGuard VPN. No public VPS. No internet-facing relay.
+Access local services from anywhere via WireGuard VPN. **Relay device can leave LAN after setup.**
 
 ## Architecture
 ```
 Device A (Port 5000)  ─┐
-Device B (Port 3000)  ─┬─→ [Local Relay] ←─ WireGuard VPN ←─ [Remote Clients]
-Device C (Port 8080)  ─┘
+Device B (Port 3000)  ─┬─→ [Mobile Relay] ←─ WireGuard VPN ←─ [Remote Clients]
+Device C (Port 8080)  ─┘         ↓
+                          (can roam to any network)
+                          
+After setup, relay device can leave LAN!
+Tunnels stay active, VPN clients still connect.
 ```
 
 ---
@@ -262,4 +266,39 @@ curl http://myapp.$RELAY_IP:8080
 
 ---
 
-That's it! You now have a complete, private tunnel infrastructure! 🎉
+## 🚀 The Magic Part: Relay is Mobile!
+
+After initial setup, **the relay device can leave the LAN**:
+
+```bash
+# Device A & B are on home LAN
+Device A: tunneling to relay  ✓
+Device B: tunneling to relay  ✓
+
+# Relay device leaves home (goes to coffee shop)
+Relay: connected to coffee shop WiFi ✓
+
+# Tunnels DON'T break - they persist!
+Device A: still tunneling ✓
+Device B: still tunneling ✓
+
+# Remote VPN clients still access everything!
+VPN Client: connects to relay, accesses all services ✓
+```
+
+**Why this is powerful:**
+- Device A & B stay at home (always available)
+- Relay can travel (phone, laptop, wherever)
+- External access works from relay's new network
+- Tunnels are persistent (survive network transitions)
+
+**For relay to be reachable after leaving LAN:**
+- Use public IP if relay has one
+- Use dynamic DNS (recommended - see MOBILE_RELAY_VPN_SETUP.md)
+- Use relay discovery service (advanced)
+
+See `MOBILE_RELAY_VPN_SETUP.md` for detailed roaming setup! 🎉
+
+---
+
+That's it! You now have a complete, private, **mobile** tunnel infrastructure! 🎉
