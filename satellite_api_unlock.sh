@@ -89,6 +89,7 @@ for arg in "$@"; do
 done
 
 # ---------- Colors ----------
+GREEN="" BLUE="" YELLOW="" RED="" BOLD="" RESET=""
 if [ -t 1 ]; then
   GREEN=$(tput setaf 2 2>/dev/null || true)
   BLUE=$(tput setaf 4 2>/dev/null || true)
@@ -120,6 +121,14 @@ info "Device: ${BOLD}${model}${RESET}  Android ${release} (SDK ${sdk})"
 mkdir -p "$BACKUP_DIR"
 ts=$(date +%Y%m%d_%H%M%S)
 
+# Scratch files live under BACKUP_DIR rather than /tmp: on Termux (a common
+# host for this script) the real /tmp is not guaranteed writable, while
+# BACKUP_DIR was just proven writable above.
+SCRATCH_DIR="${BACKUP_DIR}/.scratch"
+mkdir -p "$SCRATCH_DIR"
+trap 'rm -rf "$SCRATCH_DIR"' EXIT
+scratch() { mktemp "${SCRATCH_DIR}/$1.XXXXXX"; }
+
 dump_carrier_config() {
   adb shell dumpsys carrier_config 2>/dev/null
 }
@@ -145,20 +154,22 @@ if [[ "$MODE" == "reset" ]]; then
   dump_satellite_state > "$before_state"
   info "Pre-reset snapshots: $before_cc, $before_state"
 
-  if adb shell cmd phone cc clear-values >/tmp/cc_reset_out 2>&1; then
+  cc_reset_out="$(scratch cc_reset_out)"
+  if adb shell cmd phone cc clear-values >"$cc_reset_out" 2>&1; then
     ok "Cleared all carrier_config test overrides (cmd phone cc clear-values)"
   else
     err "clear-values failed:"
-    cat /tmp/cc_reset_out
+    cat "$cc_reset_out"
     exit 1
   fi
 
   if [[ "$has_oem_provision_cmd" -eq 1 ]]; then
-    if adb shell cmd phone set-oem-enabled-satellite-provision-status >/tmp/oem_reset_out 2>&1; then
+    oem_reset_out="$(scratch oem_reset_out)"
+    if adb shell cmd phone set-oem-enabled-satellite-provision-status >"$oem_reset_out" 2>&1; then
       ok "Cleared OEM-enabled satellite provision-status override"
     else
       warn "Could not clear provision-status override (may not support no-arg clear on this build):"
-      cat /tmp/oem_reset_out | sed 's/^/    /'
+      cat "$oem_reset_out" | sed 's/^/    /'
     fi
   fi
 
@@ -239,29 +250,32 @@ for k in "${sat_keys[@]}"; do
   fi
 
   # Verify the key is actually recognized by this build before writing it.
-  if ! adb shell cmd phone cc get-value -k "$k" >/tmp/cc_probe 2>&1; then
+  cc_probe="$(scratch cc_probe)"
+  if ! adb shell cmd phone cc get-value -k "$k" >"$cc_probe" 2>&1; then
     warn "Skipping $k — device rejected get-value (not a real key on this build)"
     ((skipped++)) || true
     continue
   fi
 
-  if adb shell cmd phone cc set-value -k "$k" -v true >/tmp/cc_set_out 2>&1; then
+  cc_set_out="$(scratch cc_set_out)"
+  if adb shell cmd phone cc set-value -k "$k" -v true >"$cc_set_out" 2>&1; then
     ok "Set $k = true"
     ((applied++)) || true
   else
     warn "Failed to set $k:"
-    cat /tmp/cc_set_out | sed 's/^/    /'
+    cat "$cc_set_out" | sed 's/^/    /'
     ((skipped++)) || true
   fi
 done
 
 if [[ "$has_oem_provision_cmd" -eq 1 ]]; then
-  if adb shell cmd phone set-oem-enabled-satellite-provision-status -p true >/tmp/oem_set_out 2>&1; then
+  oem_set_out="$(scratch oem_set_out)"
+  if adb shell cmd phone set-oem-enabled-satellite-provision-status -p true >"$oem_set_out" 2>&1; then
     ok "Set OEM-enabled satellite provision status = true"
     ((applied++)) || true
   else
     warn "Failed to set OEM provision status:"
-    cat /tmp/oem_set_out | sed 's/^/    /'
+    cat "$oem_set_out" | sed 's/^/    /'
     ((skipped++)) || true
   fi
 fi
