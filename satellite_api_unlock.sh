@@ -4,33 +4,77 @@ set -euo pipefail
 # satellite_api_unlock.sh
 #
 # Android's Satellite framework (android.telephony.satellite.SatelliteManager)
-# is gated by CarrierConfigManager flags — KEY_SATELLITE_*, KEY_CARRIER_*SATELLITE*,
-# KEY_CARRIER_ROAMING_NTN_* — that a real carrier normally has to provision
-# remotely before the APIs light up. The exact key set has grown/changed every
-# Android release (14 -> 15 -> 16 -> 17), so hardcoding names here would just
-# rot. Instead this script reads them straight off the connected device via
-# `dumpsys carrier_config` (the ground truth for *this* build) and only
-# touches keys it has just verified exist via `cmd phone cc get-value` —
-# never a blind write.
+# is gated in two different ways depending on the build:
 #
-# `cmd phone cc set-value` / `clear-values` is AOSP's own documented developer
-# override path for carrier config (Telephony's TelephonyShellCommand `cc`
-# group) — it's what `shell` identity is granted for local dev/CTS testing,
-# no root or bootloader unlock required. It does NOT grant real satellite RF —
-# that still needs modem/OEM hardware and a live satellite backend — it only
-# removes the config gate so SatelliteManager's APIs and Settings > Satellite
-# UI stop short-circuiting to "unsupported" during development/testing.
+#   - Older-style: CarrierConfigManager KEY_*SATELLITE*_BOOL flags that a real
+#     carrier normally has to provision remotely.
+#   - Newer-style (confirmed on a real Pixel 9a / Android 17 / SDK 37): the
+#     aconfig feature flags (device_config telephony oem_enabled_satellite_flag
+#     etc.) are already compiled in and enabled, but the device's runtime
+#     "OEM-enabled satellite provision status" is a separate bit, normally set
+#     by an OEM provisioning app/flow — not by CarrierConfigManager at all.
+#     TelephonyShellCommand exposes it directly for local dev/CTS testing:
+#     `cmd phone set-oem-enabled-satellite-provision-status -p true/false`.
+#
+# The exact surface has grown/changed every Android release (14 -> 15 -> 16 ->
+# 17), so hardcoding one mechanism would rot. This script discovers both live
+# off the connected device instead of assuming which one applies:
+#   - carrier_config keys are read from `dumpsys carrier_config` and verified
+#     via `cmd phone cc get-value` before ever being written.
+#   - the OEM provision-status lever is discovered by parsing `cmd phone help`
+#     for the `set-oem-enabled-satellite-provision-status` subcommand — it's
+#     only used if the connected build actually advertises it.
+#
+# `cmd phone cc set-value/clear-values` and `cmd phone set-oem-enabled-
+# satellite-provision-status` are AOSP's own documented shell-level dev-
+# override paths (TelephonyShellCommand) — what `shell` identity is granted
+# for local dev/CTS testing, no root or bootloader unlock required. Neither
+# grants real satellite RF — that still needs modem/OEM hardware and a live
+# satellite backend — they only remove the software gate so SatelliteManager's
+# APIs and Settings > Satellite UI stop short-circuiting to "unsupported"
+# during development/testing.
 #
 # Modes:
 #   (default)      recon only — discover + print current satellite-related
-#                  carrier_config keys, cmd phone satellite subcommands, and
-#                   device_config telephony flags. No writes.
-#   --apply        back up current carrier_config, then set every discovered
-#                  satellite *_bool key to true (int/other keys are only
-#                  reported, never auto-written).
+#                  carrier_config keys, cmd phone satellite subcommands
+#                  (flagging the OEM provision-status lever if present), and
+#                  device_config telephony flags. No writes.
+#   --apply        back up current state, then set every discovered carrier
+#                  config satellite *_bool key to true, AND, if the build
+#                  advertises it, set OEM-enabled satellite provision status
+#                  to true. Non-boolean carrier_config keys are only reported,
+#                  never auto-written.
 #   --reset        clear ALL cc test overrides (cmd phone cc clear-values)
-#                  and re-dump to confirm.
+#                  and clear the OEM provision-status override (if present),
+#                  then re-dump to confirm.
 #   --backup-dir D directory for backups (default: ./satellite_backups)
+
+show_help() {
+  cat <<'EOF'
+satellite_api_unlock.sh
+
+Discovers and unlocks Android's SatelliteManager developer APIs on a
+connected device, using whichever gating mechanism that build actually
+exposes rather than a hardcoded one:
+
+  - CarrierConfigManager KEY_*SATELLITE*_BOOL flags (older-style), read from
+    dumpsys carrier_config and verified via `cmd phone cc get-value` before
+    any write.
+  - OEM-enabled satellite provision status (confirmed on Android 17 / SDK 37),
+    set via `cmd phone set-oem-enabled-satellite-provision-status`, only used
+    if `cmd phone help` on the connected device actually advertises it.
+
+Does NOT grant real satellite RF — that still needs modem/OEM hardware and a
+live satellite backend. It only removes the software gate for testing.
+
+Modes:
+  (default)      recon only — discover and print current state. No writes.
+  --apply        back up current state, then enable every lever discovered.
+  --reset        revert every override this script can make (cc clear-values
+                 plus clearing the OEM provision-status override).
+  --backup-dir D directory for backups (default: ./satellite_backups)
+EOF
+}
 
 MODE="recon"
 BACKUP_DIR="./satellite_backups"
@@ -40,10 +84,7 @@ for arg in "$@"; do
     --apply) MODE="apply" ;;
     --reset) MODE="reset" ;;
     --backup-dir=*) BACKUP_DIR="${arg#*=}" ;;
-    -h|--help)
-      grep '^#' "$0" | sed 's/^# \{0,1\}//'
-      exit 0
-      ;;
+    -h|--help) show_help; exit 0 ;;
   esac
 done
 
@@ -83,11 +124,26 @@ dump_carrier_config() {
   adb shell dumpsys carrier_config 2>/dev/null
 }
 
+dump_satellite_state() {
+  {
+    adb shell dumpsys telephony.registry 2>/dev/null | grep -i satellite
+    adb shell dumpsys isub 2>/dev/null | grep -i satellite
+  } 2>/dev/null || true
+}
+
+phone_help="$(adb shell cmd phone help 2>&1 || true)"
+has_oem_provision_cmd=0
+if echo "$phone_help" | grep -q 'set-oem-enabled-satellite-provision-status'; then
+  has_oem_provision_cmd=1
+fi
+
 # ---------- Reset mode ----------
 if [[ "$MODE" == "reset" ]]; then
-  before_file="${BACKUP_DIR}/carrier_config_before_reset_${ts}.txt"
-  dump_carrier_config > "$before_file"
-  info "Pre-reset snapshot: $before_file"
+  before_cc="${BACKUP_DIR}/carrier_config_before_reset_${ts}.txt"
+  before_state="${BACKUP_DIR}/satellite_state_before_reset_${ts}.txt"
+  dump_carrier_config > "$before_cc"
+  dump_satellite_state > "$before_state"
+  info "Pre-reset snapshots: $before_cc, $before_state"
 
   if adb shell cmd phone cc clear-values >/tmp/cc_reset_out 2>&1; then
     ok "Cleared all carrier_config test overrides (cmd phone cc clear-values)"
@@ -97,9 +153,22 @@ if [[ "$MODE" == "reset" ]]; then
     exit 1
   fi
 
-  after_file="${BACKUP_DIR}/carrier_config_after_reset_${ts}.txt"
-  dump_carrier_config > "$after_file"
-  diff "$before_file" "$after_file" | grep -i satellite || info "No satellite-key diff (already clean or never overridden)"
+  if [[ "$has_oem_provision_cmd" -eq 1 ]]; then
+    if adb shell cmd phone set-oem-enabled-satellite-provision-status >/tmp/oem_reset_out 2>&1; then
+      ok "Cleared OEM-enabled satellite provision-status override"
+    else
+      warn "Could not clear provision-status override (may not support no-arg clear on this build):"
+      cat /tmp/oem_reset_out | sed 's/^/    /'
+    fi
+  fi
+
+  after_cc="${BACKUP_DIR}/carrier_config_after_reset_${ts}.txt"
+  after_state="${BACKUP_DIR}/satellite_state_after_reset_${ts}.txt"
+  dump_carrier_config > "$after_cc"
+  dump_satellite_state > "$after_state"
+
+  diff "$before_cc" "$after_cc" | grep -i satellite || info "No carrier_config satellite-key diff"
+  diff "$before_state" "$after_state" || info "No satellite-state diff"
   exit 0
 fi
 
@@ -111,8 +180,7 @@ cc_dump="$(dump_carrier_config)"
 mapfile -t sat_keys < <(echo "$cc_dump" | grep -oE '\bKEY_[A-Z0-9_]*SATELLITE[A-Z0-9_]*' | sort -u)
 
 if [[ "${#sat_keys[@]}" -eq 0 ]]; then
-  warn "No KEY_*SATELLITE* entries found in dumpsys carrier_config for this build/SIM state."
-  warn "Some OEMs only populate these once a SIM with any carrier profile is present."
+  info "No KEY_*SATELLITE* entries in dumpsys carrier_config (expected on newer builds — see below)."
 else
   ok "Found ${#sat_keys[@]} satellite-related carrier_config key(s):"
   for k in "${sat_keys[@]}"; do
@@ -122,11 +190,15 @@ else
 fi
 
 info "Discovering 'cmd phone' satellite subcommands..."
-sat_cmds="$(adb shell cmd phone help 2>&1 | grep -i satellite || true)"
+sat_cmds="$(echo "$phone_help" | grep -i satellite || true)"
 if [[ -n "$sat_cmds" ]]; then
   echo "$sat_cmds" | sed 's/^/    /'
 else
   info "No dedicated satellite subcommands surfaced in 'cmd phone help' on this build."
+fi
+
+if [[ "$has_oem_provision_cmd" -eq 1 ]]; then
+  ok "Primary lever available: cmd phone set-oem-enabled-satellite-provision-status"
 fi
 
 info "Checking device_config telephony namespace for satellite flags..."
@@ -139,22 +211,26 @@ fi
 
 if [[ "$MODE" == "recon" ]]; then
   echo
-  info "Recon only — re-run with --apply to enable the discovered *_bool keys."
+  info "Recon only — re-run with --apply to enable the levers discovered above."
   exit 0
 fi
 
 # ---------- Apply mode ----------
-if [[ "${#sat_keys[@]}" -eq 0 ]]; then
-  err "Nothing discovered to apply. Insert a SIM (even an inactive one) and re-run recon first."
+if [[ "${#sat_keys[@]}" -eq 0 && "$has_oem_provision_cmd" -eq 0 ]]; then
+  err "Nothing discovered to apply — no carrier_config *SATELLITE* keys and no"
+  err "set-oem-enabled-satellite-provision-status subcommand on this build."
   exit 1
 fi
 
-backup_file="${BACKUP_DIR}/carrier_config_before_${ts}.txt"
-echo "$cc_dump" > "$backup_file"
-ok "Backed up current carrier_config to $backup_file (restore anytime with --reset)"
+backup_cc="${BACKUP_DIR}/carrier_config_before_${ts}.txt"
+backup_state="${BACKUP_DIR}/satellite_state_before_${ts}.txt"
+echo "$cc_dump" > "$backup_cc"
+dump_satellite_state > "$backup_state"
+ok "Backed up current state to $backup_cc / $backup_state (restore anytime with --reset)"
 
 applied=0
 skipped=0
+
 for k in "${sat_keys[@]}"; do
   if [[ "$k" != *_BOOL ]]; then
     warn "Skipping non-boolean key (review manually): $k"
@@ -179,12 +255,27 @@ for k in "${sat_keys[@]}"; do
   fi
 done
 
-echo
-new_dump="$(dump_carrier_config)"
-after_file="${BACKUP_DIR}/carrier_config_after_${ts}.txt"
-echo "$new_dump" > "$after_file"
+if [[ "$has_oem_provision_cmd" -eq 1 ]]; then
+  if adb shell cmd phone set-oem-enabled-satellite-provision-status -p true >/tmp/oem_set_out 2>&1; then
+    ok "Set OEM-enabled satellite provision status = true"
+    ((applied++)) || true
+  else
+    warn "Failed to set OEM provision status:"
+    cat /tmp/oem_set_out | sed 's/^/    /'
+    ((skipped++)) || true
+  fi
+fi
 
-ok "Applied ${applied} key(s), skipped ${skipped}. Snapshot: $after_file"
-info "Diff:"
-diff "$backup_file" "$after_file" | grep -i satellite | sed 's/^/    /' || true
+echo
+new_cc="$(dump_carrier_config)"
+after_cc="${BACKUP_DIR}/carrier_config_after_${ts}.txt"
+after_state="${BACKUP_DIR}/satellite_state_after_${ts}.txt"
+echo "$new_cc" > "$after_cc"
+dump_satellite_state > "$after_state"
+
+ok "Applied ${applied} lever(s), skipped ${skipped}. Snapshots: $after_cc, $after_state"
+info "carrier_config diff:"
+diff "$backup_cc" "$after_cc" | grep -i satellite | sed 's/^/    /' || true
+info "satellite-state diff:"
+diff "$backup_state" "$after_state" | sed 's/^/    /' || true
 info "Revert anytime with: $0 --reset"
