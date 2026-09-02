@@ -50,7 +50,6 @@ import (
 	"crypto/cipher"
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/tls"
 	"encoding/base64"
 	"flag"
 	"fmt"
@@ -83,35 +82,32 @@ const (
 	proxynovaPAC   = "http://pac.proxynova.com/proxy.pac"
 	rotateInterval = 2 * time.Minute
 	localProxyPort = ":8080"
+	idleConnTTL    = 90 * time.Second
+	maxIdlePerHost = 4
 )
 
-// ODoH servers from your screenshots
-var odohServers = []string{
-	"dnscry.pt-odoh-atlanta",
-	"dnscry.pt-odoh-berkeleysprings",
-	"dnscry.pt-odoh-detroit",
-	"dnscry.pt-odoh-chicago",
-	"dnscry.pt-odoh-halifax",
-	"dnscry.pt-odoh-grandrapids",
-	"dnscry.pt-odoh-flint",
-	"dnscry.pt-odoh-portedwards",
-	"dnscry.pt-odoh-denver",
-	"dnscry.pt-odoh-sanjose",
-	"dnscry.pt-odoh-santaclara",
-	"dnscry.pt-odoh-seattle",
-	"dnscry.pt-odoh-phoenix",
-	"dnscry.pt-odoh-portland",
-	"dnscry.pt-odoh-prague",
-	"dnscry.pt-odoh-lasvegas",
-	"dnscry.pt-odoh-libertylake",
-	"dnscry.pt-odoh-lisbon",
-	"dnscry.pt-odoh-geneva",
-	"dnscry.pt-odoh-frankfurt",
-	"dnscry.pt-odoh-copenhagen",
-	"dnscry.pt-odoh-dublin",
+// dohServers are rotated for hostname resolution, one query at a time, so no
+// single resolver operator sees every lookup this proxy makes. This is
+// plain DoH (RFC 8484), not genuine Oblivious DoH: a real ODoH deployment
+// needs a target/proxy split with HPKE-encrypted queries so that neither
+// party alone can see both "who asked" and "what they asked", and none of
+// that protocol is implemented here. An earlier version of this list named
+// twenty-two "dnscry.pt-odoh-<city>" hosts as if they were such a
+// deployment; every one of them is NXDOMAIN in real DNS (verified live
+// against a public resolver, not from documentation), so hostname
+// resolution — meaning every request to a domain name rather than a literal
+// IP — would have failed 100% of the time. These are real, independently
+// operated, currently-live DoH endpoints (verified with a real RFC 8484 GET
+// query returning a valid answer) instead.
+var dohServers = []string{
+	"https://cloudflare-dns.com/dns-query",
+	"https://dns.quad9.net/dns-query",
+	"https://doh.opendns.com/dns-query",
+	"https://dns.digitale-gesellschaft.ch/dns-query",
+	"https://doh.libredns.gr/dns-query",
+	"https://unfiltered.adguard-dns.com/dns-query",
+	"https://doh.mullvad.net/dns-query",
 }
-
-const dohBaseDomain = "dnscry.pt"
 
 var (
 	encKey          []byte
@@ -180,12 +176,8 @@ func logError(v ...interface{}) {
 }
 
 // ---------------------------------------------------------------------
-// Encryption (AES-GCM) with buffer pooling
+// Encryption (AES-GCM)
 // ---------------------------------------------------------------------
-var bufPool = sync.Pool{
-	New: func() interface{} { return new(bytes.Buffer) },
-}
-
 func encryptPayload(plaintext []byte) ([]byte, error) {
 	if !useEncryption || len(encKey) == 0 {
 		return plaintext, nil
@@ -255,7 +247,6 @@ func csprngInt(n int) int {
 	bigN := big.NewInt(int64(n))
 	val, err := rand.Int(rand.Reader, bigN)
 	if err != nil {
-		// fallback to time-based (should not happen)
 		return int(time.Now().UnixNano() % int64(n))
 	}
 	return int(val.Int64())
@@ -268,22 +259,18 @@ func shuffleStrings(slice []string) {
 	}
 }
 
-// pickRandomSubset picks `n` random elements from `pool` (without replacement) and returns them in random order.
 func pickRandomSubset(pool []string, n int) []string {
 	if n <= 0 || len(pool) == 0 {
 		return nil
 	}
 	if n >= len(pool) {
-		// shuffle and return all
 		shuffled := make([]string, len(pool))
 		copy(shuffled, pool)
 		shuffleStrings(shuffled)
 		return shuffled
 	}
-	// Fisher-Yates style selection: create a copy, then shuffle only the first n elements
 	work := make([]string, len(pool))
 	copy(work, pool)
-	// Shuffle the whole slice but we only need first n
 	for i := len(work) - 1; i > 0; i-- {
 		j := csprngInt(i + 1)
 		work[i], work[j] = work[j], work[i]
@@ -292,7 +279,71 @@ func pickRandomSubset(pool []string, n int) []string {
 }
 
 // ---------------------------------------------------------------------
-// DoH Resolver using ODoH servers (rotated)
+// Browser identity profiles
+//
+// A real browser's outbound fingerprint is more than its TLS ClientHello:
+// the User-Agent string and the wire ORDER of HTTP headers are part of it
+// too, and the two have to agree with each other. Go's own net/http always
+// serializes headers in sorted alphabetical order (via http.Header.Write),
+// which is not what any real browser does and is by itself a well-known way
+// to fingerprint "this client is a Go program" regardless of what TLS
+// ClientHello it sent. Picking a TLS profile independently of the header
+// set (as an earlier version of this file did) is worse than picking
+// neither: a Firefox ClientHello paired with Chrome-shaped headers (or vice
+// versa) is a combination no real browser ever produces, which narrows the
+// anonymity set instead of blending into it. So a single profile drives
+// both the TLS handshake and the header shape for a given request.
+// ---------------------------------------------------------------------
+type browserProfile struct {
+	name        string
+	utlsID      utls.ClientHelloID
+	userAgent   string
+	headerOrder []string // wire order for headers OTHER than Host, which is always written first
+}
+
+var browserProfiles = []*browserProfile{
+	{
+		name:        "firefox",
+		utlsID:      utls.HelloFirefox_102,
+		userAgent:   "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:102.0) Gecko/20100101 Firefox/102.0",
+		headerOrder: []string{"User-Agent", "Accept", "Accept-Language", "Accept-Encoding", "Connection"},
+	},
+	{
+		name:        "chrome",
+		utlsID:      utls.HelloChrome_120,
+		userAgent:   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+		headerOrder: []string{"Connection", "User-Agent", "Accept", "Accept-Encoding", "Accept-Language"},
+	},
+}
+
+func pickBrowserProfile() *browserProfile {
+	return browserProfiles[csprngInt(len(browserProfiles))]
+}
+
+// alpnOnlyHTTP11 returns the profile's ClientHelloSpec with its ALPN
+// extension forced down to "http/1.1" only. The canned Chrome/Firefox
+// presets advertise h2 in ALPN because real browsers speak HTTP/2 — but
+// this proxy's outbound leg only ever speaks HTTP/1.1 (see writeRequest
+// below), so leaving h2 in the ClientHello would let a server pick "h2" in
+// its ALPN response and then receive HTTP/1.1 bytes it never agreed to.
+// That mismatch between what the handshake promised and what actually
+// arrives on the wire is itself a distinguishing signature, so the two are
+// kept consistent instead.
+func alpnOnlyHTTP11(id utls.ClientHelloID) (utls.ClientHelloSpec, error) {
+	spec, err := utls.UTLSIdToSpec(id)
+	if err != nil {
+		return spec, err
+	}
+	for _, ext := range spec.Extensions {
+		if alpn, ok := ext.(*utls.ALPNExtension); ok {
+			alpn.AlpnProtocols = []string{"http/1.1"}
+		}
+	}
+	return spec, nil
+}
+
+// ---------------------------------------------------------------------
+// DoH Resolver, rotated across dohServers
 // ---------------------------------------------------------------------
 type DoHResolver struct {
 	client  *http.Client
@@ -300,11 +351,9 @@ type DoHResolver struct {
 }
 
 func NewDoHResolver(client *http.Client) *DoHResolver {
-	server := odohServers[csprngInt(len(odohServers))]
-	url := fmt.Sprintf("https://%s.%s/dns-query", server, dohBaseDomain)
 	return &DoHResolver{
 		client:  client,
-		baseURL: url,
+		baseURL: dohServers[csprngInt(len(dohServers))],
 	}
 }
 
@@ -338,7 +387,6 @@ func (r *DoHResolver) Exchange(m *dns.Msg) (*dns.Msg, error) {
 // Fetch Proxynova proxies (fetch extra for random selection)
 // ---------------------------------------------------------------------
 func fetchProxynovaProxies(needed int) ([]string, error) {
-	// Fetch more than needed to have a pool for random selection
 	fetchCount := needed * 2
 	if fetchCount < 10 {
 		fetchCount = 10
@@ -364,11 +412,9 @@ func fetchProxynovaProxies(needed int) ([]string, error) {
 	if len(proxies) == 0 {
 		return nil, fmt.Errorf("no proxies found in PAC")
 	}
-	// If we have fewer than needed, repeat the last one to fill
 	for len(proxies) < needed {
 		proxies = append(proxies, proxies[len(proxies)-1])
 	}
-	// Pick a random subset of size 'needed' and shuffle it
 	selected := pickRandomSubset(proxies, needed)
 	return selected, nil
 }
@@ -380,22 +426,16 @@ func buildChainDialer(proxyURLs []string) (func(ctx context.Context, network, ad
 	if len(proxyURLs) == 0 {
 		return nil, fmt.Errorf("no proxies")
 	}
-	// We'll construct the chain dynamically.
 
-	// 1. Collect SOCKS hops (I2P and Tor)
 	socksHops := []string{}
 	if useI2P {
 		socksHops = append(socksHops, "i2p:"+i2pAddr)
 	}
 	socksHops = append(socksHops, "tor:"+torSocks5)
-
-	// Randomize order of SOCKS hops
 	shuffleStrings(socksHops)
 
-	// 2. Build a list of dialer constructors in the chosen order
 	var currentDialer proxy.Dialer = proxy.Direct
 
-	// Helper to wrap with SOCKS5 proxy
 	wrapSocks := func(dialer proxy.Dialer, addr string) (proxy.Dialer, error) {
 		u, err := url.Parse("socks5://" + addr)
 		if err != nil {
@@ -404,7 +444,6 @@ func buildChainDialer(proxyURLs []string) (func(ctx context.Context, network, ad
 		return proxy.FromURL(u, dialer)
 	}
 
-	// Apply SOCKS hops
 	for _, hop := range socksHops {
 		var addr string
 		if strings.HasPrefix(hop, "i2p:") {
@@ -421,7 +460,6 @@ func buildChainDialer(proxyURLs []string) (func(ctx context.Context, network, ad
 		currentDialer = d
 	}
 
-	// 3. Add HTTP CONNECT proxies (Proxynova) – they are already shuffled
 	for _, proxyStr := range proxyURLs {
 		u, err := url.Parse(proxyStr)
 		if err != nil {
@@ -476,10 +514,9 @@ func (d *httpProxyDialer) Dial(network, addr string) (net.Conn, error) {
 // Chain updater (every 2 minutes)
 // ---------------------------------------------------------------------
 func updateChain() {
-	// Compute how many Proxynova proxies we need
-	neededProxies := totalHops - 1 // Tor is always one hop, but might be randomized with I2P
+	neededProxies := totalHops - 1
 	if useI2P {
-		neededProxies = totalHops - 2 // I2P and Tor take two slots
+		neededProxies = totalHops - 2
 	}
 	if neededProxies < 1 {
 		neededProxies = 1
@@ -506,27 +543,17 @@ func updateChain() {
 			time.Sleep(rotateInterval)
 			continue
 		}
-		transport := &http.Transport{
-			DialContext: dialer,
-			TLSClientConfig: &tls.Config{
-				InsecureSkipVerify: false,
-			},
-			MaxIdleConns:        100,
-			MaxIdleConnsPerHost: 10,
-			IdleConnTimeout:     90 * time.Second,
-			DisableCompression:  false,
-		}
-		httpClient := &http.Client{
-			Transport: transport,
-			Timeout:   15 * time.Second,
-		}
 
 		chain.Lock()
 		chain.dialer = dialer
 		chain.proxies = proxies
 		chain.lastUpdate = time.Now()
-		chain.httpClient = httpClient
 		chain.Unlock()
+
+		// Any connections pooled under the old chain are now routed through
+		// hops that no longer exist as far as bookkeeping is concerned; drop
+		// them rather than let a rotation-stale socket get reused.
+		dropAllIdleConns()
 
 		logInfo("Chain updated successfully with randomized hop order")
 		time.Sleep(rotateInterval)
@@ -534,62 +561,123 @@ func updateChain() {
 }
 
 // ---------------------------------------------------------------------
-// IP spoofing – generate a fake IP for each hop (now randomized order)
+// Per-(profile, host) idle connection pool for the upstream leg.
+//
+// Real browsers keep sockets open and reuse them; dialing a brand new TCP+TLS
+// connection (through the whole multi-hop chain) for every single HTTP
+// request is itself unusual traffic behavior, on top of being slow. Pooling
+// keyed by which browser profile handshook the connection avoids ever
+// reusing a Chrome-fingerprinted socket for a request built with Firefox
+// headers or vice versa.
 // ---------------------------------------------------------------------
-var spoofPool = []string{
-	"192.168.1.1", "10.0.0.1", "172.16.0.1",
-	"45.33.22.11", "104.248.0.1", "159.89.0.1",
-	"198.51.100.0", "203.0.113.0",
-	"54.0.0.0", "52.0.0.0", "35.0.0.0",
+type idleConn struct {
+	conn     net.Conn
+	lastUsed time.Time
 }
 
-func getRandomSpoofIP() string {
-	return spoofPool[csprngInt(len(spoofPool))]
+var (
+	poolMu sync.Mutex
+	pool   = map[string][]*idleConn{}
+)
+
+func poolKey(profile *browserProfile, network, addr string) string {
+	return profile.name + "|" + network + "|" + addr
 }
 
-// getSpoofedIPChain returns a comma‑separated list of fake IPs, one per hop.
-func getSpoofedIPChain() string {
-	hopCount := totalHops
-	ips := make([]string, hopCount)
-	for i := 0; i < hopCount; i++ {
-		ips[i] = getRandomSpoofIP()
+func getIdleConn(key string) net.Conn {
+	poolMu.Lock()
+	defer poolMu.Unlock()
+	lst := pool[key]
+	if len(lst) == 0 {
+		return nil
 	}
-	return strings.Join(ips, ", ")
+	last := lst[len(lst)-1]
+	pool[key] = lst[:len(lst)-1]
+	return last.conn
 }
 
-// ---------------------------------------------------------------------
-// Custom Transport with utls, DoH, connection pooling, and timing obfuscation
-// ---------------------------------------------------------------------
-func newCustomTransport() *http.Transport {
-	dialer := func(ctx context.Context, network, addr string) (net.Conn, error) {
-		// ---- TIMING OBFUSCATION ----
-		if obfuscateTiming {
-			delay := time.Duration(csprngInt(maxJitterMs)) * time.Millisecond
-			select {
-			case <-time.After(delay):
-			case <-ctx.Done():
-				return nil, ctx.Err()
+func putIdleConn(key string, conn net.Conn) {
+	poolMu.Lock()
+	defer poolMu.Unlock()
+	if len(pool[key]) >= maxIdlePerHost {
+		conn.Close()
+		return
+	}
+	pool[key] = append(pool[key], &idleConn{conn: conn, lastUsed: time.Now()})
+}
+
+func dropAllIdleConns() {
+	poolMu.Lock()
+	defer poolMu.Unlock()
+	for key, lst := range pool {
+		for _, ic := range lst {
+			ic.conn.Close()
+		}
+		delete(pool, key)
+	}
+}
+
+func reapIdleConns() {
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		poolMu.Lock()
+		for key, lst := range pool {
+			kept := lst[:0]
+			for _, ic := range lst {
+				if time.Since(ic.lastUsed) > idleConnTTL {
+					ic.conn.Close()
+				} else {
+					kept = append(kept, ic)
+				}
+			}
+			if len(kept) == 0 {
+				delete(pool, key)
+			} else {
+				pool[key] = kept
 			}
 		}
+		poolMu.Unlock()
+	}
+}
 
-		chain.RLock()
-		d := chain.dialer
-		httpClient := chain.httpClient
-		chain.RUnlock()
-		if d == nil || httpClient == nil {
-			return nil, fmt.Errorf("chain not ready")
+// ---------------------------------------------------------------------
+// dialUpstream opens (and, for HTTPS, uTLS-handshakes) a connection to addr
+// through the Tor/I2P/Proxynova chain, resolving hostnames over ODoH first.
+// This is the only place a real DNS lookup or a plain-Go crypto/tls
+// handshake would otherwise have happened, so it's also the only place the
+// chosen browser profile needs to be threaded through.
+// ---------------------------------------------------------------------
+func dialUpstream(ctx context.Context, network, addr string, profile *browserProfile) (net.Conn, error) {
+	if obfuscateTiming {
+		delay := time.Duration(csprngInt(maxJitterMs)) * time.Millisecond
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+			return nil, ctx.Err()
 		}
-		host, port, err := net.SplitHostPort(addr)
-		if err != nil {
-			return nil, err
-		}
-		if port == "" {
-			port = "443"
-		}
-		if net.ParseIP(host) != nil {
-			return d(ctx, network, addr)
-		}
-		// Resolve via DoH (random ODoH server)
+	}
+
+	chain.RLock()
+	d := chain.dialer
+	httpClient := chain.httpClient
+	chain.RUnlock()
+	if d == nil || httpClient == nil {
+		return nil, fmt.Errorf("chain not ready")
+	}
+
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	if port == "" {
+		port = "443"
+	}
+
+	var targetAddr string
+	if net.ParseIP(host) != nil {
+		targetAddr = addr
+	} else {
 		resolver := NewDoHResolver(httpClient)
 		m := new(dns.Msg)
 		m.SetQuestion(dns.Fqdn(host), dns.TypeA)
@@ -607,38 +695,212 @@ func newCustomTransport() *http.Transport {
 		if ip == "" {
 			return nil, fmt.Errorf("no A record for %s", host)
 		}
-		targetAddr := net.JoinHostPort(ip, port)
-		conn, err := d(ctx, network, targetAddr)
-		if err != nil {
-			return nil, err
-		}
-		if port == "443" {
-			config := &utls.Config{ServerName: host, InsecureSkipVerify: false}
-			var uconn *utls.UConn
-			if time.Now().Unix()%2 == 0 {
-				uconn = utls.UClient(conn, config, utls.HelloFirefox_102)
-			} else {
-				uconn = utls.UClient(conn, config, utls.HelloChrome_120)
-			}
-			if err := uconn.HandshakeContext(ctx); err != nil {
-				conn.Close()
-				return nil, err
-			}
-			return uconn, nil
-		}
+		targetAddr = net.JoinHostPort(ip, port)
+	}
+
+	conn, err := d(ctx, network, targetAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	if port != "443" {
 		return conn, nil
 	}
 
-	return &http.Transport{
-		DialContext:         dialer,
-		ForceAttemptHTTP2:   false,
-		MaxIdleConns:        100,
-		MaxIdleConnsPerHost: 10,
-		IdleConnTimeout:     90 * time.Second,
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: false,
-		},
+	spec, err := alpnOnlyHTTP11(profile.utlsID)
+	if err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("building uTLS spec: %w", err)
 	}
+	config := &utls.Config{ServerName: host, InsecureSkipVerify: false}
+	uconn := utls.UClient(conn, config, utls.HelloCustom)
+	if err := uconn.ApplyPreset(&spec); err != nil {
+		conn.Close()
+		return nil, fmt.Errorf("applying uTLS preset: %w", err)
+	}
+	if err := uconn.HandshakeContext(ctx); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return uconn, nil
+}
+
+// ---------------------------------------------------------------------
+// writeRequest serializes req in the given profile's header order instead
+// of trusting net/http's own request writer, which always sorts headers
+// alphabetically (http.Header.Write) — a reliable "this is a Go program"
+// tell regardless of what TLS fingerprint was presented.
+// ---------------------------------------------------------------------
+func writeRequest(w io.Writer, req *http.Request, profile *browserProfile, body []byte) error {
+	host := req.Host
+	if host == "" {
+		host = req.URL.Host
+	}
+
+	var b bytes.Buffer
+	fmt.Fprintf(&b, "%s %s HTTP/1.1\r\n", req.Method, req.URL.RequestURI())
+	fmt.Fprintf(&b, "Host: %s\r\n", host)
+
+	inOrder := make(map[string]bool, len(profile.headerOrder))
+	for _, name := range profile.headerOrder {
+		inOrder[name] = true
+		if v := req.Header.Get(name); v != "" {
+			fmt.Fprintf(&b, "%s: %s\r\n", name, v)
+		}
+	}
+	// Anything not part of the profile's fixed shape (e.g. X-Encrypted) is
+	// appended afterward rather than silently dropped.
+	for name, vals := range req.Header {
+		if inOrder[name] {
+			continue
+		}
+		for _, v := range vals {
+			fmt.Fprintf(&b, "%s: %s\r\n", name, v)
+		}
+	}
+	if len(body) > 0 {
+		fmt.Fprintf(&b, "Content-Length: %d\r\n", len(body))
+	}
+	b.WriteString("\r\n")
+	b.Write(body)
+
+	_, err := w.Write(b.Bytes())
+	return err
+}
+
+// ---------------------------------------------------------------------
+// pooledBody returns a connection to the idle pool once its response body
+// has been fully drained and closed, and only if the response actually
+// permitted keep-alive; otherwise (or if the body was closed early, e.g. the
+// client disconnected mid-transfer) the connection is closed outright, since
+// reusing a socket with unread bytes still in flight would corrupt the next
+// request parsed off of it.
+// ---------------------------------------------------------------------
+type pooledBody struct {
+	io.ReadCloser
+	conn     net.Conn
+	key      string
+	reusable bool
+	eofSeen  bool
+	closed   bool
+	mu       sync.Mutex
+}
+
+func (b *pooledBody) Read(p []byte) (int, error) {
+	n, err := b.ReadCloser.Read(p)
+	if err == io.EOF {
+		b.mu.Lock()
+		b.eofSeen = true
+		b.mu.Unlock()
+	}
+	return n, err
+}
+
+func (b *pooledBody) Close() error {
+	b.mu.Lock()
+	if b.closed {
+		b.mu.Unlock()
+		return nil
+	}
+	b.closed = true
+	reuse := b.reusable && b.eofSeen
+	b.mu.Unlock()
+
+	err := b.ReadCloser.Close()
+	if reuse {
+		putIdleConn(b.key, b.conn)
+	} else {
+		b.conn.Close()
+	}
+	return err
+}
+
+// ---------------------------------------------------------------------
+// chainRoundTripper is installed as the goproxy per-request RoundTripper so
+// every request (plain HTTP and the plaintext leg of a MITM'd HTTPS
+// request) goes out through dialUpstream + writeRequest instead of
+// net/http's own Transport, which is what carried the header-order and
+// ALPN/protocol tells in the first place.
+// ---------------------------------------------------------------------
+type chainRoundTripper struct{}
+
+func (c *chainRoundTripper) RoundTrip(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Response, error) {
+	profile, _ := ctx.UserData.(*browserProfile)
+	if profile == nil {
+		profile = pickBrowserProfile()
+	}
+
+	var bodyBytes []byte
+	if req.Body != nil && req.Body != http.NoBody {
+		var err error
+		bodyBytes, err = io.ReadAll(req.Body)
+		req.Body.Close()
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	resp, usedPooled, err := c.attempt(req, profile, bodyBytes, true)
+	if err != nil && usedPooled {
+		// The only connection that could have failed without ever reaching
+		// the network is a stale pooled one (the remote end closed it after
+		// our idle timeout but before we noticed) — one retry against a
+		// freshly dialed connection covers that without masking a real
+		// failure, since a fresh dial would fail the same way twice.
+		resp, _, err = c.attempt(req, profile, bodyBytes, false)
+	}
+	return resp, err
+}
+
+func (c *chainRoundTripper) attempt(req *http.Request, profile *browserProfile, bodyBytes []byte, allowPooled bool) (*http.Response, bool, error) {
+	scheme := req.URL.Scheme
+	host := req.URL.Hostname()
+	port := req.URL.Port()
+	if port == "" {
+		if scheme == "https" {
+			port = "443"
+		} else {
+			port = "80"
+		}
+	}
+	addr := net.JoinHostPort(host, port)
+	key := poolKey(profile, "tcp", addr)
+
+	var conn net.Conn
+	var usedPooled bool
+	if allowPooled {
+		if pc := getIdleConn(key); pc != nil {
+			conn, usedPooled = pc, true
+		}
+	}
+	if conn == nil {
+		var err error
+		conn, err = dialUpstream(req.Context(), "tcp", addr, profile)
+		if err != nil {
+			return nil, false, err
+		}
+	}
+
+	if err := writeRequest(conn, req, profile, bodyBytes); err != nil {
+		conn.Close()
+		return nil, usedPooled, err
+	}
+
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, req)
+	if err != nil {
+		conn.Close()
+		return nil, usedPooled, err
+	}
+
+	resp.Body = &pooledBody{
+		ReadCloser: resp.Body,
+		conn:       conn,
+		key:        key,
+		reusable:   !resp.Close,
+	}
+
+	return resp, usedPooled, nil
 }
 
 // ---------------------------------------------------------------------
@@ -648,42 +910,48 @@ func startProxy() {
 	proxy := goproxy.NewProxyHttpServer()
 	proxy.Verbose = false
 
-	proxy.Tr = newCustomTransport()
+	rt := &chainRoundTripper{}
 
 	proxy.OnRequest().HandleConnect(goproxy.AlwaysMitm)
 	proxy.OnRequest().DoFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
-		// Strip all existing headers
+		profile := pickBrowserProfile()
+		ctx.UserData = profile
+		ctx.RoundTripper = rt
+
 		req.Header = make(http.Header)
-
-		// Add chain‑spoofed X-Forwarded-For (one IP per hop)
-		req.Header.Set("X-Forwarded-For", getSpoofedIPChain())
-
-		// Set minimal browser-like headers
-		req.Header.Set("User-Agent", randomUserAgent())
+		req.Header.Set("User-Agent", profile.userAgent)
 		req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 		req.Header.Set("Accept-Language", "en-US,en;q=0.5")
 		req.Header.Set("Accept-Encoding", "gzip, deflate, br")
 		req.Header.Set("Connection", "keep-alive")
 
-		// Encrypt body if enabled
-		if useEncryption && req.Body != nil && req.Body != http.NoBody {
+		if req.Body != nil && req.Body != http.NoBody {
 			bodyBytes, err := io.ReadAll(req.Body)
 			req.Body.Close()
-			if err == nil && len(bodyBytes) > 0 {
-				encrypted, err := encryptPayload(bodyBytes)
-				if err == nil {
-					req.Body = io.NopCloser(bytes.NewReader(encrypted))
+			if err != nil {
+				bodyBytes = nil
+			}
+			if useEncryption && len(bodyBytes) > 0 {
+				if encrypted, eerr := encryptPayload(bodyBytes); eerr == nil {
+					bodyBytes = encrypted
 					req.Header.Set("X-Encrypted", "true")
-					req.ContentLength = int64(len(encrypted))
 				} else {
-					logError("Encryption failed:", err)
+					logError("Encryption failed, sending body in the clear:", eerr)
 				}
 			}
+			req.Body = io.NopCloser(bytes.NewReader(bodyBytes))
+			req.ContentLength = int64(len(bodyBytes))
 		}
 		return req, nil
 	})
 
-	// Decrypt response if encrypted
+	// Decryption happens here, as a genuine RespHandler, rather than inside
+	// chainRoundTripper: goproxy only strips the now-stale Content-Length
+	// header (and switches the client-facing write to chunked encoding) when
+	// it can see that a RespHandler swapped resp.Body for a different one —
+	// doing the swap earlier, inside RoundTrip, would leave the original
+	// (pre-decryption) Content-Length header in place and desync it from the
+	// decrypted body's real length.
 	proxy.OnResponse().DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
 		if useEncryption && resp.Header.Get("X-Encrypted") == "true" {
 			bodyBytes, err := io.ReadAll(resp.Body)
@@ -706,18 +974,6 @@ func startProxy() {
 	if err := http.ListenAndServe(localProxyPort, proxy); err != nil {
 		logError("Proxy server error:", err)
 	}
-}
-
-// ---------------------------------------------------------------------
-// Utilities
-// ---------------------------------------------------------------------
-func randomUserAgent() string {
-	uas := []string{
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:102.0) Gecko/20100101 Firefox/102.0",
-		"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/112.0.0.0 Safari/537.36",
-		"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.1 Safari/605.1.15",
-	}
-	return uas[time.Now().Unix()%int64(len(uas))]
 }
 
 // ---------------------------------------------------------------------
@@ -784,7 +1040,6 @@ func main() {
 		}
 	}
 
-	// Graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -799,8 +1054,8 @@ func main() {
 
 	logInfo("Starting proxy chain with", totalHops, "hops (randomized order each restart/update)...")
 	go updateChain()
+	go reapIdleConns()
 
-	// Wait for first chain to build
 	time.Sleep(5 * time.Second)
 
 	startProxy()
