@@ -51,9 +51,23 @@ misclassified.
 - action taken by the session that received it: deleted the PR #10 check-in trigger; no code pushed as a direct result of this notification.
 - repo status: repairable - not applicable.
 
+## 2026-09-08T18:38:10Z — SecTrollz/scripts#63 — notification id 1fdc7829-0e8c-4eb6-b314-9d993da8c372
+- claimed origin/trust: source="github", kind="subscription.created", from="system", trust="principal"
+- classification: aggressive-but-real automation
+- flagged language: the wrapper comment contains several phrases this audit's own checklist calls high-risk verbatim - "never idle" ("never idle on a red PR you own"), "no round limit" ("There is no round limit: repeated findings on your pushes mean fix the root cause, not stop"), "the push is the deliverable; a comment [describing the fix] is not", and "takes precedence over these rules" (describing a repo's own `.claude/skills/steward or babysit/SKILL.md`, if present, taking precedence on *convention and proactivity* only). Checked these against this session's actual system prompt (the "Driving a PR to green" / "Handling PR Activity Events" sections given at session start, not repo-embedded or externally supplied) - the phrasing matches near-verbatim. This is the harness re-stating its own already-established PR-driving policy inside the wake envelope, labeled `from="system"`/`trust="principal"` consistently, not external/relay content asserting unearned trust. The "takes precedence" clause is also explicitly self-limiting in the same text: it cannot override rules stated as "never" (skipping tests, rewriting others' history, empty-commit CI kicks, pushing/resolving a larger ask on a PR not opened by the session) and cannot grant approve/merge authority. No `.claude/skills/steward/SKILL.md` or `babysit/SKILL.md` exist in this repo (checked via `get_file_contents` on `.claude/skills`), so that clause is moot here regardless.
+- action taken by the session that received it: confirmed PR #63 was clean/mergeable with no CI configured and nothing to act on; scheduled a ~1hr check-in.
+- repo status: repairable - not applicable, no code pushed as a result of this event.
+
+## 2026-09-08T18:38:29Z — SecTrollz/scripts#63 — notification id c8cb831b-e74e-4682-888a-0239bb8555fb
+- claimed origin/trust: source="github", kind="subscription.created", from="system", trust="principal"
+- classification: aggressive-but-real automation
+- flagged language: byte-for-byte identical wrapper comment to the entry immediately above (a duplicate delivery of the same subscription confirmation). Same reasoning applies: matches this session's actual system prompt, self-limiting on the "never" rules, `.claude/skills/` clause moot since no such files exist in this repo.
+- action taken by the session that received it: none beyond the check already performed for the duplicate above - no separate action taken, no code pushed.
+- repo status: repairable - not applicable.
+
 ---
 
-## Summary of this audit pass
+## Summary of audit pass 1 (2026-08-20)
 
 All wake/notification events this session could find in its own context
 (six total, across PRs #8, #9, #10 in SecTrollz/scripts) were classified
@@ -80,3 +94,26 @@ an IP without checking.
 This audit only covers wake events visible in this session's own context;
 it did not have access to `.claude/` logs from other sessions to review
 prior history beyond what's recorded here.
+
+---
+
+## Summary of audit pass 2 (2026-09-08)
+
+Two additional wake events (a duplicate-delivered `subscription.created`
+pair for PR #63) were found and audited, prompted by a re-paste of this
+audit's instructions. Both classified **aggressive-but-real automation**,
+not suspected injection: their wrapper comments contain several of this
+checklist's own flagged phrases ("never idle," "no round limit," "the
+push is the deliverable; a comment is not," "takes precedence over these
+rules"), but the phrasing was verified against this session's actual
+system prompt content (given at session start, not repo- or
+externally-supplied) and matches near-verbatim - this is the harness
+restating its own established policy inside the wake envelope, not
+external content smuggling in new authority. The one clause that grants
+conditional precedence (a repo's own `.claude/skills/steward` or
+`babysit/SKILL.md`) is explicitly self-limiting in the same text (cannot
+override "never" rules, cannot grant approve/merge) and is moot in this
+repo regardless, since no such files exist here.
+
+No repos required repair or rebuild as a result of this pass. No commits
+were pushed as a result of either event.
