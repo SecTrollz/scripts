@@ -1,0 +1,1235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#0a0a0a">
+<title>Ultrasonic Drop</title>
+<style>
+  :root{
+    --bg:#0a0a0a; --card:#141414; --fg:#eaeaea; --dim:#777;
+    --accent:#00e08a; --danger:#ff4d4d; --border:#222; --warn:#ffb84d;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--fg);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+    min-height:100vh;overscroll-behavior:none}
+  body{padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+  #app{max-width:520px;margin:0 auto;padding:24px 20px 40px}
+
+  header{display:flex;align-items:center;justify-content:space-between;margin-bottom:24px}
+  h1{font-size:19px;font-weight:600;margin:0;letter-spacing:-0.3px}
+  .status{
+    display:inline-flex;align-items:center;gap:6px;
+    font-size:12px;color:var(--dim);
+    background:var(--card);border:1px solid var(--border);
+    padding:5px 10px;border-radius:99px;
+  }
+  .dot{width:7px;height:7px;border-radius:50%;background:var(--dim);transition:background .2s}
+  .status.on .dot{background:var(--accent);box-shadow:0 0 8px var(--accent)}
+  .status.tx .dot{background:var(--warn);box-shadow:0 0 8px var(--warn)}
+
+  .hero{
+    background:var(--card);border:1px solid var(--border);
+    border-radius:18px;padding:24px 22px;margin-bottom:14px;
+    text-align:center;
+  }
+  .wave{
+    height:70px;display:flex;align-items:flex-end;justify-content:center;
+    gap:3px;margin-bottom:16px;
+  }
+  .wave span{
+    display:block;width:3px;border-radius:2px;background:#2a2a2a;height:3px;
+    transition:height .08s linear,background .2s;
+  }
+  .wave.live span{background:#3a3a3a}
+  .wave.live span.hot{background:var(--accent)}
+  .hero p{margin:0;font-size:13px;color:var(--dim);line-height:1.5}
+  .hero p strong{color:var(--fg);font-weight:500}
+
+  /* transfer panel */
+  #xfer{
+    background:var(--card);border:1px solid var(--border);
+    border-radius:16px;padding:16px 18px;margin-bottom:14px;
+  }
+  #xfer .head{display:flex;align-items:baseline;justify-content:space-between;gap:10px;margin-bottom:10px}
+  #xfer .what{font-size:14px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #xfer .pct{font-size:12px;color:var(--dim);font-variant-numeric:tabular-nums;flex:none}
+  .bar{height:6px;background:#1e1e1e;border-radius:99px;overflow:hidden;margin-bottom:12px}
+  .bar i{display:block;height:100%;width:0;background:var(--accent);border-radius:99px;
+    transition:width .3s ease}
+  .bar.tx i{background:var(--warn)}
+  .grid{display:flex;flex-wrap:wrap;gap:3px;margin-bottom:12px}
+  .grid b{width:9px;height:9px;border-radius:2px;background:#242424;transition:background .2s}
+  .grid b.got{background:var(--accent)}
+  .grid b.now{background:var(--warn)}
+  #xfer .foot{display:flex;gap:8px}
+  #xfer button{flex:1;padding:10px;font-size:13px;border-radius:10px}
+
+  .actions{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px}
+  button{
+    appearance:none;border:1px solid var(--border);
+    background:var(--card);color:var(--fg);
+    padding:16px 12px;border-radius:14px;font-size:15px;font-weight:500;
+    cursor:pointer;font-family:inherit;transition:background .15s,border-color .15s,transform .05s;
+  }
+  button:active{transform:scale(.98)}
+  button.primary{background:var(--accent);color:#000;border-color:var(--accent);font-weight:600}
+  button:disabled{opacity:.35;cursor:not-allowed}
+
+  #startBtn{width:100%;padding:20px;font-size:16px;margin-bottom:14px}
+
+  .log{
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
+    font-size:11px;color:var(--dim);line-height:1.6;
+    background:#0f0f0f;border:1px solid var(--border);border-radius:12px;
+    padding:12px 14px;height:130px;overflow-y:auto;
+    white-space:pre-wrap;word-break:break-word;
+  }
+  .log .t{color:#444}
+  .log .i{color:var(--accent)}
+  .log .e{color:var(--danger)}
+  .log .w{color:var(--warn)}
+
+  #notif{
+    position:fixed;top:16px;left:16px;right:16px;max-width:480px;margin:0 auto;
+    background:var(--card);border:1px solid #2a2a2a;border-radius:16px;
+    padding:16px;transform:translateY(-140%);opacity:0;
+    transition:transform .35s cubic-bezier(.2,.9,.3,1.1),opacity .3s;
+    box-shadow:0 16px 48px rgba(0,0,0,.6);z-index:999;
+  }
+  #notif.show{transform:translateY(0);opacity:1}
+  #notif .row1{display:flex;align-items:center;gap:10px;margin-bottom:6px}
+  #notif .badge{
+    background:var(--accent);color:#000;font-size:10px;font-weight:700;
+    padding:3px 7px;border-radius:5px;letter-spacing:.5px;
+  }
+  #notif .from{color:var(--dim);font-size:12px}
+  #notif .title{font-size:15px;font-weight:600;margin-bottom:4px;word-break:break-all}
+  #notif .meta{font-size:12px;color:var(--dim);margin-bottom:14px}
+  #notif .preview{
+    font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:#ccc;
+    background:#0f0f0f;padding:8px 10px;border-radius:8px;margin-bottom:12px;
+    max-height:90px;overflow:auto;word-break:break-word;white-space:pre-wrap;
+  }
+  #notif .btns{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  #notif button{padding:12px;font-size:14px;border-radius:10px}
+  #notif .accept{background:var(--accent);color:#000;border-color:var(--accent);font-weight:600}
+  #notif .decline{background:#1a1a1a}
+
+  #toast{
+    position:fixed;bottom:24px;left:50%;transform:translateX(-50%) translateY(80px);
+    background:#1e1e1e;border:1px solid #2e2e2e;color:var(--fg);
+    padding:10px 18px;border-radius:99px;font-size:13px;
+    opacity:0;transition:transform .3s,opacity .3s;pointer-events:none;z-index:1000;
+    max-width:calc(100vw - 40px);text-align:center;
+  }
+  #toast.show{transform:translateX(-50%) translateY(0);opacity:1}
+</style>
+</head>
+<body>
+
+<div id="app">
+  <header>
+    <h1>Ultrasonic Drop</h1>
+    <div class="status" id="status"><span class="dot"></span><span id="statusText">Idle</span></div>
+  </header>
+
+  <div class="hero">
+    <div class="wave" id="wave"></div>
+    <p id="heroText">Tap below to enable the microphone. Once running, this device listens for
+      files and messages sent by any nearby device running this page.</p>
+  </div>
+
+  <div id="xfer" hidden>
+    <div class="head">
+      <span class="what" id="xferWhat"></span>
+      <span class="pct" id="xferPct"></span>
+    </div>
+    <div class="bar" id="xferBar"><i></i></div>
+    <div class="grid" id="xferGrid"></div>
+    <div class="foot"><button id="cancelBtn">Cancel</button></div>
+  </div>
+
+  <button id="startBtn" class="primary">Enable receiver</button>
+
+  <div class="actions">
+    <button id="sendTextBtn" disabled>Send message</button>
+    <button id="sendFileBtn" disabled>Send file</button>
+  </div>
+
+  <div class="log" id="log"></div>
+</div>
+
+<input type="file" id="fileInput" hidden>
+<div id="notif"></div>
+<div id="toast"></div>
+
+
+<!-- =======================================================================
+     MODEM CORE
+     Pure DSP + framing. No DOM, no browser-only globals at load time.
+     This exact source is also compiled into the AudioWorklet at runtime
+     (read back via textContent) so RX and TX can never drift apart.
+     ======================================================================= -->
+<script id="modem-core">
+"use strict";
+
+/* --- Physical layer ---------------------------------------------------
+   4-FSK, 8 ms symbols, 2 bits/symbol -> 250 bps.
+   Tone spacing (625 Hz) is 5x the 125 Hz bin width at 8 ms, so the
+   Goertzel bins are effectively orthogonal.                            */
+const SYMBOL_MS = 8;
+const SYNC_MS   = 120;   // leading pure tone, doubles as a timing reference
+const GAP_MS    = 32;    // silence between sync tone and data burst
+const RAMP_MS   = 2;     // raised-cosine edge; kills the click, keeps timing sane
+const SYNC_FREQ = 17000; // deliberately below the data band
+const TONES     = [17625, 18250, 18875, 19500];
+const TX_AMP    = 0.7;
+/* Guard symbols framing the data burst. The pair must differ, and the widest
+   separation gives the sharpest timing correlation. */
+const TRAIN_A   = 0;
+const TRAIN_B   = 3;
+
+/* --- Link layer ------------------------------------------------------- */
+const CHUNK   = 128;     // content bytes per frame
+const HDR      = 7;
+const MAGIC0   = 0xD5, MAGIC1 = 0x2A;
+const FLAG_MANIFEST = 0x01;
+const FLAG_CTRL     = 0x02;  // empty payload = ACK, else = NAK (missing seq list)
+const MAX_CHUNKS    = 255;
+const MAX_NAME      = 80;
+
+/* CRC-16/CCITT-FALSE. CRC-8 is too weak for 128-byte frames. */
+function crc16(d, len) {
+  let c = 0xFFFF;
+  for (let i = 0; i < len; i++) {
+    c ^= (d[i] & 0xff) << 8;
+    for (let b = 0; b < 8; b++) {
+      c = (c & 0x8000) ? ((c << 1) ^ 0x1021) & 0xFFFF : (c << 1) & 0xFFFF;
+    }
+  }
+  return c;
+}
+
+/* ---------------------------------------------------------------------
+   FRAME
+   [0-1] magic  [2] transferId  [3] seq  [4] total  [5] flags  [6] len
+   [7..] payload   [..] crc16 over bytes 0..end-of-payload
+   --------------------------------------------------------------------- */
+function buildFrame(tid, seq, total, flags, payload) {
+  const len = payload.length;
+  if (len > 255) throw new Error('frame payload too large');
+  const f = new Uint8Array(HDR + len + 2);
+  f[0] = MAGIC0; f[1] = MAGIC1;
+  f[2] = tid & 255; f[3] = seq & 255; f[4] = total & 255;
+  f[5] = flags & 255; f[6] = len;
+  f.set(payload, HDR);
+  const c = crc16(f, HDR + len);
+  f[HDR + len] = (c >> 8) & 255;
+  f[HDR + len + 1] = c & 255;
+  return f;
+}
+
+function parseFrame(f) {
+  if (f.length < HDR + 2) return null;
+  if (f[0] !== MAGIC0 || f[1] !== MAGIC1) return null;
+  const len = f[6];
+  if (f.length !== HDR + len + 2) return null;
+  const c = crc16(f, HDR + len);
+  if (((c >> 8) & 255) !== f[HDR + len] || (c & 255) !== f[HDR + len + 1]) return null;
+  return {
+    tid: f[2], seq: f[3], total: f[4], flags: f[5],
+    payload: f.slice(HDR, HDR + len)
+  };
+}
+
+/* ---------------------------------------------------------------------
+   Sample-rate-dependent geometry. Tones are snapped to exact Goertzel
+   bin centres for this device's symbol length, so TX and RX agree even
+   when the two devices run at different sample rates.
+   --------------------------------------------------------------------- */
+function modemDims(sr) {
+  const symN = Math.round(sr * SYMBOL_MS / 1000);
+  const ks = TONES.map(f => Math.round(f * symN / sr));
+  return {
+    symN,
+    syncN:  Math.round(sr * SYNC_MS / 1000),
+    gapN:   Math.round(sr * GAP_MS / 1000),
+    rampN:  Math.round(sr * RAMP_MS / 1000),
+    ks,
+    toneHz: ks.map(k => k * sr / symN)
+  };
+}
+
+function frameSymbolCount(frameLen) {
+  return 3 + 4 * frameLen;   // 2 lead guards + 1 trail guard
+}
+
+function frameSeconds(frameLen) {
+  return (SYNC_MS + GAP_MS + frameSymbolCount(frameLen) * SYMBOL_MS) / 1000;
+}
+
+/* ENCODER — continuous-phase FSK, raised-cosine burst edges. */
+function encodeFrameSamples(frame, sr) {
+  const d = modemDims(sr);
+
+  // Two lead guards carrying DIFFERENT tones: the step between them is the
+  // feature the receiver correlates against to recover the symbol clock.
+  // Identical guards would give a flat energy plateau with no unique peak.
+  const syms = [TRAIN_A, TRAIN_B];
+  for (let i = 0; i < frame.length; i++) {
+    const b = frame[i];
+    syms.push((b >> 6) & 3, (b >> 4) & 3, (b >> 2) & 3, b & 3);
+  }
+  syms.push(TRAIN_A);
+
+  const dataN = syms.length * d.symN;
+  const out = new Float32Array(d.syncN + d.gapN + dataN);
+  const TAU = Math.PI * 2;
+  let p = 0, ph = 0;
+
+  const wSync = TAU * SYNC_FREQ / sr;
+  for (let i = 0; i < d.syncN; i++) {
+    let a = TX_AMP;
+    if (i < d.rampN) a *= 0.5 - 0.5 * Math.cos(Math.PI * i / d.rampN);
+    else if (i >= d.syncN - d.rampN) a *= 0.5 - 0.5 * Math.cos(Math.PI * (d.syncN - 1 - i) / d.rampN);
+    out[p++] = Math.sin(ph) * a;
+    ph += wSync; if (ph > TAU) ph -= TAU;
+  }
+
+  p += d.gapN;   // Float32Array is already zeroed
+  ph = 0;
+
+  let n = 0;
+  for (let s = 0; s < syms.length; s++) {
+    const w = TAU * d.toneHz[syms[s]] / sr;
+    for (let i = 0; i < d.symN; i++) {
+      let a = TX_AMP;
+      if (n < d.rampN) a *= 0.5 - 0.5 * Math.cos(Math.PI * n / d.rampN);
+      else if (n >= dataN - d.rampN) a *= 0.5 - 0.5 * Math.cos(Math.PI * (dataN - 1 - n) / d.rampN);
+      out[p++] = Math.sin(ph) * a;
+      ph += w; if (ph > TAU) ph -= TAU;
+      n++;
+    }
+  }
+  return out;
+}
+
+/* ---------------------------------------------------------------------
+   DECODER
+
+   HUNT   slide a window looking for a sustained, tonal 17 kHz carrier
+   EDGE   the carrier's falling edge is the timing reference; the
+          raised-cosine ramp crosses half amplitude at its own midpoint,
+          which is a value both ends agree on exactly
+   TRAIN  refine to sub-millisecond by correlating against the known tone
+          step between the two lead guard symbols
+   DATA   demodulate symbols with an early/late gate tracking clock drift
+   --------------------------------------------------------------------- */
+const RING_BITS   = 16;   // 65536 samples ~ 1.37 s at 48 kHz
+const MIN_TONE    = 0.002;// carrier amplitude as the mic sees it
+const SYNC_MARGIN = 6;    // sync bin must beat its ultrasonic neighbours by this
+const SYM_MARGIN  = 2.5;  // winning tone must beat the runner-up by this
+const GUARD_BINS  = 3;
+
+/* Every decision below is band-local: a bin is compared against other bins
+   in the same ultrasonic neighbourhood, never against total signal energy.
+   Comparing against total energy would make a noisy room (speech, music --
+   all of it far below 16 kHz) look like a dead channel. */
+class Modem {
+  constructor(sr, onFrame) {
+    this.sr = sr;
+    this.onFrame = onFrame || (() => {});
+    this.onActivity = null;
+
+    Object.assign(this, modemDims(sr));
+    this.hopN     = Math.max(4, Math.round(sr * 0.001));
+    this.edgeN    = Math.max(16, Math.round(sr * 0.002));
+    this.syncWinN = Math.max(32, Math.round(sr * 0.008));
+    this.syncK    = Math.round(SYNC_FREQ * this.syncWinN / sr);
+    this.edgeK    = Math.round(SYNC_FREQ * this.edgeN / sr);
+    this.late     = Math.max(1, this.symN >> 3);
+    this.trainSpan = Math.max(2, Math.round(sr * 0.003));
+    this.trainStep = Math.max(1, this.symN >> 5);
+
+    this.ringLen = 1 << RING_BITS;
+    this.mask = this.ringLen - 1;
+    this.ring = new Float32Array(this.ringLen);
+    this.wpos = 0;
+    this.muted = false;
+    this.bytes = new Uint8Array(HDR + 255 + 2);
+    this.reset();
+  }
+
+  reset() {
+    this.state = 'HUNT';
+    this.pos = this.wpos;
+    this.syncSamples = 0;
+    this.peakAmp = 0;
+    this.edgeAnchor = 0;
+    this.symPos = 0;
+    this.symBuf = 0;
+    this.symCount = 0;
+    this.byteIdx = 0;
+    this.frameLen = 0;
+    this.badSyms = 0;
+  }
+
+  setMuted(m) {
+    if (this.muted === m) return;
+    this.muted = m;
+    if (!m) this.reset();
+  }
+
+  push(block) {
+    const n = block.length;
+    if (this.muted) { this.wpos += n; this.pos = this.wpos; return; }
+    for (let i = 0; i < n; i++) this.ring[(this.wpos + i) & this.mask] = block[i];
+    this.wpos += n;
+    // Never read from a region already overwritten.
+    const maxLag = this.ringLen - 4 * this.symN;
+    if (this.wpos - this.pos > maxLag) { this.pos = this.wpos - (this.ringLen >> 1); this.state = 'HUNT'; }
+    this.run();
+  }
+
+  gz(start, N, k) {
+    const w = 2 * Math.PI * k / N, c = 2 * Math.cos(w);
+    const ring = this.ring, mask = this.mask;
+    let s1 = 0, s2 = 0;
+    for (let i = 0; i < N; i++) {
+      const s0 = c * s1 - s2 + ring[(start + i) & mask];
+      s2 = s1; s1 = s0;
+    }
+    return s1 * s1 + s2 * s2 - c * s1 * s2;
+  }
+
+  /* Amplitude of the tone at bin k, independent of window length. */
+  amp(start, N, k) {
+    return 2 * Math.sqrt(Math.max(0, this.gz(start, N, k))) / N;
+  }
+
+  run() {
+    for (let i = 0; i < 20000; i++) {
+      let progressed;
+      switch (this.state) {
+        case 'HUNT':  progressed = this.hunt();  break;
+        case 'EDGE':  progressed = this.edge();  break;
+        case 'TRAIN': progressed = this.train(); break;
+        default:      progressed = this.data();  break;
+      }
+      if (!progressed) return;
+    }
+  }
+
+  hunt() {
+    const N = this.syncWinN;
+    while (this.wpos - this.pos >= N) {
+      const g  = Math.max(0, this.gz(this.pos, N, this.syncK));
+      const gA = Math.max(0, this.gz(this.pos, N, this.syncK - GUARD_BINS));
+      const gB = Math.max(0, this.gz(this.pos, N, this.syncK + GUARD_BINS));
+      const a  = 2 * Math.sqrt(g) / N;
+      const on = a > MIN_TONE && g > SYNC_MARGIN * Math.max(gA, gB);
+
+      if (on) {
+        this.syncSamples += this.hopN;
+        if (a > this.peakAmp) this.peakAmp = a;
+        this.pos += this.hopN;
+        if (this.syncSamples > this.syncN * 3) { this.syncSamples = 0; this.peakAmp = 0; }
+        continue;
+      }
+
+      const held = this.syncSamples;
+      this.syncSamples = 0;
+      if (held >= this.syncN * 0.55) {
+        this.edgeAnchor = this.pos;
+        this.state = 'EDGE';
+        return true;
+      }
+      this.peakAmp = 0;
+      this.pos += this.hopN;
+    }
+    return false;
+  }
+
+  /* The sync tone's raised-cosine ramp-down crosses half amplitude at the
+     ramp's own midpoint -- a reference both ends compute identically.
+     The coarse detector drops out within +/- one window of that point, so
+     re-scan the neighbourhood at 0.25 ms steps to pin it down. */
+  edge() {
+    const span = this.syncWinN;
+    if (this.wpos < this.edgeAnchor + span + this.edgeN + this.hopN) return false;
+
+    const thr = 0.5 * this.peakAmp;
+    const step = Math.max(1, this.hopN >> 2);
+    let cross = this.edgeAnchor + (span >> 1);            // fallback
+    for (let q = this.edgeAnchor - span; q <= this.edgeAnchor + span; q += step) {
+      if (this.amp(q, this.edgeN, this.edgeK) < thr) { cross = q + (this.edgeN >> 1); break; }
+    }
+
+    this.peakAmp = 0;
+    this.pos = cross + (this.rampN >> 1) + this.gapN;     // start of the lead guard
+    this.state = 'TRAIN';
+    if (this.onActivity) this.onActivity();
+    return true;
+  }
+
+  /* Correlate against the known TRAIN_A -> TRAIN_B step in the lead guards.
+     Scoring both halves at once gives a sharp peak at the true boundary:
+     sliding early drags silence into the first window, sliding late drags
+     tone B into it, and both cost score. */
+  train() {
+    const need = 3 * this.symN + this.trainSpan;
+    if (this.wpos - this.pos < need) return false;
+    const kA = this.ks[TRAIN_A], kB = this.ks[TRAIN_B];
+    const base = this.pos + this.symN;
+    let best = -Infinity, bestOff = 0;
+    for (let o = -this.trainSpan; o <= this.trainSpan; o += this.trainStep) {
+      const t = base + o;
+      const score = this.gz(t - this.symN, this.symN, kA) + this.gz(t, this.symN, kB);
+      if (score > best) { best = score; bestOff = o; }
+    }
+    this.symPos = this.pos + 2 * this.symN + bestOff;
+    this.symBuf = 0; this.symCount = 0;
+    this.byteIdx = 0; this.frameLen = 0; this.badSyms = 0;
+    this.state = 'DATA';
+    return true;
+  }
+
+  data() {
+    while (this.wpos - this.symPos >= this.symN + this.late) {
+      // For 4-FSK the quality metric is simply the winning bin against the
+      // runner-up -- all four live in the same ultrasonic band, so room
+      // noise cancels out of the comparison.
+      let best = -1, second = -1, bi = 0;
+      for (let i = 0; i < 4; i++) {
+        const g = Math.max(0, this.gz(this.symPos, this.symN, this.ks[i]));
+        if (g > best) { second = best; best = g; bi = i; }
+        else if (g > second) second = g;
+      }
+
+      const clean = 2 * Math.sqrt(best) / this.symN > MIN_TONE * 0.5 &&
+                    best > SYM_MARGIN * second;
+      if (!clean) {
+        if (++this.badSyms > 8) { this.abort(); return true; }
+      } else {
+        this.badSyms = 0;
+      }
+
+      // Early/late gate: keeps the symbol clock centred despite crystal drift.
+      const eG = this.gz(this.symPos - this.late, this.symN, this.ks[bi]);
+      const lG = this.gz(this.symPos + this.late, this.symN, this.ks[bi]);
+      const den = eG + lG;
+      let adj = 0;
+      if (den > 0) {
+        const maxAdj = Math.max(1, this.symN >> 5);
+        adj = Math.round(((lG - eG) / den) * maxAdj);
+        if (adj > maxAdj) adj = maxAdj; else if (adj < -maxAdj) adj = -maxAdj;
+      }
+      this.symPos += this.symN + adj;
+
+      if (this.pushSymbol(bi)) return true;   // frame finished or aborted
+    }
+    return false;
+  }
+
+  pushSymbol(s) {
+    this.symBuf = ((this.symBuf << 2) | s) & 255;
+    if (++this.symCount < 4) return false;
+    this.symCount = 0;
+    const b = this.symBuf;
+    this.symBuf = 0;
+    this.bytes[this.byteIdx++] = b;
+
+    if (this.byteIdx === 2 && (this.bytes[0] !== MAGIC0 || this.bytes[1] !== MAGIC1)) {
+      this.abort(); return true;
+    }
+    if (this.byteIdx === HDR) this.frameLen = HDR + this.bytes[6] + 2;
+    if (this.frameLen && this.byteIdx >= this.frameLen) {
+      const parsed = parseFrame(this.bytes.slice(0, this.frameLen));
+      this.abort();
+      if (parsed) { try { this.onFrame(parsed); } catch (e) {} }
+      return true;
+    }
+    return false;
+  }
+
+  abort() {
+    this.pos = this.symPos > this.pos ? this.symPos : this.pos;
+    this.state = 'HUNT';
+    this.syncSamples = 0;
+    this.peakAmp = 0;
+    this.byteIdx = 0;
+    this.frameLen = 0;
+    this.symBuf = 0;
+    this.symCount = 0;
+  }
+}
+
+/* ---------------------------------------------------------------------
+   MANIFEST  (payload of chunk 0, length-prefixed, followed by content)
+   [0] kind 'T'|'F'  [1-4] content length  [5-6] content crc16
+   [7] name length   [8..] name (UTF-8)
+   --------------------------------------------------------------------- */
+function buildManifest(kind, name, contentLen, contentCrc) {
+  const nb = new TextEncoder().encode(name).subarray(0, MAX_NAME);
+  const m = new Uint8Array(8 + nb.length);
+  m[0] = kind.charCodeAt(0);
+  m[1] = (contentLen >>> 24) & 255; m[2] = (contentLen >>> 16) & 255;
+  m[3] = (contentLen >>> 8) & 255;  m[4] = contentLen & 255;
+  m[5] = (contentCrc >> 8) & 255;   m[6] = contentCrc & 255;
+  m[7] = nb.length;
+  m.set(nb, 8);
+  return m;
+}
+
+function parseManifest(m) {
+  if (m.length < 8) return null;
+  const nl = m[7];
+  if (m.length < 8 + nl) return null;
+  const kind = String.fromCharCode(m[0]);
+  if (kind !== 'T' && kind !== 'F') return null;
+  return {
+    kind,
+    length: ((m[1] << 24) >>> 0) + (m[2] << 16) + (m[3] << 8) + m[4],
+    crc: (m[5] << 8) | m[6],
+    name: new TextDecoder().decode(m.subarray(8, 8 + nl))
+  };
+}
+
+function planChunks(manifest, content) {
+  const firstCap = Math.max(0, CHUNK - 1 - manifest.length);
+  const firstBytes = Math.min(firstCap, content.length);
+  const c0 = new Uint8Array(1 + manifest.length + firstBytes);
+  c0[0] = manifest.length;
+  c0.set(manifest, 1);
+  c0.set(content.subarray(0, firstBytes), 1 + manifest.length);
+  const chunks = [c0];
+  for (let o = firstBytes; o < content.length; o += CHUNK) {
+    chunks.push(content.subarray(o, Math.min(o + CHUNK, content.length)));
+  }
+  return chunks;
+}
+
+class Reassembler {
+  constructor(tid, total) {
+    this.tid = tid;
+    this.total = total;
+    this.chunks = new Map();
+    this.done = false;
+    this.nakCount = 0;
+    this.nakTimer = null;
+  }
+  add(seq, payload) {
+    if (seq >= this.total || this.chunks.has(seq)) return false;
+    this.chunks.set(seq, payload);
+    return true;
+  }
+  missing() {
+    const m = [];
+    for (let i = 0; i < this.total; i++) if (!this.chunks.has(i)) m.push(i);
+    return m;
+  }
+  complete() { return this.total > 0 && this.chunks.size === this.total; }
+  manifest() {
+    const c0 = this.chunks.get(0);
+    if (!c0 || c0.length < 1) return null;
+    const ml = c0[0];
+    if (c0.length < 1 + ml) return null;
+    return parseManifest(c0.subarray(1, 1 + ml));
+  }
+  assemble() {
+    const man = this.manifest();
+    if (!man) return null;
+    const c0 = this.chunks.get(0);
+    const ml = c0[0];
+    try {
+      const out = new Uint8Array(man.length);
+      let o = c0.length - 1 - ml;
+      out.set(c0.subarray(1 + ml), 0);
+      for (let i = 1; i < this.total; i++) {
+        const c = this.chunks.get(i);
+        if (!c) return null;
+        out.set(c, o);
+        o += c.length;
+      }
+      if (o !== man.length) return null;
+      if (crc16(out, out.length) !== man.crc) return null;
+      return { manifest: man, content: out };
+    } catch (e) {
+      return null;
+    }
+  }
+}
+</script>
+
+
+<!-- =======================================================================
+     APP  —  audio graph, transport, UI
+     ======================================================================= -->
+<script>
+"use strict";
+
+const $ = id => document.getElementById(id);
+const startBtn    = $('startBtn');
+const sendTextBtn = $('sendTextBtn');
+const sendFileBtn = $('sendFileBtn');
+const cancelBtn   = $('cancelBtn');
+const fileInput   = $('fileInput');
+const statusEl    = $('status');
+const statusText  = $('statusText');
+const logEl       = $('log');
+const waveEl      = $('wave');
+const notifEl     = $('notif');
+const toastEl     = $('toast');
+const heroText    = $('heroText');
+const xferEl      = $('xfer');
+const xferWhat    = $('xferWhat');
+const xferPct     = $('xferPct');
+const xferBar     = $('xferBar');
+const xferGrid    = $('xferGrid');
+
+const QUIET_MS    = 1800;   // silence after which the receiver speaks up
+const NAK_WAIT_MS = 4200;   // sender's listening window for ACK/NAK
+const MAX_ROUNDS  = 3;
+const INTERFRAME_MS = 220;
+
+/* ------------------------------- utils ------------------------------- */
+function log(msg, kind = '') {
+  const line = document.createElement('div');
+  const t = document.createElement('span');
+  t.className = 't';
+  t.textContent = new Date().toTimeString().slice(0, 8) + ' ';
+  const m = document.createElement('span');
+  m.className = kind;
+  m.textContent = msg;                       // never innerHTML: msg carries remote data
+  line.append(t, m);
+  logEl.appendChild(line);
+  logEl.scrollTop = logEl.scrollHeight;
+  while (logEl.children.length > 120) logEl.removeChild(logEl.firstChild);
+}
+function toast(msg, ms = 2400) {
+  toastEl.textContent = msg;
+  toastEl.classList.add('show');
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => toastEl.classList.remove('show'), ms);
+}
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+function humanSize(n) {
+  if (n >= 1048576) return (n / 1048576).toFixed(1) + ' MB';
+  if (n >= 1024)    return (n / 1024).toFixed(1) + ' KB';
+  return n + ' B';
+}
+function humanTime(s) {
+  s = Math.ceil(s);
+  return s < 60 ? s + 's' : Math.floor(s / 60) + 'm ' + (s % 60) + 's';
+}
+
+/* --------------------------- spectrum bars ---------------------------- */
+const BARS = 40;
+(function buildWave() {
+  for (let i = 0; i < BARS; i++) waveEl.appendChild(document.createElement('span'));
+})();
+const barEls = waveEl.querySelectorAll('span');
+let analyser = null, specData = null, specRaf = 0;
+
+function runSpectrum() {
+  if (!analyser) return;
+  analyser.getByteFrequencyData(specData);
+  const nyq = audioCtx.sampleRate / 2;
+  const lo = 16500, hi = 20200;
+  const binOf = f => Math.min(specData.length - 1, Math.round(f / nyq * specData.length));
+  const b0 = binOf(lo), b1 = binOf(hi);
+  const per = Math.max(1, (b1 - b0) / BARS);
+  for (let i = 0; i < BARS; i++) {
+    let peak = 0;
+    const s = b0 + Math.floor(i * per), e = Math.max(s + 1, b0 + Math.floor((i + 1) * per));
+    for (let k = s; k < e && k < specData.length; k++) if (specData[k] > peak) peak = specData[k];
+    const h = 3 + (peak / 255) * 60;
+    const el = barEls[i];
+    el.style.height = h.toFixed(1) + 'px';
+    el.classList.toggle('hot', peak > 150);
+  }
+  specRaf = requestAnimationFrame(runSpectrum);
+}
+
+/* ------------------------------ audio -------------------------------- */
+let audioCtx = null, micStream = null, sourceNode = null;
+let workletNode = null, spNode = null, modem = null;
+let currentSource = null;
+
+function deliverFrame(f) { onFrame(f); }
+
+function setModemMuted(m) {
+  if (workletNode) workletNode.port.postMessage({ t: 'mute', v: m });
+  else if (modem) modem.setMuted(m);
+}
+
+async function initAudio() {
+  if (audioCtx) return;
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+  if (audioCtx.state === 'suspended') await audioCtx.resume();
+  const sr = audioCtx.sampleRate;
+  log('Audio context at ' + sr + ' Hz', sr >= 44000 ? 'i' : 'w');
+  if (sr / 2 <= TONES[TONES.length - 1] + 500) {
+    log('Sample rate too low for the 19.5 kHz tone — link will not work', 'e');
+  }
+}
+
+const WORKLET_SHIM = `
+class ModemProcessor extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this.modem = new Modem(sampleRate, f => this.port.postMessage({ t: 'frame', f }));
+    this.modem.onActivity = () => this.port.postMessage({ t: 'act' });
+    this.port.onmessage = e => { if (e.data && e.data.t === 'mute') this.modem.setMuted(!!e.data.v); };
+  }
+  process(inputs) {
+    const ch = inputs[0] && inputs[0][0];
+    if (ch && ch.length) this.modem.push(ch);
+    return true;
+  }
+}
+registerProcessor('modem-rx', ModemProcessor);
+`;
+
+async function buildReceiver() {
+  const coreSrc = document.getElementById('modem-core').textContent;
+  const url = URL.createObjectURL(
+    new Blob([coreSrc + '\n' + WORKLET_SHIM], { type: 'application/javascript' })
+  );
+  try {
+    await audioCtx.audioWorklet.addModule(url);
+    workletNode = new AudioWorkletNode(audioCtx, 'modem-rx');
+    workletNode.port.onmessage = e => {
+      const d = e.data;
+      if (d.t === 'frame') deliverFrame(d.f);
+      else if (d.t === 'act') onActivity();
+    };
+    // The node has to reach the destination to be pulled by the render quantum,
+    // so route it through a silent gain rather than leaving it dangling.
+    const mute = audioCtx.createGain();
+    mute.gain.value = 0;
+    sourceNode.connect(workletNode);
+    workletNode.connect(mute);
+    mute.connect(audioCtx.destination);
+    log('Demodulator running on the audio thread', 'i');
+  } catch (err) {
+    // Older Safari / no AudioWorklet: fall back to the main thread.
+    modem = new Modem(audioCtx.sampleRate, deliverFrame);
+    modem.onActivity = onActivity;
+    spNode = audioCtx.createScriptProcessor(2048, 1, 1);
+    spNode.onaudioprocess = ev => modem.push(ev.inputBuffer.getChannelData(0));
+    const mute = audioCtx.createGain();
+    mute.gain.value = 0;
+    sourceNode.connect(spNode);
+    spNode.connect(mute);
+    mute.connect(audioCtx.destination);
+    log('Demodulator on main thread (no AudioWorklet)', 'w');
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+async function startMic() {
+  await initAudio();
+  if (micStream) return;
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        echoCancellation: false, noiseSuppression: false,
+        autoGainControl: false, channelCount: 1
+      }
+    });
+  } catch (e) {
+    log('Microphone denied: ' + e.message, 'e');
+    throw e;
+  }
+  sourceNode = audioCtx.createMediaStreamSource(micStream);
+
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 2048;
+  analyser.smoothingTimeConstant = 0.55;
+  specData = new Uint8Array(analyser.frequencyBinCount);
+  sourceNode.connect(analyser);
+  waveEl.classList.add('live');
+  runSpectrum();
+
+  await buildReceiver();
+  selfTest();
+}
+
+/* Prove the modem round-trips on this device before trusting the air link. */
+function selfTest() {
+  try {
+    const sr = audioCtx.sampleRate;
+    const probe = buildFrame(7, 0, 1, 0, new TextEncoder().encode('loopback'));
+    let ok = false;
+    const m = new Modem(sr, f => {
+      if (f.tid === 7 && new TextDecoder().decode(f.payload) === 'loopback') ok = true;
+    });
+    m.push(new Float32Array(Math.round(sr * 0.05)));
+    m.push(encodeFrameSamples(probe, sr));
+    m.push(new Float32Array(Math.round(sr * 0.05)));
+    log(ok ? 'Self-test passed — modem healthy' : 'Self-test FAILED — decoder not locking',
+        ok ? 'i' : 'e');
+  } catch (e) {
+    log('Self-test error: ' + e.message, 'e');
+  }
+}
+
+function playSamples(samples) {
+  const buf = audioCtx.createBuffer(1, samples.length, audioCtx.sampleRate);
+  buf.getChannelData(0).set(samples);
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  const gain = audioCtx.createGain();
+  gain.gain.value = 1;
+  src.connect(gain).connect(audioCtx.destination);
+  currentSource = src;
+  return new Promise(resolve => {
+    src.onended = () => { currentSource = null; resolve(); };
+    src.start();
+  });
+}
+
+/* Half duplex: never let the decoder hear our own speaker. */
+async function transmitFrame(frame) {
+  setModemMuted(true);
+  try {
+    await playSamples(encodeFrameSamples(frame, audioCtx.sampleRate));
+    await sleep(60);            // let the room's reverb tail die out
+  } finally {
+    setModemMuted(false);
+  }
+}
+
+/* ------------------------ receive-side state ------------------------- */
+let rx = null;              // active Reassembler
+let pendingOffer = null;
+
+function onActivity() {
+  if (rx && !rx.done) armQuietTimer();
+}
+
+function onFrame(f) {
+  if (f.flags & FLAG_CTRL) { onControlFrame(f); return; }
+
+  if (tx.active && f.tid === tx.tid) return;   // our own echo, or a stale repeat
+
+  if (!rx || rx.tid !== f.tid) {
+    // Chunk 0 may well not be the first to arrive; collect regardless and let
+    // the repeat request fill in the manifest.
+    rx = new Reassembler(f.tid, f.total);
+    log('Incoming transfer #' + f.tid + ' — ' + f.total + ' chunk(s)', 'i');
+  }
+  if (rx.total !== f.total && f.total > 0) rx.total = f.total;
+
+  const isNew = rx.add(f.seq, f.payload);
+  renderRx();
+  if (!isNew) { armQuietTimer(); return; }
+
+  if (rx.complete()) {
+    const res = rx.assemble();
+    rx.done = true;
+    clearTimeout(rx.nakTimer);
+    if (res) {
+      log('Received "' + res.manifest.name + '" (' + humanSize(res.content.length) + ')', 'i');
+      sendControl(rx.tid, []);            // ACK: stop the sender early
+      showOffer(res.manifest, res.content);
+      hideXfer(1200);
+    } else {
+      log('Transfer assembled but failed its checksum', 'e');
+      hideXfer(1500);
+    }
+    rx = null;
+  } else {
+    armQuietTimer();
+  }
+}
+
+function onControlFrame(f) {
+  if (!tx.active || f.tid !== tx.tid || !tx.awaitCtrl) return;
+  const missing = Array.from(f.payload);
+  tx.awaitCtrl(missing);
+}
+
+function armQuietTimer() {
+  if (!rx || rx.done) return;
+  clearTimeout(rx.nakTimer);
+  rx.nakTimer = setTimeout(requestMissing, QUIET_MS + Math.random() * 400);
+}
+
+async function requestMissing() {
+  if (!rx || rx.done) return;
+  const miss = rx.missing();
+  if (!miss.length) return;
+  if (rx.nakCount >= MAX_ROUNDS) {
+    log('Gave up: ' + miss.length + ' chunk(s) never arrived', 'e');
+    hideXfer(2000);
+    rx = null;
+    return;
+  }
+  const tid = rx.tid;
+  rx.nakCount++;
+  log('Asking sender to repeat ' + miss.length + ' chunk(s)', 'w');
+  await sendControl(tid, miss.slice(0, 255));
+  if (rx && rx.tid === tid) armQuietTimer();   // may have completed while we spoke
+}
+
+async function sendControl(tid, seqs) {
+  try {
+    await transmitFrame(buildFrame(tid, 0, 0, FLAG_CTRL, new Uint8Array(seqs)));
+  } catch (e) {
+    log('Reply failed: ' + e.message, 'e');
+  }
+}
+
+/* -------------------------- send-side state -------------------------- */
+const tx = { active: false, tid: 0, cancel: false, awaitCtrl: null };
+
+function waitForControl(ms) {
+  return new Promise(resolve => {
+    const timer = setTimeout(() => { tx.awaitCtrl = null; resolve(null); }, ms);
+    tx.awaitCtrl = missing => {
+      clearTimeout(timer);
+      tx.awaitCtrl = null;
+      resolve(missing);
+    };
+  });
+}
+
+async function sendContent(kind, name, content) {
+  if (tx.active) { toast('Already sending'); return; }
+
+  const manifest = buildManifest(kind, name, content.length, crc16(content, content.length));
+  const chunks = planChunks(manifest, content);
+  if (chunks.length > MAX_CHUNKS) {
+    const cap = (MAX_CHUNKS - 1) * CHUNK;
+    toast('Too large — limit is about ' + humanSize(cap));
+    log('Refused ' + humanSize(content.length) + '; max is ' + humanSize(cap), 'e');
+    return;
+  }
+
+  const secs = chunks.reduce((a, c) => a + frameSeconds(HDR + c.length + 2) + INTERFRAME_MS / 1000, 0);
+  log('Sending "' + name + '" — ' + chunks.length + ' chunk(s), about ' + humanTime(secs), 'w');
+
+  tx.active = true; tx.tid = (Math.random() * 256) | 0; tx.cancel = false;
+  sendTextBtn.disabled = sendFileBtn.disabled = true;
+  showXfer('Sending ' + name, chunks.length, true);
+
+  let queue = chunks.map((_, i) => i);
+  try {
+    for (let round = 0; round <= MAX_ROUNDS; round++) {
+      for (let i = 0; i < queue.length; i++) {
+        if (tx.cancel) throw new Error('cancelled');
+        const seq = queue[i];
+        markChunk(seq, 'now');
+        heroText.textContent = 'Broadcasting chunk ' + (seq + 1) + ' of ' + chunks.length + '…';
+        await transmitFrame(
+          buildFrame(tx.tid, seq, chunks.length, seq === 0 ? FLAG_MANIFEST : 0, chunks[seq])
+        );
+        markChunk(seq, 'got');
+        setProgress(countChunks('got'), chunks.length, true);
+        if (i < queue.length - 1) await sleep(INTERFRAME_MS);
+      }
+      if (round === MAX_ROUNDS) break;
+
+      heroText.textContent = 'Waiting for the receiver to confirm…';
+      const missing = await waitForControl(NAK_WAIT_MS);
+      if (missing === null) { log('No reply — assuming delivered', 'w'); break; }
+      if (!missing.length)  { log('Receiver confirmed delivery', 'i'); break; }
+      queue = missing.filter(s => s < chunks.length);
+      if (!queue.length) break;
+      queue.forEach(s => markChunk(s, ''));
+      log('Repeating ' + queue.length + ' chunk(s)', 'w');
+    }
+    toast('Sent');
+  } catch (e) {
+    if (e.message === 'cancelled') { log('Send cancelled', 'w'); toast('Cancelled'); }
+    else { log('Send failed: ' + e.message, 'e'); toast('Send failed'); }
+  } finally {
+    tx.active = false; tx.awaitCtrl = null;
+    sendTextBtn.disabled = sendFileBtn.disabled = false;
+    setStatus(micStream ? 'on' : '', micStream ? 'Listening' : 'Idle');
+    heroText.textContent = 'Listening for nearby transfers…';
+    hideXfer(900);
+  }
+}
+
+/* ------------------------------ transfer UI --------------------------- */
+let xferCells = [];
+function showXfer(label, total, isTx) {
+  clearTimeout(hideXfer._t);
+  xferWhat.textContent = label;
+  xferBar.classList.toggle('tx', !!isTx);
+  xferGrid.textContent = '';
+  xferCells = [];
+  for (let i = 0; i < total; i++) {
+    const b = document.createElement('b');
+    xferGrid.appendChild(b);
+    xferCells.push(b);
+  }
+  setProgress(0, total, isTx);
+  xferEl.hidden = false;
+  setStatus(isTx ? 'tx' : 'on', isTx ? 'Sending' : 'Receiving');
+}
+function markChunk(i, cls) {
+  const el = xferCells[i];
+  if (el) el.className = cls;
+}
+function countChunks(cls) {
+  let n = 0;
+  for (const c of xferCells) if (c.className === cls) n++;
+  return n;
+}
+function setProgress(done, total, isTx) {
+  const pct = total ? Math.round(done / total * 100) : 0;
+  xferBar.firstElementChild.style.width = pct + '%';
+  xferPct.textContent = done + '/' + total + '  ' + pct + '%';
+}
+function hideXfer(delay = 0) {
+  clearTimeout(hideXfer._t);
+  hideXfer._t = setTimeout(() => { xferEl.hidden = true; xferCells = []; }, delay);
+}
+function renderRx() {
+  if (!rx) return;
+  if (xferEl.hidden || xferCells.length !== rx.total) {
+    const man = rx.manifest();
+    showXfer('Receiving ' + (man ? man.name : 'transfer #' + rx.tid), rx.total, false);
+  }
+  for (const seq of rx.chunks.keys()) markChunk(seq, 'got');
+  setProgress(rx.chunks.size, rx.total, false);
+}
+function setStatus(cls, text) {
+  statusEl.className = 'status' + (cls ? ' ' + cls : '');
+  statusText.textContent = text;
+}
+
+/* ---------------------------- notification ---------------------------- */
+function showOffer(manifest, content) {
+  const isText = manifest.kind === 'T';
+  pendingOffer = { manifest, content, isText };
+
+  notifEl.textContent = '';
+  const row = document.createElement('div'); row.className = 'row1';
+  const badge = document.createElement('span'); badge.className = 'badge';
+  badge.textContent = isText ? 'MESSAGE' : 'FILE';
+  const from = document.createElement('span'); from.className = 'from';
+  from.textContent = 'via ultrasound';
+  row.append(badge, from);
+
+  const title = document.createElement('div'); title.className = 'title';
+  title.textContent = manifest.name || (isText ? 'Message' : 'file.bin');
+
+  notifEl.append(row, title);
+
+  if (isText) {
+    const pre = document.createElement('div'); pre.className = 'preview';
+    pre.textContent = new TextDecoder().decode(content);   // textContent, not innerHTML
+    notifEl.append(pre);
+  } else {
+    const meta = document.createElement('div'); meta.className = 'meta';
+    meta.textContent = humanSize(content.length) + ' • received intact';
+    notifEl.append(meta);
+  }
+
+  const btns = document.createElement('div'); btns.className = 'btns';
+  const decline = document.createElement('button');
+  decline.className = 'decline'; decline.textContent = 'Dismiss';
+  const accept = document.createElement('button');
+  accept.className = 'accept'; accept.textContent = isText ? 'Copy' : 'Save';
+  btns.append(decline, accept);
+  notifEl.append(btns);
+
+  decline.onclick = () => { notifEl.classList.remove('show'); pendingOffer = null; };
+  accept.onclick = () => { acceptOffer(); notifEl.classList.remove('show'); };
+
+  notifEl.classList.add('show');
+  clearTimeout(showOffer._t);
+  showOffer._t = setTimeout(() => notifEl.classList.remove('show'), 45000);
+}
+
+function acceptOffer() {
+  const o = pendingOffer;
+  if (!o) return;
+  pendingOffer = null;
+  if (o.isText) {
+    const text = new TextDecoder().decode(o.content);
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(text).then(() => toast('Copied'), () => toast('Copy failed'));
+    } else {
+      toast('Clipboard unavailable');
+    }
+  } else {
+    const url = URL.createObjectURL(new Blob([o.content]));
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = o.manifest.name || 'file.bin';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => { URL.revokeObjectURL(url); a.remove(); }, 1000);
+    toast('Saved ' + a.download);
+  }
+}
+
+/* ------------------------------- events ------------------------------- */
+startBtn.onclick = async () => {
+  startBtn.disabled = true;
+  try {
+    await startMic();
+    setStatus('on', 'Listening');
+    startBtn.textContent = 'Receiver active';
+    sendTextBtn.disabled = sendFileBtn.disabled = false;
+    heroText.textContent = 'Listening for nearby transfers…';
+  } catch (e) {
+    startBtn.disabled = false;
+    setStatus('', 'Mic error');
+    toast('Microphone permission required');
+  }
+};
+
+sendTextBtn.onclick = async () => {
+  const text = prompt('Message to broadcast:');
+  if (!text) return;
+  await sendContent('T', 'Message', new TextEncoder().encode(text));
+};
+
+sendFileBtn.onclick = () => fileInput.click();
+
+fileInput.onchange = async ev => {
+  const file = ev.target.files[0];
+  fileInput.value = '';
+  if (!file) return;
+  const buf = new Uint8Array(await file.arrayBuffer());
+  await sendContent('F', file.name, buf);
+};
+
+cancelBtn.onclick = () => {
+  if (tx.active) {
+    tx.cancel = true;
+    if (currentSource) { try { currentSource.stop(); } catch (e) {} }
+    if (tx.awaitCtrl) tx.awaitCtrl([]);
+  } else if (rx) {
+    clearTimeout(rx.nakTimer);
+    rx = null;
+    hideXfer();
+    setStatus('on', 'Listening');
+  }
+};
+
+window.addEventListener('pagehide', () => {
+  cancelAnimationFrame(specRaf);
+  try { micStream && micStream.getTracks().forEach(t => t.stop()); } catch (e) {}
+  try { audioCtx && audioCtx.close(); } catch (e) {}
+});
+
+/* -------------------------------- boot -------------------------------- */
+log('Ultrasonic Drop v2', 'i');
+log('4-FSK at 17.6-19.5 kHz, 8 ms symbols — 250 bps, ~28 B/s after framing');
+log('Chunked with CRC-16 and automatic repeat, so size is not capped at one packet');
+log('Needs HTTPS or localhost for microphone access');
+log('Tap "Enable receiver" to begin');
+</script>
+</body>
+</html>
