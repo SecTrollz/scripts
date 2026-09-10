@@ -435,6 +435,7 @@ button:disabled { opacity: .4; cursor: not-allowed; }
 .spinner { width: 18px; height: 18px; border: 2px solid var(--border2); border-top-color: var(--gold); border-radius: 50%; animation: spin .7s linear infinite; display: inline-block; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .loading-row { display: flex; align-items: center; gap: 10px; padding: 20px; color: var(--text3); font-size: 12px; }
+.empty-state { padding: 24px 10px; text-align: center; color: var(--text3); font-size: 12px; line-height: 1.6; }
 
 .progress { height: 4px; background: var(--border); border-radius: 2px; overflow: hidden; }
 .progress-bar { height: 100%; background: linear-gradient(90deg, var(--crimson), var(--gold)); border-radius: 2px; transition: width .3s; }
@@ -1983,4 +1984,813 @@ async function startScan() {
           addLog(`[---] ${probe.label.slice(0,50)}`, 'log-miss');
         }
       } catch(e) {
-        addLog(`[E
+        addLog(`[ERR] ${probe.label.slice(0,40)}: ${e.message}`, 'log-err');
+      } finally {
+        done++;
+        counter.textContent = `${done}/${total}`;
+        bar.style.width = `${Math.round((done/total)*100)}%`;
+      }
+    }));
+  }
+
+  label.textContent = 'Scan complete.';
+  document.getElementById('scan-status').textContent =
+    `${findings.length} enrollment signal${findings.length===1?'':'s'} detected across ${total} probes.`;
+
+  S.findings = S.findings.concat(findings);
+  S.scanHistory.push({ id: uid(), ts: now(), target, findingCount: findings.length, findings });
+  save();
+  journalAppend('scan.completed', { target, findingCount: findings.length });
+
+  renderScanResults(target, findings);
+}
+
+// Shared expand/collapse finding-card renderer (severity: CRITICAL|HIGH|MEDIUM|OK|INFO)
+function findingCard(f) {
+  const fid = 'fc_' + uid();
+  return `
+  <div class="finding-card sev-${esc(f.severity)}" data-toggle="${fid}">
+    <div class="finding-hdr">
+      <span class="finding-title">${esc(f.title)}</span>
+      ${sev(f.severity)}
+    </div>
+    <div class="finding-body" id="${fid}">
+      ${f.meta ? `<div>${f.meta}</div>` : ''}
+      ${f.evidence ? `<div class="finding-evidence">${esc(f.evidence)}</div>` : ''}
+    </div>
+  </div>`;
+}
+function wireFindingCards(root) {
+  (root || document).querySelectorAll('.finding-card').forEach(el => {
+    el.addEventListener('click', () => {
+      const body = document.getElementById(el.dataset.toggle);
+      if (body) body.classList.toggle('open');
+    });
+  });
+}
+
+function renderScanResults(target, findings) {
+  const box = document.getElementById('scan-results');
+  if(!findings.length) {
+    box.innerHTML = `<div class="card"><div class="empty-state">No enrollment infrastructure detected for <b>${esc(target)}</b>. The probe set has a zero false-positive design (401/403/429/redirect/HTML responses are never counted) — this is a real negative, not an absence of signal.</div></div>`;
+    return;
+  }
+  box.innerHTML = `
+  <div class="card" style="border-color:rgba(239,68,68,.35);">
+    <div class="card-title">⚠ ${findings.length} signal${findings.length===1?'':'s'} found for ${esc(target)}</div>
+    <button class="btn btn-sm" id="scan-export" style="margin-top:8px;">⇩ Export findings JSON</button>
+  </div>
+  ${findings.map(f => findingCard({
+    title: f.platform,
+    severity: f.confidence >= 85 ? 'CRITICAL' : 'HIGH',
+    meta: `${esc(CATEGORIES[f.category]||f.category)} · ${f.confidence}% confidence · ${esc(f.method)} ${esc(f.probeUrl)}`,
+    evidence: (f.capabilities||[]).slice(0,6).join('\n'),
+  })).join('')}`;
+  wireFindingCards(box);
+  document.getElementById('scan-export').addEventListener('click', () => {
+    const items = S.scanHistory.filter(s=>s.target===target);
+    const last = items[items.length-1];
+    download(`mdmcheck-scan-${target.replace(/[^a-z0-9]+/gi,'_')}.json`, JSON.stringify(last||{}, null, 2), 'application/json');
+  });
+}
+
+// ── mdmcheck_collector.sh (mdmcheck_v1) import ─────────────────────
+function parseCollectorJson(text) {
+  const data = JSON.parse(text);
+  if (data.schema !== 'mdmcheck_v1' || !Array.isArray(data.findings)) {
+    throw new Error('Not an mdmcheck_v1 document — expected a "schema":"mdmcheck_v1" object with a "findings" array (the output of mdmcheck_collector.sh).');
+  }
+  return data;
+}
+function renderCollectorImport(data) {
+  const sevMap = { CRITICAL:'CRITICAL', HIGH:'HIGH', MEDIUM:'MEDIUM', LOW:'INFO' };
+  const overallColor = data.summary.overall === 'COMPROMISED' ? 'rgba(239,68,68,.4)'
+    : data.summary.overall === 'ELEVATED' ? 'rgba(245,158,11,.4)' : 'rgba(34,197,94,.3)';
+  const cards = data.findings.map(f => findingCard({
+    title: `[Tier ${f.tier}] ${f.label}`,
+    severity: f.status === 'CLEAR' ? 'OK' : (sevMap[f.severity] || 'INFO'),
+    meta: `Status: ${esc(f.status)} · Severity: ${esc(f.severity)} · Check ID: ${esc(f.id)}`,
+    evidence: f.evidence,
+  })).join('');
+  return `
+  <div class="card" style="border-color:${overallColor};">
+    <div class="card-title">${esc(data.device.model || 'Unknown device')} — ${esc(data.summary.overall)}</div>
+    <div class="card-sub">Android ${esc(data.device.android_version||'?')} · ${esc(data.device.build_fingerprint||'')} · scanned ${fmtDate(data.timestamp)}</div>
+    <div class="card-row" style="margin-top:12px;">
+      <div class="stat-card"><div class="stat-val" style="color:var(--danger);">${data.summary.alert_count}</div><div class="stat-lbl">Alerts</div></div>
+      <div class="stat-card"><div class="stat-val" style="color:var(--warn);">${data.summary.warn_count}</div><div class="stat-lbl">Warnings</div></div>
+      <div class="stat-card"><div class="stat-val" style="color:var(--ok);">${data.summary.clear_count}</div><div class="stat-lbl">Clear</div></div>
+    </div>
+  </div>${cards}`;
+}
+function wireCollectorImport(taId, btnId, outId) {
+  document.getElementById(btnId).addEventListener('click', () => {
+    const raw = document.getElementById(taId).value;
+    const out = document.getElementById(outId);
+    if (!raw.trim()) { alert('Paste the JSON output of mdmcheck_collector.sh first.'); return; }
+    let data;
+    try { data = parseCollectorJson(raw); }
+    catch (e) { out.innerHTML = `<div class="alert alert-critical">${esc(e.message)}</div>`; return; }
+    out.innerHTML = renderCollectorImport(data);
+    wireFindingCards(out);
+    const mapped = data.findings.filter(f=>f.status!=='CLEAR').map(f => ({
+      id: uid(), ts: now(), target: data.device.model || 'on-device scan',
+      platform: `[Tier ${f.tier}] ${f.label}`, category: 'mdm_discovery',
+      probeUrl: '(on-device probe)', method: 'adb',
+      confidence: f.status === 'ALERT' ? 95 : 70, severity: f.severity,
+    }));
+    S.findings = S.findings.concat(mapped);
+    S.scanHistory.push({ id: uid(), ts: now(), target: data.device.model || 'on-device scan',
+      findingCount: mapped.length, findings: mapped, source: 'mdmcheck_collector.sh' });
+    save();
+    journalAppend('collector.imported', { overall: data.summary.overall, alerts: data.summary.alert_count });
+  });
+}
+
+// ── PASSIVE SCAN (continued) — import card ─────────────────────────
+const _origScanPage = PAGES.scan;
+PAGES.scan = function() {
+  _origScanPage();
+  const c = document.getElementById('content');
+  const div = document.createElement('div');
+  div.className = 'card';
+  div.innerHTML = `
+    <div class="card-title">Import an on-device scan (mdmcheck_collector.sh)</div>
+    <div class="card-sub">Run <code>mdmcheck_collector.sh</code> against a device over ADB and paste its JSON output (schema <code>mdmcheck_v1</code>) below — this is the real 5-tier, 22-check on-device scorer; the probe sweep above is network-side only.</div>
+    <textarea id="collector-paste" rows="6" style="margin-top:10px;" placeholder='{"schema":"mdmcheck_v1", "findings":[...], ...}'></textarea>
+    <button class="btn btn-sm" id="collector-import" style="margin-top:8px;">Import</button>
+    <div id="collector-result" style="margin-top:12px;"></div>`;
+  c.appendChild(div);
+  wireCollectorImport('collector-paste', 'collector-import', 'collector-result');
+};
+
+// ── DNS FINGERPRINT ─────────────────────────────────────────────────
+const DNS_MDM_HOSTS = [
+  { prefix: 'enterpriseregistration', vendor: 'Microsoft Entra / Intune device registration', expect: /msappproxy\.net|windows\.net/i },
+  { prefix: 'enterpriseenrollment',   vendor: 'Microsoft Intune MDM enrollment',              expect: /manage\.microsoft\.com/i },
+  { prefix: 'msoid',                  vendor: 'Microsoft federation (ADFS)',                  expect: /microsoftonline/i },
+  { prefix: 'autodiscover',           vendor: 'Exchange / Microsoft 365 mail',                expect: /outlook\.com|protection\.outlook/i },
+];
+async function dohLookup(name, type) {
+  try {
+    const r = await fetch(`https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name)}&type=${type}`,
+      { headers: { Accept: 'application/dns-json' } });
+    if (!r.ok) return null;
+    const j = await r.json();
+    return (j.Answer || []).map(a => a.data);
+  } catch { return null; }
+}
+PAGES.dns = function() {
+  const c = document.getElementById('content');
+  c.innerHTML = `
+  <div class="card">
+    <div class="card-title">⬡ DNS Fingerprint</div>
+    <div class="card-sub">CNAME/A sweep via Cloudflare DNS-over-HTTPS for the enterprise-enrollment subdomains Intune/Entra/Exchange expect to find under your domain.</div>
+    <div class="form-row" style="margin-top:10px;"><label>Domain</label>
+      <div class="flex-row"><input id="dns-domain" placeholder="company.com"><button class="btn-primary" id="dns-run">Sweep</button></div>
+    </div>
+  </div>
+  <div id="dns-results"></div>`;
+  document.getElementById('dns-run').addEventListener('click', runDnsSweep);
+};
+async function runDnsSweep() {
+  const domain = document.getElementById('dns-domain').value.trim().replace(/^https?:\/\//,'').replace(/\/.*$/,'');
+  if (!domain) { alert('Enter a domain.'); return; }
+  const box = document.getElementById('dns-results');
+  box.innerHTML = `<div class="card"><div class="loading-row"><div class="spinner"></div> Querying DNS…</div></div>`;
+  const rows = [];
+  for (const h of DNS_MDM_HOSTS) {
+    const fqdn = `${h.prefix}.${domain}`;
+    const cname = await dohLookup(fqdn, 'CNAME');
+    const a = (cname && cname.length) ? null : await dohLookup(fqdn, 'A');
+    const answer = (cname && cname[0]) || (a && a[0]) || null;
+    rows.push({ fqdn, vendor: h.vendor, answer, match: answer ? h.expect.test(answer) : false });
+  }
+  const mx = await dohLookup(domain, 'MX');
+  const hits = rows.filter(r => r.answer);
+  box.innerHTML = `
+  <div class="card">
+    <div class="card-title">${hits.length} of ${rows.length} probe hostname(s) resolve for ${esc(domain)}</div>
+    <div class="card-sub">MX records: ${mx && mx.length ? esc(mx.join(', ')) : 'none resolved'}</div>
+  </div>
+  ${rows.map(r => findingCard({
+    title: r.fqdn,
+    severity: r.answer ? (r.match ? 'HIGH' : 'MEDIUM') : 'OK',
+    meta: `${esc(r.vendor)}${r.answer ? ` → resolves to ${esc(r.answer)}` : ' → no record'}`,
+  })).join('')}`;
+  wireFindingCards(box);
+  journalAppend('dns.swept', { domain, hits: hits.length });
+}
+
+// ── TENANT LOOKUP ────────────────────────────────────────────────────
+PAGES.lookup = function() {
+  const c = document.getElementById('content');
+  c.innerHTML = `
+  <div class="card">
+    <div class="card-title">↗ Tenant Lookup</div>
+    <div class="card-sub">Single-query check: is this domain a managed Microsoft or Google Workspace tenant?</div>
+    <div class="form-row" style="margin-top:10px;"><label>Email or domain</label>
+      <div class="flex-row"><input id="lookup-target" placeholder="user@company.com or company.com"><button class="btn-primary" id="lookup-run">Lookup</button></div>
+    </div>
+  </div>
+  <div id="lookup-results"></div>`;
+  document.getElementById('lookup-run').addEventListener('click', runTenantLookup);
+};
+async function runTenantLookup() {
+  const target = document.getElementById('lookup-target').value.trim();
+  if (!target) { alert('Enter an email or domain.'); return; }
+  const domain = target.includes('@') ? target.split('@')[1] : target;
+  const box = document.getElementById('lookup-results');
+  box.innerHTML = `<div class="card"><div class="loading-row"><div class="spinner"></div> Checking tenant realms…</div></div>`;
+  let msResult = 'Not a Microsoft tenant';
+  try {
+    const r = await fetch(`https://login.microsoftonline.com/common/userrealm/${encodeURIComponent('user@'+domain)}?api-version=1.0`);
+    const txt = await r.text();
+    const m = txt.match(/"NameSpaceType"\s*:\s*"(\w+)"/);
+    if (m) msResult = m[1];
+    else if (!r.ok) msResult = 'Lookup rejected';
+  } catch { msResult = 'Lookup blocked (CORS) or offline'; }
+  const mx = await dohLookup(domain, 'MX').catch(() => null);
+  const googleWorkspace = !!(mx && mx.some(m => /aspmx\.l\.google\.com|googlemail\.com/i.test(m)));
+  box.innerHTML = `
+  ${findingCard({ title: 'Microsoft Entra / Azure AD', severity: (msResult==='Managed'||msResult==='Federated') ? 'HIGH' : 'OK', meta: `NameSpaceType: ${esc(msResult)}` })}
+  ${findingCard({ title: 'Google Workspace', severity: googleWorkspace ? 'HIGH' : 'OK', meta: `MX: ${mx ? esc(mx.join(', ')) : 'none resolved'}` })}`;
+  wireFindingCards(box);
+  journalAppend('tenant.lookup', { domain, msResult, googleWorkspace });
+}
+
+// ── MODULE F SWEEP (parses the android probe script's own output) ──
+function sliceSection(text, startMarker, endMarker) {
+  const s = text.indexOf(startMarker);
+  if (s === -1) return null;
+  const rest = text.slice(s + startMarker.length);
+  const e = endMarker ? rest.indexOf(endMarker) : -1;
+  return (e === -1 ? rest : rest.slice(0, e)).trim();
+}
+function analyzeModuleF(text) {
+  const results = [];
+  const f3 = sliceSection(text, '[F3] ATOMIC JOURNAL RECOVERY', '=== [F4]');
+  if (f3 !== null) {
+    const hits = f3.split('\n').filter(l => l.startsWith('WAL_HIT') || /enrollmentToken|enterpriseId|checkInUrl|mdm_url|management_url|afwManagementUrl|dpcExtras/i.test(l));
+    results.push(hits.length
+      ? { tier: 'F3', severity: 'CRITICAL', title: 'Enrollment tokens/URLs recovered from leftover SQLite WAL/SHM journals', evidence: hits.slice(0, 12).join('\n') }
+      : { tier: 'F3', severity: 'OK', title: 'No enrollment artifacts found in WAL/SHM journals' });
+  }
+  const f4 = sliceSection(text, '[F4] TRUST-ROOT & ADB KEY AUDIT', '=== [F5]');
+  if (f4 !== null) {
+    const wpCa = f4.split('\n').filter(l => l.startsWith('WORKPROFILE_CA'));
+    if (wpCa.length) results.push({ tier: 'F4', severity: 'HIGH', title: `${wpCa.length} work-profile CA certificate(s) installed`, evidence: wpCa.join('\n') });
+    const adbKeys = sliceSection(f4, '--- ADB authorized keys ---', '--- User-installed CA');
+    if (adbKeys && adbKeys.trim() && !/no access/i.test(adbKeys)) {
+      results.push({ tier: 'F4', severity: 'MEDIUM', title: 'ADB authorized keys present on this device', evidence: adbKeys });
+    }
+    if (!wpCa.length && (!adbKeys || !adbKeys.trim() || /no access/i.test(adbKeys))) {
+      results.push({ tier: 'F4', severity: 'OK', title: 'No work-profile CAs or ADB authorized keys found' });
+    }
+  }
+  const f5 = sliceSection(text, '[F5] PROVISIONING HANDSHAKE INTERCEPT', '=== STANDARD MDM');
+  if (f5 !== null) {
+    const proxyHits = f5.split('\n').filter(l => /wpad|proxy|option.252/i.test(l) && l.trim() && !l.startsWith('---') && !l.startsWith('==='));
+    if (proxyHits.length) results.push({ tier: 'F5', severity: 'HIGH', title: 'WPAD/proxy provisioning artifacts present', evidence: proxyHits.slice(0, 12).join('\n') });
+    const zt = sliceSection(f5, '--- Zero-touch oobconfig ---', '--- SetupWizard');
+    if (zt && zt.trim() && !/not present/i.test(zt)) results.push({ tier: 'F5', severity: 'HIGH', title: 'Zero-touch provisioning preferences file present', evidence: zt });
+    if (!proxyHits.length && (!zt || !zt.trim() || /not present/i.test(zt))) {
+      results.push({ tier: 'F5', severity: 'OK', title: 'No provisioning-intercept artifacts found' });
+    }
+  }
+  const std = sliceSection(text, '=== STANDARD MDM INDICATORS ===', '=== END PROBE');
+  if (std !== null) {
+    const vendors = std.split('\n').filter(l => /intune|workspaceone|knox|jamf|jumpcloud|companyportal|airwatch|maas360|kandji|mobileiron|ivanti|clouddpc/i.test(l) && l.trim());
+    results.push(vendors.length
+      ? { tier: 'STD', severity: 'CRITICAL', title: 'Known MDM vendor package(s) enabled on this device', evidence: vendors.join('\n') }
+      : { tier: 'STD', severity: 'OK', title: 'No known MDM vendor packages found enabled' });
+  }
+  return results;
+}
+PAGES.forensic = function() {
+  const c = document.getElementById('content');
+  c.innerHTML = `
+  <div class="card">
+    <div class="card-title">⊛ Module F Sweep</div>
+    <div class="card-sub">Paste the full output of the Android probe script (Probe Scripts → android). Parses F3 (journal recovery), F4 (trust-root/ADB), F5 (provisioning intercept), and the standard MDM vendor-package check.</div>
+    <textarea id="f-paste" rows="10" style="margin-top:10px;" placeholder="Paste probe-out.txt contents here…"></textarea>
+    <button class="btn-primary" id="f-analyze" style="margin-top:10px;">Analyze</button>
+  </div>
+  <div id="f-results"></div>`;
+  document.getElementById('f-analyze').addEventListener('click', () => {
+    const text = document.getElementById('f-paste').value;
+    if (!text.trim()) { alert('Paste probe output first.'); return; }
+    const results = analyzeModuleF(text);
+    const box = document.getElementById('f-results');
+    if (!results.length) {
+      box.innerHTML = `<div class="card"><div class="empty-state">No recognizable probe sections found. Make sure you pasted the full android probe output (Probe Scripts → android).</div></div>`;
+      return;
+    }
+    box.innerHTML = results.map(r => findingCard({ title: `[${r.tier}] ${r.title}`, severity: r.severity, evidence: r.evidence })).join('');
+    wireFindingCards(box);
+    const actionable = results.filter(r => r.severity !== 'OK');
+    if (actionable.length) {
+      S.findings = S.findings.concat(actionable.map(r => ({
+        id: uid(), ts: now(), target: '(local device probe)', platform: `Module F ${r.tier}`,
+        category: 'mdm_discovery', probeUrl: '(pasted probe output)', method: 'local',
+        confidence: r.severity === 'CRITICAL' ? 95 : r.severity === 'HIGH' ? 80 : 60, severity: r.severity,
+      })));
+      save();
+    }
+    journalAppend('forensic.analyzed', { findingCount: results.length, actionableCount: actionable.length });
+  });
+};
+
+// ── DUAL-STATE RECONCILIATION ───────────────────────────────────────
+function extractPackageList(text) {
+  return [...new Set((text.match(/package:\S+/g) || []).map(s => s.replace('package:', '').trim()))];
+}
+PAGES.dual = function() {
+  const c = document.getElementById('content');
+  c.innerHTML = `
+  <div class="card">
+    <div class="card-title">⇄ Dual-State Reconciliation</div>
+    <div class="card-sub">Phase A = OS-visible packages ("pm list packages -e", or the android probe's F2-A section). Phase B = privileged read via rish/Shizuku ("rish -c 'pm list packages -u -a'"). A package in B but not A is hidden from normal enumeration — both <code>pm suspend</code> and <code>pm disable-user</code> do this.</div>
+    <div class="form-row" style="margin-top:10px;"><label>Phase A — OS-visible</label>
+      <textarea id="dual-a" rows="8" placeholder="pm list packages -e  output, or a full android probe paste"></textarea>
+    </div>
+    <div class="form-row"><label>Phase B — rish/Shizuku, all packages</label>
+      <textarea id="dual-b" rows="8" placeholder="rish -c 'pm list packages -u -a'  output"></textarea>
+    </div>
+    <button class="btn-primary" id="dual-compare">Compare</button>
+  </div>
+  <div id="dual-results"></div>`;
+  document.getElementById('dual-compare').addEventListener('click', () => {
+    const a = extractPackageList(document.getElementById('dual-a').value);
+    const b = extractPackageList(document.getElementById('dual-b').value);
+    if (!a.length || !b.length) { alert('Paste package output (lines like "package:com.example") into both boxes.'); return; }
+    const hiddenFromA = b.filter(p => !a.includes(p));
+    const box = document.getElementById('dual-results');
+    box.innerHTML = `
+    <div class="card">
+      <div class="card-row">
+        <div class="stat-card"><div class="stat-val">${a.length}</div><div class="stat-lbl">Phase A packages</div></div>
+        <div class="stat-card"><div class="stat-val">${b.length}</div><div class="stat-lbl">Phase B packages</div></div>
+        <div class="stat-card"><div class="stat-val" style="color:${hiddenFromA.length?'var(--danger)':'var(--ok)'}">${hiddenFromA.length}</div><div class="stat-lbl">Discrepancies</div></div>
+      </div>
+    </div>
+    ${hiddenFromA.length ? `
+    <div class="dual-table">
+      <div class="dual-col"><div class="dual-col-hdr">Phase A</div><div class="dual-val dual-mismatch">absent</div></div>
+      <div class="dual-col"><div class="dual-col-hdr">Phase B</div><div class="dual-val">present</div></div>
+      <div class="dual-col"><div class="dual-col-hdr">Package</div><div class="dual-val"></div></div>
+      ${hiddenFromA.map(p => `
+      <div class="dual-col"><div class="dual-val dual-mismatch">—</div></div>
+      <div class="dual-col"><div class="dual-val dual-match">✓</div></div>
+      <div class="dual-col"><div class="dual-val">${esc(p)}</div></div>`).join('')}
+    </div>` : `<div class="alert alert-ok">✓ No discrepancy — Phase B contains nothing Phase A doesn't already show.</div>`}`;
+    S.dualState = { phaseA: { count: a.length }, phaseB: { count: b.length }, discrepancies: hiddenFromA };
+    journalAppend('dual_state.compared', { discrepancyCount: hiddenFromA.length });
+    save();
+  });
+};
+
+// ── OWNERSHIP LEDGER (devices) ──────────────────────────────────────
+PAGES.devices = function() {
+  const c = document.getElementById('content');
+  c.innerHTML = `
+  <div class="card">
+    <div class="card-title">▣ Ownership Ledger</div>
+    <div class="card-sub">Record the hardware identifiers and purchase proof for devices you own. Auto-fills into Disclosure (DSAR) letters.</div>
+    <div class="form-row" style="margin-top:10px;"><label>Label</label><input id="dev-label" placeholder="e.g. Pixel 9a — daily driver"></div>
+    <div class="form-row"><label>Serial / IMEI / MEID</label><input id="dev-serial" placeholder="Serial number, IMEI, or MEID"></div>
+    <div class="form-row"><label>Purchase proof</label><input id="dev-proof" placeholder="Order ID, carrier account, receipt date…"></div>
+    <div class="form-row"><label>Notes</label><input id="dev-notes" placeholder="Optional"></div>
+    <button class="btn-primary" id="dev-add">+ Add device</button>
+  </div>
+  <div class="card">
+    ${S.devices.length === 0 ? `<div class="empty-state">No devices recorded yet.</div>` :
+      S.devices.map(d => `
+      <div class="list-item">
+        <div style="flex:1;">
+          <div class="main">${esc(d.label)}</div>
+          <div class="sub">${esc(d.serial)}${d.proof ? ` · proof: ${esc(d.proof)}` : ''}${d.notes ? ` · ${esc(d.notes)}` : ''} · added ${fmtDate(d.ts)}</div>
+        </div>
+        <div class="actions"><button class="btn btn-sm" data-del="${esc(d.id)}" style="border-color:var(--danger);color:var(--danger);">✖</button></div>
+      </div>`).join('')}
+  </div>`;
+  document.getElementById('dev-add').addEventListener('click', () => {
+    const label = document.getElementById('dev-label').value.trim();
+    const serial = document.getElementById('dev-serial').value.trim();
+    if (!label || !serial) { alert('Label and serial/IMEI are required.'); return; }
+    S.devices.push({ id: uid(), ts: now(), label, serial,
+      proof: document.getElementById('dev-proof').value.trim(),
+      notes: document.getElementById('dev-notes').value.trim() });
+    save();
+    journalAppend('device.added', { label, serial });
+    nav('devices');
+  });
+  document.querySelectorAll('[data-del]').forEach(btn => btn.addEventListener('click', () => {
+    if (!confirm('Remove this device from the ledger?')) return;
+    S.devices = S.devices.filter(d => d.id !== btn.dataset.del);
+    save();
+    journalAppend('device.removed', { id: btn.dataset.del });
+    nav('devices');
+  }));
+};
+
+// ── AUDIT FILES ──────────────────────────────────────────────────────
+PAGES.audits = function() {
+  const c = document.getElementById('content');
+  c.innerHTML = `
+  <div class="card">
+    <div class="card-title">⊞ Audit Files</div>
+    <div class="card-sub">Upload .mobileconfig, .plist, .reg, .xml, .json, .csv, or plain-text probe output. Parsed entirely in your browser — files never leave this device.</div>
+    <input type="file" id="audit-file" multiple style="margin-top:10px;width:auto;">
+  </div>
+  <div class="card">
+    ${S.audits.length === 0 ? `<div class="empty-state">No audit files yet.</div>` :
+      S.audits.map(a => `
+      <div class="list-item" style="align-items:flex-start;">
+        <div style="flex:1;">
+          <div class="main">${esc(a.name)}</div>
+          <div class="sub">${fmtDate(a.ts)} · ${(a.size/1024).toFixed(1)} KB</div>
+          ${a.findings.classification.length
+            ? a.findings.classification.map(cl => `<span class="badge b-high" style="margin-top:6px;display:inline-block;">${esc(cl.category_label)} — ${esc(cl.enrollment_mode)}</span>`).join(' ')
+            : `<div class="sub">No known MDM/EDR fingerprints matched.</div>`}
+        </div>
+        <div class="actions"><button class="btn btn-sm" data-del="${esc(a.id)}" style="border-color:var(--danger);color:var(--danger);">✖</button></div>
+      </div>`).join('')}
+  </div>`;
+  document.getElementById('audit-file').addEventListener('change', async (e) => {
+    for (const f of e.target.files) {
+      const text = await f.text().catch(() => '');
+      const findings = classifyFile(f.name, text);
+      S.audits.push({ id: uid(), ts: now(), name: f.name, size: f.size, findings });
+      save();
+      journalAppend('audit.uploaded', { name: f.name, classifications: findings.classification.length });
+    }
+    nav('audits');
+  });
+  document.querySelectorAll('[data-del]').forEach(btn => btn.addEventListener('click', () => {
+    S.audits = S.audits.filter(a => a.id !== btn.dataset.del);
+    save();
+    journalAppend('audit.removed', { id: btn.dataset.del });
+    nav('audits');
+  }));
+};
+
+// ── PROBE SCRIPTS ────────────────────────────────────────────────────
+PAGES.probes = function() {
+  const c = document.getElementById('content');
+  c.innerHTML = `
+  <div class="card">
+    <div class="card-title">↓ Probe Scripts</div>
+    <div class="card-sub">Run on a device you own, then upload the output to Audit Files (or paste the android one into Module F Sweep) for automatic parsing.</div>
+  </div>
+  <div class="card">
+    ${Object.entries(PROBE_SCRIPTS).map(([k, p]) => `
+    <div class="list-item">
+      <div style="flex:1;">
+        <div class="main" style="text-transform:capitalize;">${esc(k)}</div>
+        <div class="sub">${esc(p.filename)}</div>
+      </div>
+      <div class="actions"><button class="btn btn-sm" data-probe="${esc(k)}">⇩ Download</button></div>
+    </div>`).join('')}
+  </div>`;
+  document.querySelectorAll('[data-probe]').forEach(btn => btn.addEventListener('click', () => {
+    const p = PROBE_SCRIPTS[btn.dataset.probe];
+    download(p.filename, p.content, p.mime);
+    journalAppend('probe.downloaded', { platform: btn.dataset.probe });
+  }));
+};
+
+// ── DISCLOSURE (DSAR) ────────────────────────────────────────────────
+PAGES.disclosure = function() {
+  const c = document.getElementById('content');
+  const opts = Object.entries(TEMPLATES).map(([k, t]) => `<option value="${esc(k)}">${esc(t.label)}</option>`).join('');
+  c.innerHTML = `
+  <div class="card">
+    <div class="card-title">⊂ Disclosure (DSAR) Letter Builder</div>
+    <div class="card-sub">${Object.keys(TEMPLATES).length} pre-drafted templates pulled from your Ownership Ledger, Passive Scan findings, and Audit Files. Not legal advice — review and adapt before sending.</div>
+    <div class="form-row" style="margin-top:10px;"><label>Template</label><select id="dsar-template">${opts}</select></div>
+    <div class="form-row"><label>Recipient</label><input id="dsar-recipient"></div>
+    <div class="form-row"><label>Your name</label><input id="dsar-name"></div>
+    <div class="form-row"><label>Your email</label><input id="dsar-email"></div>
+    <div class="form-row"><label>Your address (optional)</label><input id="dsar-address"></div>
+    <div class="form-row"><label>Additional context</label><textarea id="dsar-context" rows="3" placeholder="Anything specific to include…"></textarea></div>
+    <button class="btn-primary" id="dsar-generate">Generate letter</button>
+  </div>
+  <div id="dsar-preview"></div>`;
+  const fillDefaults = () => { document.getElementById('dsar-recipient').value = TEMPLATES[document.getElementById('dsar-template').value].recipient_default; };
+  document.getElementById('dsar-template').addEventListener('change', fillDefaults);
+  fillDefaults();
+  document.getElementById('dsar-generate').addEventListener('click', () => {
+    const key = document.getElementById('dsar-template').value;
+    const t = TEMPLATES[key];
+    const v = {
+      recipient: document.getElementById('dsar-recipient').value.trim() || t.recipient_default,
+      name: document.getElementById('dsar-name').value.trim() || '(your name)',
+      email: document.getElementById('dsar-email').value.trim() || '(your email)',
+      address: document.getElementById('dsar-address').value.trim() || '(your address)',
+      date: new Date().toLocaleDateString(),
+      context: document.getElementById('dsar-context').value.trim() || '(none provided)',
+      deviceBlock: S.devices.length ? S.devices.map(d => `- ${d.label}: ${d.serial}`).join('\n') : '(no devices recorded in Ownership Ledger)',
+      tenantBlock: S.findings.length ? [...new Set(S.findings.map(f => f.platform))].map(p => `- ${p}`).join('\n') : '(no tenant findings recorded — run a Passive Scan first)',
+      auditBlock: S.audits.length ? S.audits.map(a => `- ${a.name} (${a.findings.classification.map(cl => cl.category_label).join(', ') || 'unclassified'})`).join('\n') : '(no audit files uploaded)',
+    };
+    const body = t.body(v);
+    const deadline = new Date(Date.now() + t.days * 86400000).toISOString();
+    const subj = (body.split('\n')[0] || '').replace(/^SUBJECT:\s*/, '');
+    document.getElementById('dsar-preview').innerHTML = `
+    <div class="card">
+      <div class="card-title">Preview</div>
+      <textarea readonly style="min-height:320px;font-family:var(--mono);font-size:11.5px;">${esc(body)}</textarea>
+      <div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;">
+        <button class="btn btn-sm" id="dsar-copy">⎘ Copy</button>
+        <button class="btn btn-sm" id="dsar-download">⇩ Download .txt</button>
+        <a class="btn btn-sm" href="mailto:${encodeURIComponent(v.recipient)}?subject=${encodeURIComponent(subj)}&body=${encodeURIComponent(body)}" style="display:inline-flex;align-items:center;">✉ Open in mail client</a>
+        <button class="btn-primary btn-sm" id="dsar-log">◷ Log dispatch &amp; start deadline</button>
+      </div>
+    </div>`;
+    document.getElementById('dsar-copy').addEventListener('click', () => copy(body));
+    document.getElementById('dsar-download').addEventListener('click', () => download(`dsar-${key}.txt`, body));
+    document.getElementById('dsar-log').addEventListener('click', () => {
+      const disp = { id: uid(), ts: now(), template: key, label: t.label, recipient: v.recipient, statute: t.statute, deadline_at: deadline, status: 'pending' };
+      S.dispatches.push(disp);
+      save();
+      journalAppend('dsar.dispatched', { template: key, recipient: v.recipient, deadline_at: deadline });
+      alert(`Logged. Deadline: ${fmtDate(deadline)}. Track it in Deadline Tracker.`);
+      nav('tracker');
+    });
+  });
+};
+
+// ── DEADLINE TRACKER ─────────────────────────────────────────────────
+PAGES.tracker = function() {
+  const c = document.getElementById('content');
+  const nowD = new Date();
+  const rows = [...S.dispatches].sort((a, b) => new Date(a.deadline_at) - new Date(b.deadline_at));
+  c.innerHTML = `
+  <div class="card">
+    <div class="card-title">◷ Deadline Tracker</div>
+    <div class="card-sub">Statutory response windows for every disclosure you've logged (GDPR 30 days, CCPA 45 days).</div>
+  </div>
+  ${rows.length === 0 ? `<div class="card"><div class="empty-state">No disclosures logged yet. Generate one from Disclosure (DSAR).</div></div>` :
+    rows.map(d => {
+      const overdue = d.status === 'pending' && new Date(d.deadline_at) < nowD;
+      const daysLeft = daysBetween(nowD.toISOString(), d.deadline_at);
+      return `
+      <div class="card ${overdue ? 'overdue' : ''}">
+        <div class="list-item" style="border-bottom:none;padding:0;">
+          <div style="flex:1;">
+            <div class="main">${esc(d.label)}</div>
+            <div class="sub">To: ${esc(d.recipient)} · sent ${fmtDate(d.ts)}</div>
+            <div class="sub" style="color:${overdue ? 'var(--danger)' : 'inherit'};margin-top:4px;">
+              ${d.status !== 'pending' ? `Marked ${esc(d.status)}` : overdue ? `OVERDUE by ${Math.abs(daysLeft)} day(s)` : `${daysLeft} day(s) remaining — due ${fmtDate(d.deadline_at)}`}
+            </div>
+          </div>
+          <div class="actions">
+            ${d.status === 'pending' ? `<button class="btn btn-sm" data-resolve="${esc(d.id)}">✓ Mark responded</button>` : ''}
+            <button class="btn btn-sm" data-del="${esc(d.id)}" style="border-color:var(--danger);color:var(--danger);">✖</button>
+          </div>
+        </div>
+      </div>`;
+    }).join('')}`;
+  document.querySelectorAll('[data-resolve]').forEach(btn => btn.addEventListener('click', () => {
+    const d = S.dispatches.find(x => x.id === btn.dataset.resolve);
+    if (d) { d.status = 'responded'; save(); journalAppend('dsar.responded', { id: d.id }); }
+    nav('tracker');
+  }));
+  document.querySelectorAll('[data-del]').forEach(btn => btn.addEventListener('click', () => {
+    S.dispatches = S.dispatches.filter(d => d.id !== btn.dataset.del);
+    save();
+    nav('tracker');
+  }));
+};
+
+// ── CASE BUNDLE ──────────────────────────────────────────────────────
+PAGES.bundle = function() {
+  const c = document.getElementById('content');
+  c.innerHTML = `
+  <div class="card">
+    <div class="card-title">⊟ Case Bundle</div>
+    <div class="card-sub">Exports every record below as one self-contained JSON file (devices, audit files, journal, dispatches, findings, scan history) with a SHA-256 hash over the full payload for tamper evidence. This is a JSON bundle, not a .tar.gz — any evidence reviewer can open it as plain text.</div>
+    <div class="card-row" style="margin-top:12px;">
+      <div class="stat-card"><div class="stat-val">${S.devices.length}</div><div class="stat-lbl">Devices</div></div>
+      <div class="stat-card"><div class="stat-val">${S.audits.length}</div><div class="stat-lbl">Audits</div></div>
+      <div class="stat-card"><div class="stat-val">${S.journal.length}</div><div class="stat-lbl">Journal</div></div>
+      <div class="stat-card"><div class="stat-val">${S.dispatches.length}</div><div class="stat-lbl">Dispatches</div></div>
+    </div>
+    <button class="btn-primary" id="bundle-export" style="margin-top:14px;">⊟ Build &amp; download Case Bundle</button>
+    <div id="bundle-result" style="margin-top:10px;font-size:11px;font-family:var(--mono);word-break:break-all;"></div>
+  </div>`;
+  document.getElementById('bundle-export').addEventListener('click', async () => {
+    const payload = {
+      schema: 'mdmcheck_case_bundle_v1', generated_at: now(),
+      devices: S.devices, audits: S.audits, journal: S.journal,
+      dispatches: S.dispatches, findings: S.findings, scanHistory: S.scanHistory,
+    };
+    const hash = await sha256hex(JSON.stringify(payload));
+    download(`mdmcheck-case-bundle-${Date.now()}.json`, JSON.stringify({ ...payload, bundle_sha256: hash }, null, 2), 'application/json');
+    document.getElementById('bundle-result').textContent = `SHA-256: ${hash}`;
+    journalAppend('bundle.exported', { hash });
+  });
+};
+
+// ── ORG MAP ──────────────────────────────────────────────────────────
+PAGES.orgmap = function() {
+  const c = document.getElementById('content');
+  const nodes = {};
+  S.findings.forEach(f => { const k = f.category || 'other'; nodes[k] = (nodes[k] || 0) + 1; });
+  S.audits.forEach(a => (a.findings?.classification || []).forEach(cl => { nodes[cl.category] = (nodes[cl.category] || 0) + 1; }));
+  const entries = Object.entries(nodes);
+  if (!entries.length) {
+    c.innerHTML = `<div class="card"><div class="empty-state">No findings yet — run a Passive Scan or upload Audit Files to populate the map.</div></div>`;
+    return;
+  }
+  const cx = 260, cy = 220, r = 150;
+  const svgNodes = entries.map(([cat, count], i) => {
+    const angle = (i / entries.length) * 2 * Math.PI;
+    return { cat, count, x: cx + r * Math.cos(angle), y: cy + r * Math.sin(angle) };
+  });
+  c.innerHTML = `
+  <div class="card">
+    <div class="card-title">⬡ Org Map</div>
+    <div class="card-sub">Categories your local evidence actually touches, sized by finding count — a structured summary of Passive Scan + Audit Files, not a live network graph.</div>
+    <svg viewBox="0 0 520 440" style="width:100%;max-width:520px;margin-top:10px;">
+      ${svgNodes.map(n => `<line x1="${cx}" y1="${cy}" x2="${n.x}" y2="${n.y}" stroke="var(--border2)" stroke-width="1"/>`).join('')}
+      <circle cx="${cx}" cy="${cy}" r="22" fill="var(--gold)" opacity="0.85"/>
+      <text x="${cx}" y="${cy+4}" text-anchor="middle" font-size="9" fill="var(--navy)">YOU</text>
+      ${svgNodes.map(n => `
+        <circle cx="${n.x}" cy="${n.y}" r="${10 + Math.min(n.count,10)*2}" fill="var(--crimson2)" stroke="var(--border2)"/>
+        <text x="${n.x}" y="${n.y - 14 - Math.min(n.count,10)*2}" text-anchor="middle" font-size="9" fill="var(--text2)">${esc(CATEGORIES[n.cat]||n.cat)} (${n.count})</text>`).join('')}
+    </svg>
+  </div>`;
+};
+
+// ── SCAN HISTORY ─────────────────────────────────────────────────────
+PAGES.scanhistory = function() {
+  const c = document.getElementById('content');
+  c.innerHTML = `
+  <div class="card">
+    <div class="card-title">◉ Scan History</div>
+    <div class="card-sub">Last ${S.scanHistory.length} scan run${S.scanHistory.length===1?'':'s'} (most recent 50 kept locally, network and on-device alike).</div>
+  </div>
+  ${S.scanHistory.length === 0 ? `<div class="card"><div class="empty-state">No scans yet. Run one from Passive Scan.</div></div>` :
+    `<div class="card">${[...S.scanHistory].reverse().map(run => `
+    <div class="timeline-item">
+      <div class="tl-dot ${run.findingCount>0?'critical':'ok'}"></div>
+      <div class="tl-content">
+        <div class="tl-title">${esc(run.target)}${run.source ? ` <span style="color:var(--text3);font-weight:400;">(${esc(run.source)})</span>` : ''}</div>
+        <div class="tl-time">${fmtDate(run.ts)}</div>
+        <div class="tl-detail">${run.findingCount} finding${run.findingCount===1?'':'s'}</div>
+      </div>
+    </div>`).join('')}</div>`}`;
+};
+
+// ── AUDIT JOURNAL ────────────────────────────────────────────────────
+PAGES.journal = function() {
+  const c = document.getElementById('content');
+  c.innerHTML = `
+  <div class="card">
+    <div class="card-title">⏣ Audit Journal — SHA-256 Hash Chain</div>
+    <div class="card-sub">Every action taken in MDMCheck is chained: each entry's hash covers the previous entry's hash. Tampering with any entry breaks every hash after it.</div>
+    <div style="margin-top:10px;display:flex;gap:8px;">
+      <button class="btn btn-sm" id="journal-verify">✓ Verify chain</button>
+      <button class="btn btn-sm" id="journal-export">⇩ Export journal</button>
+    </div>
+    <div id="journal-verify-result" style="font-size:11px;margin-top:8px;"></div>
+  </div>
+  <div class="card">
+    ${S.journal.length === 0 ? `<div class="empty-state">No journal entries yet. Actions across MDMCheck append here automatically.</div>` :
+      [...S.journal].reverse().map(e => `
+      <div class="timeline-item">
+        <div class="tl-dot"></div>
+        <div class="tl-content">
+          <div class="tl-title">${esc(e.action)}</div>
+          <div class="tl-time">${fmtDate(e.ts)}</div>
+          <div class="tl-detail" style="font-family:var(--mono);font-size:10px;word-break:break-all;">hash: ${esc(e.hash || '(pending)')}</div>
+        </div>
+      </div>`).join('')}
+  </div>`;
+  document.getElementById('journal-verify').addEventListener('click', async () => {
+    const box = document.getElementById('journal-verify-result');
+    box.textContent = 'Verifying…';
+    let prev = '0'.repeat(64);
+    for (const e of S.journal) {
+      if (e.prev_hash !== prev) { box.innerHTML = `<span style="color:var(--danger);">✗ Chain broken at "${esc(e.action)}"</span>`; return; }
+      const h = await sha256hex(`${prev}|${e.ts}|${e.action}|${JSON.stringify(e.detail, null, 0)}`);
+      if (h !== e.hash) { box.innerHTML = `<span style="color:var(--danger);">✗ Hash mismatch at "${esc(e.action)}" — evidence may be tampered</span>`; return; }
+      prev = e.hash;
+    }
+    box.innerHTML = `<span style="color:var(--ok);">✓ Chain intact — ${S.journal.length} entries verified</span>`;
+  });
+  document.getElementById('journal-export').addEventListener('click', () => {
+    download('mdmcheck-journal.json', JSON.stringify(S.journal, null, 2), 'application/json');
+  });
+};
+
+// ── LOCAL INVENTORY ──────────────────────────────────────────────────
+PAGES.inventory = function() {
+  const c = document.getElementById('content');
+  const counts = { Devices: S.devices.length, 'Audit Files': S.audits.length, 'Journal Entries': S.journal.length,
+    Dispatches: S.dispatches.length, Findings: S.findings.length, 'Scan Runs': S.scanHistory.length };
+  c.innerHTML = `
+  <div class="card">
+    <div class="card-title">⊚ Local Inventory</div>
+    <div class="card-sub">Everything below lives only in this browser's localStorage. Nothing is transmitted anywhere unless you explicitly export or send it.</div>
+    <div class="card-row" style="margin-top:12px;">
+      ${Object.entries(counts).map(([k, v]) => `<div class="stat-card"><div class="stat-val">${v}</div><div class="stat-lbl">${esc(k)}</div></div>`).join('')}
+    </div>
+    <div style="margin-top:16px;display:flex;gap:8px;flex-wrap:wrap;">
+      <button class="btn btn-sm" id="inv-export">⇩ Export everything (JSON)</button>
+      <button class="btn btn-sm" id="inv-import">⇧ Import JSON</button>
+      <input type="file" id="inv-import-file" accept="application/json" style="display:none;width:auto;">
+      <button class="btn btn-sm" id="inv-clear" style="border-color:var(--danger);color:var(--danger);">✖ Clear all local data</button>
+    </div>
+  </div>`;
+  document.getElementById('inv-export').addEventListener('click', () => {
+    download('mdmcheck-inventory.json', JSON.stringify(S, null, 2), 'application/json');
+  });
+  document.getElementById('inv-import').addEventListener('click', () => document.getElementById('inv-import-file').click());
+  document.getElementById('inv-import-file').addEventListener('change', async (e) => {
+    const f = e.target.files[0]; if (!f) return;
+    try {
+      const data = JSON.parse(await f.text());
+      ['devices','audits','journal','dispatches','findings','scanHistory'].forEach(k => { if (Array.isArray(data[k])) S[k] = data[k]; });
+      save();
+      journalAppend('inventory.imported', { filename: f.name });
+      nav('inventory');
+    } catch { alert('Invalid JSON file.'); }
+  });
+  document.getElementById('inv-clear').addEventListener('click', () => {
+    if (!confirm('Erase all locally stored MDMCheck data? This cannot be undone.')) return;
+    ['devices','audits','journal','dispatches','findings','scanHistory'].forEach(k => { S[k] = []; });
+    save();
+    nav('inventory');
+  });
+};
+
+// ── DEVICE BRIDGE (honest placeholder — see note below) ─────────────
+PAGES.bridge = function() {
+  const c = document.getElementById('content');
+  c.innerHTML = `
+  <div class="card">
+    <div class="card-title">⚡ Device Bridge</div>
+    <div class="card-sub">Not implemented in this build. A correct browser-native ADB-over-WebUSB client needs a from-scratch ADB protocol implementation (USB descriptor walk, RSA-signed auth handshake) that hasn't been written and tested here — shipping it untested would be worse than not having it.</div>
+    <div class="alert alert-info" style="margin-top:12px;">Until then, get the same evidence over a standard USB cable with the host-side tools already in this toolbox: <code>enrollment_evidence_deep.py</code> / <code>repairmode_evidence_adb.py</code> (drive the phone from a PC over plain <code>adb</code>), or <code>repairmode_evidence_termux.py</code> (run directly on-device via Termux + rish). Paste their output into Module F Sweep or upload it to Audit Files.</div>
+  </div>`;
+};
+
+// ── TEGU INTEL ────────────────────────────────────────────────────────
+PAGES.tegu = function() {
+  const c = document.getElementById('content');
+  const critCount = S.findings.filter(f => f.severity === 'CRITICAL').length;
+  c.innerHTML = `
+  <div class="card">
+    <div class="card-title">🦎 Tegu Intel — Device Ownership Report</div>
+    <div class="card-sub">Rollup of everything MDMCheck has learned locally: Passive Scan + DNS + Module F + imported on-device scans, in one view.</div>
+    <div class="card-row" style="margin-top:12px;">
+      <div class="stat-card"><div class="stat-val">${S.devices.length}</div><div class="stat-lbl">Devices tracked</div></div>
+      <div class="stat-card"><div class="stat-val">${S.scanHistory.length}</div><div class="stat-lbl">Scans run</div></div>
+      <div class="stat-card"><div class="stat-val" style="color:${critCount>0?'var(--danger)':'var(--ok)'}">${critCount}</div><div class="stat-lbl">Critical findings</div></div>
+      <div class="stat-card"><div class="stat-val">${S.dispatches.filter(d=>d.status==='pending').length}</div><div class="stat-lbl">Open disclosures</div></div>
+    </div>
+  </div>
+  ${S.findings.length === 0 ? `<div class="card"><div class="empty-state">No findings recorded yet. Start with Passive Scan, DNS Fingerprint, or Module F Sweep.</div></div>` :
+    `<div class="card"><div class="card-title">Most recent findings</div>${[...S.findings].slice(-10).reverse().map(f => findingCard({
+      title: f.platform, severity: f.severity || (f.confidence >= 85 ? 'CRITICAL' : 'HIGH'),
+      meta: `${esc(f.target||'')} · ${fmtDate(f.ts)}`,
+    })).join('')}</div>`}`;
+  wireFindingCards(c);
+};
+
+// ═══════════════════════════════════════════════════════════════
+// SCREEN NAVIGATION (landing / login / app shell)
+// ═══════════════════════════════════════════════════════════════
+function showScreen(id) {
+  document.querySelectorAll('.screen').forEach(s => s.classList.remove('active'));
+  document.getElementById(id).classList.add('active');
+}
+function goLanding() { showScreen('screen-landing'); }
+function goLogin() {
+  showScreen('screen-login');
+  setTimeout(() => document.getElementById('login-alias')?.focus(), 50);
+}
+function goApp(alias) {
+  const stored = storeGet('alias');
+  const name = (alias && alias !== 'Operator') ? alias : (stored || 'Operator');
+  storeSet('alias', name);
+  document.getElementById('user-alias-display').textContent = name;
+  document.getElementById('user-avatar-char').textContent = name.charAt(0).toUpperCase();
+  showScreen('screen-app');
+  nav(S.currentPage || 'home');
+}
+document.getElementById('login-form-btn').addEventListener('click', () => {
+  goApp(document.getElementById('login-alias').value.trim() || 'Operator');
+});
+document.getElementById('login-alias').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') document.getElementById('login-form-btn').click();
+});
+
+load();
+</script>
+</body>
+</html>
+

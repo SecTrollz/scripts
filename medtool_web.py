@@ -2573,4 +2573,974 @@ select.field { appearance: none; }
 .set-row label { font-size: 14px; min-width: 170px; }
 .set-row.wide label { min-width: 0; }
 .hint { font-size: 11px; color: var(--faint); font-family: var(--mono); margin-left: 4px; }
-.err { font-size: 12p
+.err { font-size: 12px; color: var(--red); margin-left: 8px; }
+
+@keyframes breathe {
+  0%, 100% { transform: scale(1); opacity: 0.85; }
+  50%      { transform: scale(1.14); opacity: 1; }
+}
+@keyframes fade {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: var(--border-2); border-radius: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+
+@media (max-width: 780px) {
+  .sidebar { width: 76px; }
+  .brand-text, .nav-item span:last-child { display: none; }
+  .grid { grid-template-columns: 1fr; }
+  .main { padding: 24px 18px 50px; }
+}
+  </style>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-orb"></div>
+      <div class="brand-text">
+        <div class="brand-name" id="brand-name">GARBAGE NOISE</div>
+        <div class="brand-sub" id="brand-sub">calming the garbage within</div>
+      </div>
+    </div>
+    <nav class="nav">
+      <button class="nav-item active" data-view="create"><span class="nav-ico">&#9782;</span><span>Create</span></button>
+      <button class="nav-item" data-view="library"><span class="nav-ico">&#9638;</span><span>Library</span></button>
+      <button class="nav-item" data-view="settings"><span class="nav-ico">&#9881;</span><span>Settings</span></button>
+    </nav>
+    <div class="sidebar-foot">
+      <div class="dep-row" id="dep-row"></div>
+      <div class="ver">medtool web v4.0</div>
+    </div>
+  </aside>
+
+  <main class="main">
+    <section class="view active" id="view-create">
+      <div class="view-head">
+        <h1>Create</h1>
+        <div class="muted">yt-dlp &rarr; remix &rarr; FX &rarr; master &rarr; extend &rarr; video, one pipeline.</div>
+      </div>
+      <div class="grid">
+
+        <div class="card span2">
+          <div class="card-title">Source</div>
+          <div class="seg" id="src-seg">
+            <button class="seg-btn active" data-src="url">URL</button>
+            <button class="seg-btn" data-src="batch">Batch / Playlist</button>
+            <button class="seg-btn" data-src="local">Upload file</button>
+          </div>
+          <div class="src-pane active" data-pane="url">
+            <input class="field" id="src-url" placeholder="https://www.youtube.com/watch?v=..." />
+          </div>
+          <div class="src-pane" data-pane="batch">
+            <textarea class="field area" id="src-batch" rows="5" placeholder="One URL per line (or a single playlist URL). Lines starting with # are ignored."></textarea>
+          </div>
+          <div class="src-pane" data-pane="local">
+            <label class="drop" id="drop-zone">
+              <div class="drop-ico">&#8683;</div>
+              <div class="drop-text" id="drop-text">Drop an audio/video file here, or click to choose</div>
+              <input type="file" id="file-input" accept="audio/*,video/*" style="display:none" />
+            </label>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Profile</div>
+          <div class="profiles" id="profiles"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Brand &amp; Extras</div>
+          <div class="rows">
+            <div class="row">
+              <span>Brand</span>
+              <select class="field sm" id="opt-brand"></select>
+            </div>
+            <div class="row">
+              <label class="toggle"><input type="checkbox" id="opt-binaural" checked><span class="toggle-track"><span class="toggle-thumb"></span></span><span class="toggle-label">Binaural beat</span></label>
+            </div>
+            <div class="row">
+              <label class="toggle"><input type="checkbox" id="opt-polish" checked><span class="toggle-track"><span class="toggle-thumb"></span></span><span class="toggle-label">Polish (crystalizer + widen)</span></label>
+            </div>
+            <div class="row">
+              <label class="toggle"><input type="checkbox" id="opt-creator_pack" checked><span class="toggle-track"><span class="toggle-thumb"></span></span><span class="toggle-label">Creator pack (thumb + metadata)</span></label>
+            </div>
+            <div class="row">
+              <label class="toggle"><input type="checkbox" id="opt-skip_existing" checked><span class="toggle-track"><span class="toggle-thumb"></span></span><span class="toggle-label">Skip existing files</span></label>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">FX Rack</div>
+          <div class="chiprow" id="fx-chips"></div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Slow &amp; Stem Separation</div>
+          <div class="rows">
+            <div class="row">
+              <span>Slow</span>
+              <select class="field sm" id="opt-slow"></select>
+            </div>
+            <div class="row subgroup" id="slow-pct-row">
+              <span>Speed %</span>
+              <input class="field xs" type="number" id="opt-slow_pct" min="50" max="100" value="85" />
+            </div>
+            <div class="row">
+              <span>Stems (Demucs)</span>
+              <select class="field sm" id="opt-stems"></select>
+            </div>
+            <div class="row subgroup" id="stem-sub">
+              <label class="toggle"><input type="checkbox" id="opt-stem_pipeline"><span class="toggle-track"><span class="toggle-thumb"></span></span><span class="toggle-label">Route a stem into the pipeline</span></label>
+              <select class="field sm" id="opt-stem_source">
+                <option value="mix">Mix</option>
+                <option value="vocals">Vocals</option>
+                <option value="instrumental">Instrumental</option>
+                <option value="drums">Drums</option>
+                <option value="bass">Bass</option>
+                <option value="other">Other</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Video</div>
+          <div class="rows">
+            <div class="row">
+              <label class="toggle"><input type="checkbox" id="opt-video"><span class="toggle-track"><span class="toggle-thumb"></span></span><span class="toggle-label">Render video</span></label>
+            </div>
+            <div class="row subgroup" id="video-sub1">
+              <span>Visualizer</span>
+              <select class="field sm" id="opt-viz"></select>
+            </div>
+            <div class="row subgroup" id="video-sub2">
+              <label class="toggle"><input type="checkbox" id="opt-captions" checked><span class="toggle-track"><span class="toggle-thumb"></span></span><span class="toggle-label">Whisper captions</span></label>
+            </div>
+            <div class="row subgroup" id="video-sub3">
+              <span>Breathing overlay</span>
+              <select class="field sm" id="opt-breathing"></select>
+            </div>
+            <div class="breath-desc" id="breath-desc"></div>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-title">Compilation &amp; Extend</div>
+          <div class="rows">
+            <div class="row">
+              <span>Track order</span>
+              <select class="field sm" id="opt-comp_order">
+                <option value="off">Off (single track)</option>
+                <option value="shuffle">Shuffle</option>
+                <option value="reverse">Reverse</option>
+                <option value="short">Shortest first</option>
+                <option value="long">Longest first</option>
+              </select>
+            </div>
+            <div class="row">
+              <span>Extend to</span>
+              <select class="field sm" id="opt-extend_min"></select>
+            </div>
+          </div>
+        </div>
+
+        <div class="card span2">
+          <button class="run-btn" id="run-btn"><span class="run-ico">&#9654;</span> Run pipeline</button>
+          <div class="progress-card" id="progress-card" style="display:none">
+            <div class="prog-head">
+              <div class="orb-wrap"><div class="orb idle" id="prog-orb"></div></div>
+              <div class="prog-meta">
+                <div class="prog-step" id="prog-step">Idle</div>
+                <div class="prog-sub muted" id="prog-sub"></div>
+              </div>
+              <button class="cancel-btn" id="cancel-btn">Cancel</button>
+            </div>
+            <div class="bar"><div class="bar-fill" id="bar-fill"></div></div>
+            <div class="console" id="console"></div>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <section class="view" id="view-library">
+      <div class="view-head">
+        <h1>Library</h1>
+        <div class="muted">Everything the pipeline has produced, grouped by track.</div>
+      </div>
+      <div class="lib-filter" id="lib-filter">
+        <button class="chip active" data-filter="all">All</button>
+        <button class="chip" data-filter="sleep">Sleep</button>
+        <button class="chip" data-filter="med">Med</button>
+        <button class="chip" data-filter="focus">Focus</button>
+        <button class="chip ghost" id="lib-refresh">&#8635; Refresh</button>
+      </div>
+      <div class="lib-list" id="lib-list"><div class="empty">Loading&hellip;</div></div>
+      <video id="player" controls style="display:none"></video>
+    </section>
+
+    <section class="view" id="view-settings">
+      <div class="view-head">
+        <h1>Settings</h1>
+        <div class="muted">Saved to ~/.medtool/web_config.json.</div>
+      </div>
+      <div class="card set-card">
+        <div class="set-row wide">
+          <label>Output directory</label>
+          <input class="field" id="set-out_dir" />
+        </div>
+        <div class="set-row">
+          <label>Target LUFS</label>
+          <input class="field xs" type="number" id="set-lufs" step="1" />
+          <label>True peak (dBTP)</label>
+          <input class="field xs" type="number" id="set-true_peak" step="0.5" />
+        </div>
+        <div class="set-row">
+          <label>Bitrate</label>
+          <select class="field sm" id="set-bitrate">
+            <option value="192k">192k</option>
+            <option value="256k">256k</option>
+            <option value="320k">320k</option>
+          </select>
+        </div>
+        <div class="set-row">
+          <label>Fade in / out (s)</label>
+          <input class="field xs" type="number" id="set-fade_in" />
+          <input class="field xs" type="number" id="set-fade_out" />
+        </div>
+        <div class="set-row">
+          <label>Whisper model</label>
+          <select class="field sm" id="set-whisper_model">
+            <option value="tiny">tiny</option>
+            <option value="base">base</option>
+            <option value="small">small</option>
+          </select>
+        </div>
+        <div class="set-row">
+          <label>Stem model</label>
+          <select class="field sm" id="set-stem_model">
+            <option value="htdemucs">htdemucs</option>
+            <option value="htdemucs_ft">htdemucs_ft</option>
+            <option value="htdemucs_6s">htdemucs_6s</option>
+          </select>
+        </div>
+        <div class="set-row">
+          <label>Loop crossfade (s)</label>
+          <input class="field xs" type="number" id="set-loop_xfade" />
+        </div>
+        <div class="set-row">
+          <button class="run-btn slim" id="save-settings-btn">Save settings</button>
+          <span class="err" id="settings-msg"></span>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var META = null;
+  var CFG = null;
+  var state = {
+    view: "create",
+    src: "url",
+    profile: "med",
+    fx: "none",
+    uploadPath: null,
+    uploadName: null,
+    jobId: null,
+    es: null,
+    libFilter: "all",
+    libItems: [],
+  };
+
+  function $(id) { return document.getElementById(id); }
+  function qsa(sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); }
+
+  // ── Views / nav ─────────────────────────────────────────────────
+  qsa(".nav-item").forEach(function (btn) {
+    btn.addEventListener("click", function () { switchView(btn.dataset.view); });
+  });
+
+  function switchView(view) {
+    state.view = view;
+    qsa(".nav-item").forEach(function (b) { b.classList.toggle("active", b.dataset.view === view); });
+    qsa(".view").forEach(function (v) { v.classList.toggle("active", v.id === "view-" + view); });
+    if (view === "library") loadLibrary();
+    if (view === "settings") loadConfigIntoSettings();
+  }
+
+  // ── Source tabs ─────────────────────────────────────────────────
+  qsa("#src-seg .seg-btn").forEach(function (btn) {
+    btn.addEventListener("click", function () {
+      state.src = btn.dataset.src;
+      qsa("#src-seg .seg-btn").forEach(function (b) { b.classList.toggle("active", b === btn); });
+      qsa(".src-pane").forEach(function (p) { p.classList.toggle("active", p.dataset.pane === state.src); });
+    });
+  });
+
+  var dropZone = $("drop-zone"), fileInput = $("file-input");
+  dropZone.addEventListener("click", function () { fileInput.click(); });
+  fileInput.addEventListener("change", function () {
+    if (fileInput.files[0]) uploadFile(fileInput.files[0]);
+  });
+  ["dragover", "dragenter"].forEach(function (ev) {
+    dropZone.addEventListener(ev, function (e) { e.preventDefault(); dropZone.classList.add("over"); });
+  });
+  ["dragleave", "drop"].forEach(function (ev) {
+    dropZone.addEventListener(ev, function (e) { e.preventDefault(); dropZone.classList.remove("over"); });
+  });
+  dropZone.addEventListener("drop", function (e) {
+    var f = e.dataTransfer.files && e.dataTransfer.files[0];
+    if (f) uploadFile(f);
+  });
+
+  function uploadFile(file) {
+    $("drop-text").textContent = "Uploading " + file.name + " …";
+    var fd = new FormData();
+    fd.append("file", file);
+    fetch("/api/upload", { method: "POST", body: fd })
+      .then(function (r) { return r.json(); })
+      .then(function (data) {
+        if (data.error) { $("drop-text").textContent = "Upload failed: " + data.error; return; }
+        state.uploadPath = data.path;
+        state.uploadName = data.name;
+        $("drop-text").textContent = "✓ " + data.name + " (click to replace)";
+      })
+      .catch(function () { $("drop-text").textContent = "Upload failed."; });
+  }
+
+  // ── Meta-driven controls ────────────────────────────────────────
+  function loadMeta() {
+    return fetch("/api/meta").then(function (r) { return r.json(); }).then(function (meta) {
+      META = meta;
+      CFG = meta.cfg;
+      renderDeps(meta.deps);
+      renderProfiles(meta.profiles);
+      renderBrands(meta.brands);
+      renderFx(meta.fx);
+      renderSelect("opt-slow", meta.slow, function (k, v) { return v.label + (v.available ? "" : " (unavailable)"); });
+      renderSelect("opt-stems", meta.stems, function (k, v) {
+        return v + (k !== "off" && !meta.stems_available ? " (Demucs not installed)" : "");
+      });
+      renderSelect("opt-viz", meta.viz.reduce(function (o, v) { o[v] = v; return o; }, {}), function (k) { return k; });
+      renderSelect("opt-breathing", Object.assign({ none: { label: "None" } }, meta.breathing),
+        function (k, v) { return v.label; });
+      renderExtend(meta.extend_presets);
+      applyCfgDefaults();
+      wireSubgroups();
+    }).catch(function (e) { console.error("meta load failed", e); });
+  }
+
+  function renderDeps(deps) {
+    var row = $("dep-row");
+    row.innerHTML = "";
+    Object.keys(deps).forEach(function (k) {
+      var span = document.createElement("span");
+      span.className = "dep " + (deps[k] ? "ok" : "bad");
+      span.textContent = k;
+      row.appendChild(span);
+    });
+  }
+
+  function renderProfiles(profiles) {
+    var wrap = $("profiles");
+    wrap.innerHTML = "";
+    Object.keys(profiles).forEach(function (key) {
+      var p = profiles[key];
+      var el = document.createElement("div");
+      el.className = "prof" + (key === state.profile ? " active" : "");
+      el.dataset.profile = key;
+      el.innerHTML =
+        '<span class="prof-dot ' + key + '"></span>' +
+        '<span class="prof-info"><span class="prof-name">' + p.label +
+        '</span><span class="prof-desc">' + p.desc + "</span></span>";
+      el.addEventListener("click", function () {
+        state.profile = key;
+        qsa("#profiles .prof").forEach(function (e2) { e2.classList.toggle("active", e2 === el); });
+      });
+      wrap.appendChild(el);
+    });
+  }
+
+  function renderBrands(brands) {
+    var sel = $("opt-brand");
+    sel.innerHTML = "";
+    Object.keys(brands).forEach(function (key) {
+      var o = document.createElement("option");
+      o.value = key;
+      o.textContent = brands[key].channel;
+      sel.appendChild(o);
+    });
+    sel.addEventListener("change", function () {
+      var b = brands[sel.value];
+      if (b) { $("brand-name").textContent = b.channel; $("brand-sub").textContent = b.slogan; }
+    });
+  }
+
+  function renderFx(fx) {
+    var wrap = $("fx-chips");
+    wrap.innerHTML = "";
+    Object.keys(fx).forEach(function (key) {
+      var f = fx[key];
+      var chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "chip" + (key === "none" ? " active" : "") + (f.available ? "" : " dead");
+      chip.textContent = f.label;
+      chip.dataset.fx = key;
+      if (f.available) {
+        chip.addEventListener("click", function () {
+          state.fx = key;
+          qsa("#fx-chips .chip").forEach(function (c) { c.classList.toggle("active", c === chip); });
+        });
+      } else {
+        chip.title = "Not supported by this ffmpeg build";
+      }
+      wrap.appendChild(chip);
+    });
+  }
+
+  function renderSelect(id, obj, labelFn) {
+    var sel = $(id);
+    sel.innerHTML = "";
+    Object.keys(obj).forEach(function (k) {
+      var o = document.createElement("option");
+      o.value = k;
+      o.textContent = labelFn(k, obj[k]);
+      sel.appendChild(o);
+    });
+  }
+
+  function renderExtend(presets) {
+    var sel = $("opt-extend_min");
+    sel.innerHTML = "";
+    presets.forEach(function (m) {
+      var o = document.createElement("option");
+      o.value = m;
+      o.textContent = m === 0 ? "Off (single unit)" :
+        (m >= 60 ? (m / 60) + "h" : m + "m");
+      sel.appendChild(o);
+    });
+  }
+
+  function applyCfgDefaults() {
+    if (!CFG) return;
+    setChecked("opt-binaural", CFG.binaural);
+    setChecked("opt-polish", CFG.polish);
+    setChecked("opt-creator_pack", CFG.creator_pack);
+    setChecked("opt-skip_existing", CFG.skip_existing);
+    setChecked("opt-video", CFG.video);
+    setChecked("opt-captions", CFG.captions);
+    setChecked("opt-stem_pipeline", CFG.stem_pipeline);
+    setValue("opt-brand", CFG.brand);
+    setValue("opt-viz", CFG.viz);
+    setValue("opt-breathing", CFG.breathing);
+    setValue("opt-comp_order", CFG.comp_order);
+    setValue("opt-extend_min", CFG.extend_min);
+    setValue("opt-slow", CFG.slow);
+    setValue("opt-slow_pct", CFG.slow_pct);
+    setValue("opt-stems", CFG.stems);
+    setValue("opt-stem_source", CFG.stem_source);
+    state.fx = CFG.fx || "none";
+    qsa("#fx-chips .chip").forEach(function (c) { c.classList.toggle("active", c.dataset.fx === state.fx); });
+    state.profile = CFG.profile || "med";
+    qsa("#profiles .prof").forEach(function (e2) { e2.classList.toggle("active", e2.dataset.profile === state.profile); });
+    var b = META.brands[CFG.brand];
+    if (b) { $("brand-name").textContent = b.channel; $("brand-sub").textContent = b.slogan; }
+    updateBreathDesc();
+  }
+
+  function setChecked(id, v) { $(id).checked = !!v; }
+  function setValue(id, v) { if (v !== undefined && v !== null) $(id).value = v; }
+
+  function wireSubgroups() {
+    function sync() {
+      $("slow-pct-row").classList.toggle("on", $("opt-slow").value !== "off");
+      $("stem-sub").classList.toggle("on", $("opt-stems").value !== "off");
+      var videoOn = $("opt-video").checked;
+      ["video-sub1", "video-sub2", "video-sub3"].forEach(function (id) {
+        $(id).classList.toggle("on", videoOn);
+      });
+    }
+    $("opt-slow").addEventListener("change", sync);
+    $("opt-stems").addEventListener("change", sync);
+    $("opt-video").addEventListener("change", sync);
+    $("opt-breathing").addEventListener("change", updateBreathDesc);
+    sync();
+  }
+
+  function updateBreathDesc() {
+    var key = $("opt-breathing").value;
+    var el = $("breath-desc");
+    var b = META && META.breathing[key];
+    if (!b) { el.textContent = ""; return; }
+    var cycle = b.cycle.map(function (c) { return c[0] + " " + c[1] + "s"; }).join(" · ");
+    el.innerHTML = b.desc + '<div class="breath-cycle">' + cycle + "</div>";
+  }
+
+  // ── Run pipeline ────────────────────────────────────────────────
+  $("run-btn").addEventListener("click", runPipeline);
+  $("cancel-btn").addEventListener("click", function () {
+    if (state.jobId) fetch("/api/cancel/" + state.jobId, { method: "POST" });
+  });
+
+  function buildPayload() {
+    var payload = {
+      type: state.src,
+      profile: state.profile,
+      brand: $("opt-brand").value,
+      binaural: $("opt-binaural").checked,
+      polish: $("opt-polish").checked,
+      creator_pack: $("opt-creator_pack").checked,
+      skip_existing: $("opt-skip_existing").checked,
+      fx: state.fx,
+      slow: $("opt-slow").value,
+      slow_pct: parseInt($("opt-slow_pct").value, 10) || 85,
+      stems: $("opt-stems").value,
+      stem_pipeline: $("opt-stem_pipeline").checked,
+      stem_source: $("opt-stem_source").value,
+      video: $("opt-video").checked,
+      viz: $("opt-viz").value,
+      captions: $("opt-captions").checked,
+      breathing: $("opt-breathing").value,
+      comp_order: $("opt-comp_order").value,
+      extend_min: parseInt($("opt-extend_min").value, 10) || 0,
+    };
+    if (state.src === "url") payload.url = $("src-url").value.trim();
+    else if (state.src === "batch") payload.urls = $("src-batch").value;
+    else if (state.src === "local") payload.path = state.uploadPath;
+    return payload;
+  }
+
+  function validPayload(p) {
+    if (p.type === "url") return !!p.url;
+    if (p.type === "batch") return !!(p.urls && p.urls.trim());
+    if (p.type === "local") return !!p.path;
+    return false;
+  }
+
+  function runPipeline() {
+    var payload = buildPayload();
+    if (!validPayload(payload)) {
+      alert("Add a URL, batch list, or upload a file first.");
+      return;
+    }
+    $("run-btn").disabled = true;
+    $("progress-card").style.display = "block";
+    $("console").innerHTML = "";
+    $("bar-fill").style.width = "0%";
+    $("prog-orb").classList.remove("idle");
+    $("prog-step").textContent = "Starting…";
+    $("prog-sub").textContent = "";
+
+    fetch("/api/run", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }).then(function (r) { return r.json(); }).then(function (data) {
+      if (data.error) { finishRun("Error: " + data.error); return; }
+      state.jobId = data.job_id;
+      openStream(data.job_id);
+    }).catch(function (e) { finishRun("Error: " + e); });
+  }
+
+  function openStream(jobId) {
+    var es = new EventSource("/api/stream/" + jobId);
+    state.es = es;
+    es.onmessage = function (ev) { handleEvent(JSON.parse(ev.data)); };
+    es.addEventListener("end", function () { es.close(); });
+    es.onerror = function () { es.close(); finishRun(null); };
+  }
+
+  var STEP_LABELS = {
+    downloading: "Downloading", analyzing: "Analyzing", encoding: "Mastering",
+    rendering: "Rendering video", packing: "Creator pack",
+    separating: "Separating stems", track: "Track", track_done: "Track complete",
+    track_fail: "Track failed", done: "Complete", error: "Error",
+  };
+
+  function handleEvent(ev) {
+    if (ev.state) {
+      var label = STEP_LABELS[ev.state] || ev.state;
+      if (ev.state === "track") label += " " + ev.index + "/" + ev.total;
+      $("prog-step").textContent = ev.step || label;
+    } else if (ev.step) {
+      $("prog-step").textContent = ev.step;
+    }
+    if (ev.title || ev.filename) {
+      $("prog-sub").textContent = ev.title || ev.filename || "";
+    }
+    if (typeof ev.progress === "number") {
+      $("bar-fill").style.width = Math.max(0, Math.min(100, ev.progress)) + "%";
+    }
+    if (ev.state === "track_done" || ev.state === "done") {
+      $("bar-fill").style.width = "100%";
+    }
+    if (ev.log) appendLog(ev.log);
+    if (ev.message) appendLog(ev.message);
+    if (ev.state === "done") {
+      finishRun(ev.log || ("Complete — " + ev.ok + " ok, " + ev.skip + " skipped, " + ev.fail + " failed"));
+    } else if (ev.state === "error") {
+      finishRun(ev.message || "Error");
+    }
+  }
+
+  function appendLog(text) {
+    var line = document.createElement("div");
+    var cls = "ln";
+    if (text.indexOf("✓") === 0) cls += " ok";
+    else if (text.indexOf("✗") === 0) cls += " err";
+    else if (text.indexOf("Cancel") !== -1 || text.indexOf("⚠") !== -1) cls += " warn";
+    else if (text.indexOf("──") === 0) cls += " sep";
+    line.className = cls;
+    line.textContent = text;
+    var box = $("console");
+    box.appendChild(line);
+    box.scrollTop = box.scrollHeight;
+  }
+
+  function finishRun(finalMsg) {
+    if (finalMsg) appendLog(finalMsg);
+    $("run-btn").disabled = false;
+    $("prog-orb").classList.add("idle");
+    if (state.es) { state.es.close(); state.es = null; }
+    state.jobId = null;
+  }
+
+  // ── Library ─────────────────────────────────────────────────────
+  $("lib-refresh").addEventListener("click", loadLibrary);
+  qsa("#lib-filter .chip[data-filter]").forEach(function (chip) {
+    chip.addEventListener("click", function () {
+      state.libFilter = chip.dataset.filter;
+      qsa("#lib-filter .chip[data-filter]").forEach(function (c) { c.classList.toggle("active", c === chip); });
+      renderLibrary();
+    });
+  });
+
+  var PROFILE_COLORS = { sleep: "#6366f1", med: "#a855f7", focus: "#34d2ee" };
+
+  function loadLibrary() {
+    $("lib-list").innerHTML = '<div class="empty">Loading…</div>';
+    fetch("/api/library").then(function (r) { return r.json(); }).then(function (data) {
+      state.libItems = data.items || [];
+      renderLibrary();
+    }).catch(function () { $("lib-list").innerHTML = '<div class="empty">Failed to load library.</div>'; });
+  }
+
+  function renderLibrary() {
+    var list = $("lib-list");
+    var items = state.libItems.filter(function (g) {
+      return state.libFilter === "all" || g.profile === state.libFilter;
+    });
+    if (!items.length) { list.innerHTML = '<div class="empty">Nothing here yet — run the pipeline first.</div>'; return; }
+    list.innerHTML = "";
+    items.forEach(function (g) {
+      var kinds = Object.keys(g.files);
+      var main = g.files.video || g.files.audio;
+      var size = main ? main.size : "";
+      var when = main ? new Date(main.mtime * 1000).toLocaleString() : "";
+      var el = document.createElement("div");
+      el.className = "lib-item";
+      el.innerHTML =
+        '<span class="lib-dot" style="background:' + (PROFILE_COLORS[g.profile] || "#8b85a6") + '"></span>' +
+        '<div class="lib-info">' +
+        '<div class="lib-name">' + g.stem + "</div>" +
+        '<div class="lib-meta">' +
+        kinds.map(function (k) { return '<span class="lib-kind ' + k + '">' + k + "</span>"; }).join("") +
+        size + (when ? " · " + when : "") +
+        "</div></div>" +
+        '<div class="lib-actions"></div>';
+      var actions = el.querySelector(".lib-actions");
+      if (main) {
+        var playBtn = document.createElement("button");
+        playBtn.className = "icon-btn";
+        playBtn.title = "Play";
+        playBtn.textContent = "▶";
+        playBtn.addEventListener("click", function () { playFile(main.path, !!g.files.video); });
+        actions.appendChild(playBtn);
+
+        var dlBtn = document.createElement("a");
+        dlBtn.className = "icon-btn";
+        dlBtn.title = "Download";
+        dlBtn.textContent = "⇩";
+        dlBtn.href = "/api/file?path=" + encodeURIComponent(main.path);
+        actions.appendChild(dlBtn);
+      }
+      var delBtn = document.createElement("button");
+      delBtn.className = "icon-btn danger";
+      delBtn.title = "Delete";
+      delBtn.textContent = "✖";
+      delBtn.addEventListener("click", function () { deleteGroup(g); });
+      actions.appendChild(delBtn);
+      list.appendChild(el);
+    });
+  }
+
+  function playFile(path, isVideo) {
+    var player = $("player");
+    player.src = "/api/file?path=" + encodeURIComponent(path);
+    player.style.display = "block";
+    player.style.background = isVideo ? "#000" : "transparent";
+    player.play().catch(function () {});
+    player.scrollIntoView({ behavior: "smooth", block: "center" });
+  }
+
+  function deleteGroup(g) {
+    if (!confirm("Delete all files for “" + g.stem + "”?")) return;
+    var paths = Object.keys(g.files).map(function (k) { return g.files[k].path; });
+    fetch("/api/library/delete", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ paths: paths }),
+    }).then(function () { loadLibrary(); });
+  }
+
+  // ── Settings ────────────────────────────────────────────────────
+  function loadConfigIntoSettings() {
+    fetch("/api/config").then(function (r) { return r.json(); }).then(function (cfg) {
+      CFG = cfg;
+      setValue("set-out_dir", cfg.out_dir);
+      setValue("set-lufs", cfg.lufs);
+      setValue("set-true_peak", cfg.true_peak);
+      setValue("set-bitrate", cfg.bitrate);
+      setValue("set-fade_in", cfg.fade_in);
+      setValue("set-fade_out", cfg.fade_out);
+      setValue("set-whisper_model", cfg.whisper_model);
+      setValue("set-stem_model", cfg.stem_model);
+      setValue("set-loop_xfade", cfg.loop_xfade);
+    });
+  }
+
+  $("save-settings-btn").addEventListener("click", function () {
+    var update = {
+      out_dir: $("set-out_dir").value,
+      lufs: parseFloat($("set-lufs").value),
+      true_peak: parseFloat($("set-true_peak").value),
+      bitrate: $("set-bitrate").value,
+      fade_in: parseFloat($("set-fade_in").value),
+      fade_out: parseFloat($("set-fade_out").value),
+      whisper_model: $("set-whisper_model").value,
+      stem_model: $("set-stem_model").value,
+      loop_xfade: parseFloat($("set-loop_xfade").value),
+    };
+    fetch("/api/config", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(update),
+    }).then(function (r) { return r.json(); }).then(function () {
+      $("settings-msg").textContent = "Saved.";
+      setTimeout(function () { $("settings-msg").textContent = ""; }, 2500);
+    }).catch(function () { $("settings-msg").textContent = "Save failed."; });
+  });
+
+  loadMeta();
+})();
+</script>
+</body>
+</html>
+"""
+
+
+@app.route("/")
+def index():
+    return INDEX_HTML
+
+
+@app.route("/api/meta")
+def api_meta():
+    filters = ff_filters()
+    return jsonify({
+        "profiles": {k: {"label": v["label"], "desc": v["desc"]}
+                     for k, v in PROFILES.items()},
+        "brands": {k: {"channel": v["channel"], "slogan": v["slogan"]}
+                   for k, v in BRANDS.items()},
+        "fx": {k: {"label": v["label"], "available": fx_available(k)}
+               for k, v in FX_RACK.items()},
+        "viz": list(VIZ_MODES),
+        "breathing": {k: {"label": v["label"], "desc": v["desc"],
+                          "cycle": v["cycle"]}
+                      for k, v in BREATHING.items()},
+        "slow": {k: {"label": v["label"],
+                     "available": all(n in filters for n in v["needs"])}
+                 for k, v in SLOW_MODES.items()},
+        "stems": {k: v["label"] for k, v in STEM_MODES.items()},
+        "stems_available": demucs_available(),
+        "extend_presets": list(EXTEND_PRESETS),
+        "comp_orders": list(COMP_ORDERS),
+        "deps": {
+            "ffmpeg": have("ffmpeg"),
+            "yt-dlp": ytdlp_ok(),
+            "pillow": have_module("PIL"),
+            "whisper": have_module("faster_whisper"),
+            "demucs": demucs_available(),
+            "font": find_font() is not None,
+        },
+        "cfg": CFG,
+    })
+
+
+@app.route("/api/config", methods=["GET", "POST"])
+def api_config():
+    global CFG
+    if request.method == "POST":
+        data = request.get_json(force=True, silent=True) or {}
+        for k, v in data.items():
+            if k in DEFAULTS:
+                CFG[k] = v
+        save_cfg(CFG)
+        return jsonify(ok=True, cfg=CFG)
+    return jsonify(CFG)
+
+
+@app.route("/api/upload", methods=["POST"])
+def api_upload():
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return jsonify(error="No file provided"), 400
+    ext = os.path.splitext(f.filename)[1].lower()
+    if not re.fullmatch(r"\.[a-z0-9]{1,5}", ext or ""):
+        ext = ".bin"
+    tmp_id = uuid.uuid4().hex[:8]
+    path = os.path.join(TMP_DIR, f"up_{tmp_id}{ext}")
+    f.save(path)
+    return jsonify(path=path, name=f.filename)
+
+
+@app.route("/api/run", methods=["POST"])
+def api_run():
+    payload = request.get_json(force=True, silent=True) or {}
+    t = payload.get("type")
+    if t not in ("url", "local", "batch"):
+        return jsonify(error="Invalid source type"), 400
+    if t == "url" and not str(payload.get("url", "")).strip():
+        return jsonify(error="Missing url"), 400
+    if t == "batch" and not str(payload.get("urls", "")).strip():
+        return jsonify(error="Missing urls"), 400
+    if t == "local":
+        p = str(payload.get("path", "")).strip()
+        real_tmp = os.path.realpath(TMP_DIR)
+        real_p = os.path.realpath(p) if p else ""
+        if not p or not real_p.startswith(real_tmp + os.sep) or \
+                not os.path.isfile(real_p):
+            return jsonify(error="Invalid or missing upload path"), 400
+    job_id = uuid.uuid4().hex[:12]
+    with JOBS_LOCK:
+        JOBS[job_id] = {"q": queue.Queue(), "cancel": threading.Event()}
+    t = threading.Thread(target=run_job, args=(job_id, payload), daemon=True)
+    t.start()
+    return jsonify(job_id=job_id)
+
+
+@app.route("/api/cancel/<job_id>", methods=["POST"])
+def api_cancel(job_id):
+    job = JOBS.get(job_id)
+    if not job:
+        return jsonify(error="Unknown job"), 404
+    job["cancel"].set()
+    return jsonify(ok=True)
+
+
+@app.route("/api/stream/<job_id>")
+def api_stream(job_id):
+    job = JOBS.get(job_id)
+    if not job:
+        abort(404)
+    q = job["q"]
+
+    def gen():
+        try:
+            while True:
+                item = q.get()
+                if item is None:
+                    yield "event: end\ndata: {}\n\n"
+                    break
+                yield "data: " + json.dumps(item) + "\n\n"
+        finally:
+            with JOBS_LOCK:
+                JOBS.pop(job_id, None)
+
+    return Response(gen(), mimetype="text/event-stream",
+                    headers={"Cache-Control": "no-cache",
+                             "X-Accel-Buffering": "no"})
+
+
+def _safe_library_path(path):
+    out_dir = os.path.realpath(CFG.get("out_dir", DEFAULTS["out_dir"]))
+    real = os.path.realpath(path)
+    if real == out_dir or not real.startswith(out_dir + os.sep):
+        return None
+    return real
+
+
+@app.route("/api/library")
+def api_library():
+    out_dir = CFG.get("out_dir", DEFAULTS["out_dir"])
+    groups = {}
+    if os.path.isdir(out_dir):
+        for prof_dir in sorted(glob.glob(os.path.join(out_dir, "*"))):
+            if not os.path.isdir(prof_dir):
+                continue
+            prof_label = os.path.basename(prof_dir)
+            prof_key = next((k for k in PROFILES
+                             if profile_slug(k) == prof_label), prof_label)
+            for path in glob.glob(os.path.join(prof_dir, "*")):
+                name = os.path.basename(path)
+                if name.endswith("_thumb.png"):
+                    stem, kind = name[:-len("_thumb.png")], "thumb"
+                elif name.endswith("_youtube.txt"):
+                    stem, kind = name[:-len("_youtube.txt")], "meta"
+                elif name.endswith(".mp4"):
+                    stem, kind = name[:-4], "video"
+                elif name.endswith(".mp3"):
+                    stem, kind = name[:-4], "audio"
+                else:
+                    continue
+                key = (prof_dir, stem)
+                g = groups.setdefault(key, {"stem": stem, "profile": prof_key,
+                                            "files": {}})
+                st = os.stat(path)
+                g["files"][kind] = {"path": path, "name": name,
+                                    "size": human_size(st.st_size),
+                                    "mtime": st.st_mtime}
+    items = list(groups.values())
+    items.sort(key=lambda g: max(f["mtime"] for f in g["files"].values()),
+              reverse=True)
+    return jsonify(items=items)
+
+
+@app.route("/api/file")
+def api_file():
+    real = _safe_library_path(request.args.get("path", ""))
+    if not real or not os.path.isfile(real):
+        abort(404)
+    return send_file(real)
+
+
+@app.route("/api/library/delete", methods=["POST"])
+def api_library_delete():
+    data = request.get_json(force=True, silent=True) or {}
+    removed = []
+    for p in data.get("paths", []):
+        real = _safe_library_path(p)
+        if real and os.path.isfile(real):
+            try:
+                os.remove(real)
+                removed.append(p)
+            except Exception:
+                pass
+    return jsonify(removed=removed)
+
+
+if __name__ == "__main__":
+    port = int(os.environ.get("MEDTOOL_PORT", 8800))
+    host = os.environ.get("MEDTOOL_HOST", "127.0.0.1")
+    print(f"Golden Master Studio — http://{host}:{port}")
+    app.run(host=host, port=port, threaded=True)
+
