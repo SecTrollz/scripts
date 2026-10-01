@@ -2,7 +2,7 @@
 """
 Blackjack Advisor - Fully Autonomous
 No manual teaching, auto-discovers all selectors.
-Run: python blackjack_advisor.py --url https://casino.com/blackjack
+Run: python3 autobot.py --url https://casino.com/blackjack
 """
 
 import asyncio
@@ -38,14 +38,13 @@ MAX_CLICK_RETRIES = 3
 MAX_NULL_CLICKS = 3
 
 # ------------------------------------------------------------------------------
-# 1. JavaScript Hook – Injected into every frame (main + child)
+# 1. JavaScript Hook
 # ------------------------------------------------------------------------------
-GAME_HOOK_SCRIPT = """
+GAME_HOOK_SCRIPT = r"""
 (function() {
     if (window.__bja_installed) return;
     window.__bja_installed = true;
 
-    // Heartbeat
     if (window.__bjaHeartbeat) {
         window.__bjaHeartbeat(window.location.href);
     }
@@ -60,14 +59,11 @@ GAME_HOOK_SCRIPT = """
         }
     }
 
-    // ---------- Scanner ----------
     function scan() {
         const state = { dealer: [], player: [], buttons: [] };
         const body = document.body;
         if (!body) return state;
 
-        // ---- Buttons ----
-        const actions = ['HIT','STAND','DOUBLE','SPLIT','SURRENDER','DEAL'];
         const patterns = {
             HIT: /hit|h/i,
             STAND: /stand|st/i,
@@ -88,20 +84,16 @@ GAME_HOOK_SCRIPT = """
             }
         }
 
-        // ---- Cards ----
         function getRankSuit(el) {
-            // Text with unicode suits
             const text = el.textContent || '';
             const suitMatch = text.match(/[♠♥♦♣]/);
             const rankMatch = text.match(/[2-9JQKA]|10/);
             if (suitMatch && rankMatch) return { rank: rankMatch[0], suit: suitMatch[0] };
 
-            // data-* attributes
             const rankAttr = el.getAttribute('data-rank') || el.getAttribute('data-card') || el.getAttribute('data-value');
             const suitAttr = el.getAttribute('data-suit') || el.getAttribute('data-card-suit');
             if (rankAttr && suitAttr) return { rank: rankAttr, suit: suitAttr };
 
-            // image alt/src
             const img = el.querySelector('img');
             if (img) {
                 const alt = (img.getAttribute('alt') || '').toLowerCase();
@@ -129,7 +121,6 @@ GAME_HOOK_SCRIPT = """
                 }
             }
             if (cards.length === 0) {
-                // Scan all elements in container
                 const all = container.querySelectorAll('*');
                 for (const el of all) {
                     const info = getRankSuit(el);
@@ -145,7 +136,6 @@ GAME_HOOK_SCRIPT = """
             return cards;
         }
 
-        // Identify dealer and player zones
         const dealerZones = document.querySelectorAll('[class*="dealer"], [id*="dealer"], [class*="opponent"], [class*="banker"]');
         const playerZones = document.querySelectorAll('[class*="player"], [id*="player"], [class*="user"], [class*="hand"]');
 
@@ -161,23 +151,18 @@ GAME_HOOK_SCRIPT = """
             }
         }
         if (!dealerCards.length && !playerCards.length) {
-            // fallback: assume top half is dealer, bottom half player
             const rect = body.getBoundingClientRect();
             const mid = rect.height / 2;
             const all = body.querySelectorAll('*');
             for (const el of all) {
                 const r = el.getBoundingClientRect();
-                if (r.top < mid) {
-                    const info = getRankSuit(el);
-                    if (info) dealerCards.push(info);
-                } else {
-                    const info = getRankSuit(el);
-                    if (info) playerCards.push(info);
-                }
+                const info = getRankSuit(el);
+                if (!info) continue;
+                if (r.top < mid) dealerCards.push(info);
+                else playerCards.push(info);
             }
         }
 
-        // Remove duplicates
         function unique(arr) {
             const seen = new Set();
             return arr.filter(c => {
@@ -193,10 +178,9 @@ GAME_HOOK_SCRIPT = """
         return state;
     }
 
-    // ---- Observer ----
     let observer = null;
     function startObserver() {
-        if (observer) return;
+        if (observer || !document.body) return;
         observer = new MutationObserver(() => {
             const state = scan();
             if (state.dealer.length || state.player.length) emitState(state);
@@ -208,9 +192,9 @@ GAME_HOOK_SCRIPT = """
             attributeFilter: ['src', 'data-card', 'data-rank', 'style', 'class']
         });
     }
-    startObserver();
+    if (document.body) startObserver();
+    else document.addEventListener('DOMContentLoaded', startObserver);
 
-    // ---- Click listener ----
     document.addEventListener('click', () => {
         setTimeout(() => {
             const state = scan();
@@ -218,13 +202,11 @@ GAME_HOOK_SCRIPT = """
         }, 150);
     }, true);
 
-    // ---- Periodic scan ----
     setInterval(() => {
         const state = scan();
         if (state.dealer.length || state.player.length) emitState(state);
     }, 3000);
 
-    // ---- Initial scans ----
     setTimeout(() => {
         const state = scan();
         if (state.dealer.length || state.player.length) emitState(state);
@@ -240,97 +222,101 @@ GAME_HOOK_SCRIPT = """
 """
 
 # ------------------------------------------------------------------------------
-# 2. Strategy – Full Basic Strategy with Hi‑Lo Adjustments
+# 2. Strategy
 # ------------------------------------------------------------------------------
 class Strategy:
     """Full basic strategy tables for hard, soft, and pair hands."""
 
-    # Hard totals: player total (4-21) vs dealer upcard (2-11)
-    # Actions: H=Hit, S=Stand, D=Double (if allowed), Dh=Double if not then Hit, Ds=Double if not then Stand
     HARD = {
-        # 2  3  4  5  6  7  8  9 10  A
-        4:  'H','H','H','H','H','H','H','H','H','H',
-        5:  'H','H','H','H','H','H','H','H','H','H',
-        6:  'H','H','H','H','H','H','H','H','H','H',
-        7:  'H','H','H','H','H','H','H','H','H','H',
-        8:  'H','H','H','H','H','H','H','H','H','H',
-        9:  'H','D','D','D','D','H','H','H','H','H',
-        10: 'D','D','D','D','D','D','D','D','H','H',
-        11: 'D','D','D','D','D','D','D','D','D','H',
-        12: 'H','H','S','S','S','H','H','H','H','H',
-        13: 'S','S','S','S','S','H','H','H','H','H',
-        14: 'S','S','S','S','S','H','H','H','H','H',
-        15: 'S','S','S','S','S','H','H','H','H','H',
-        16: 'S','S','S','S','S','H','H','H','H','H',
-        17: 'S','S','S','S','S','S','S','S','S','S',
-        18: 'S','S','S','S','S','S','S','S','S','S',
-        19: 'S','S','S','S','S','S','S','S','S','S',
-        20: 'S','S','S','S','S','S','S','S','S','S',
-        21: 'S','S','S','S','S','S','S','S','S','S',
+        # 2    3    4    5    6    7    8    9   10    A
+        4:  ['H','H','H','H','H','H','H','H','H','H'],
+        5:  ['H','H','H','H','H','H','H','H','H','H'],
+        6:  ['H','H','H','H','H','H','H','H','H','H'],
+        7:  ['H','H','H','H','H','H','H','H','H','H'],
+        8:  ['H','H','H','H','H','H','H','H','H','H'],
+        9:  ['H','D','D','D','D','H','H','H','H','H'],
+        10: ['D','D','D','D','D','D','D','D','H','H'],
+        11: ['D','D','D','D','D','D','D','D','D','H'],
+        12: ['H','H','S','S','S','H','H','H','H','H'],
+        13: ['S','S','S','S','S','H','H','H','H','H'],
+        14: ['S','S','S','S','S','H','H','H','H','H'],
+        15: ['S','S','S','S','S','H','H','H','H','H'],
+        16: ['S','S','S','S','S','H','H','H','H','H'],
+        17: ['S','S','S','S','S','S','S','S','S','S'],
+        18: ['S','S','S','S','S','S','S','S','S','S'],
+        19: ['S','S','S','S','S','S','S','S','S','S'],
+        20: ['S','S','S','S','S','S','S','S','S','S'],
+        21: ['S','S','S','S','S','S','S','S','S','S'],
     }
 
-    # Soft totals: A+ (2-9) vs dealer
     SOFT = {
-        # 2  3  4  5  6  7  8  9 10  A
-        13: 'H','H','H','D','D','H','H','H','H','H',  # A+2
-        14: 'H','H','H','D','D','H','H','H','H','H',  # A+3
-        15: 'H','H','D','D','D','H','H','H','H','H',  # A+4
-        16: 'H','H','D','D','D','H','H','H','H','H',  # A+5
-        17: 'H','D','D','D','D','H','H','H','H','H',  # A+6
-        18: 'S','D','D','D','D','S','S','H','H','H',  # A+7 (stand vs 2,7,8)
-        19: 'S','S','S','S','S','S','S','S','S','S',  # A+8
-        20: 'S','S','S','S','S','S','S','S','S','S',  # A+9
-        21: 'S','S','S','S','S','S','S','S','S','S',
+        # 2    3    4    5    6    7    8    9   10    A
+        13: ['H','H','H','D','D','H','H','H','H','H'],  # A+2
+        14: ['H','H','H','D','D','H','H','H','H','H'],  # A+3
+        15: ['H','H','D','D','D','H','H','H','H','H'],  # A+4
+        16: ['H','H','D','D','D','H','H','H','H','H'],  # A+5
+        17: ['H','D','D','D','D','H','H','H','H','H'],  # A+6
+        18: ['S','D','D','D','D','S','S','H','H','H'],  # A+7
+        19: ['S','S','S','S','S','S','S','S','S','S'],  # A+8
+        20: ['S','S','S','S','S','S','S','S','S','S'],  # A+9
+        21: ['S','S','S','S','S','S','S','S','S','S'],
     }
 
-    # Pairs: same rank vs dealer
     PAIRS = {
-        # 2  3  4  5  6  7  8  9 10  A
-        2:  'P','P','P','P','P','P','H','H','H','H',
-        3:  'P','P','P','P','P','P','H','H','H','H',
-        4:  'H','H','P','P','P','H','H','H','H','H',
-        5:  'D','D','D','D','D','D','D','D','H','H',
-        6:  'P','P','P','P','P','H','H','H','H','H',
-        7:  'P','P','P','P','P','P','H','H','H','H',
-        8:  'P','P','P','P','P','P','P','P','P','P',
-        9:  'P','P','P','P','P','S','P','P','S','S',
-        10: 'S','S','S','S','S','S','S','S','S','S',
-        'A':'P','P','P','P','P','P','P','P','P','P',
+        # 2    3    4    5    6    7    8    9   10    A
+        2:   ['P','P','P','P','P','P','H','H','H','H'],
+        3:   ['P','P','P','P','P','P','H','H','H','H'],
+        4:   ['H','H','P','P','P','H','H','H','H','H'],
+        5:   ['D','D','D','D','D','D','D','D','H','H'],
+        6:   ['P','P','P','P','P','H','H','H','H','H'],
+        7:   ['P','P','P','P','P','P','H','H','H','H'],
+        8:   ['P','P','P','P','P','P','P','P','P','P'],
+        9:   ['P','P','P','P','P','S','P','P','S','S'],
+        10:  ['S','S','S','S','S','S','S','S','S','S'],
+        'A': ['P','P','P','P','P','P','P','P','P','P'],
     }
 
     @classmethod
-    def get_action(cls, player_cards: List[dict], dealer_upcard: int, can_double: bool, can_split: bool, count: int) -> str:
-        # Determine if pair
+    def get_action(cls, player_cards: List[dict], dealer_upcard: int,
+                   can_double: bool, can_split: bool, count: int) -> str:
+        if not (2 <= dealer_upcard <= 11):
+            return 'HIT'
+
+        # ---- Pair ----
         if len(player_cards) == 2 and player_cards[0].get('rank') == player_cards[1].get('rank'):
-            rank = player_cards[0].get('rank')
-            if rank.isdigit():
+            rank = str(player_cards[0].get('rank', '')).upper()
+            if rank in ('J', 'Q', 'K'):
+                pair_key = 10
+            elif rank == 'A':
+                pair_key = 'A'
+            elif rank.isdigit():
                 pair_key = int(rank)
             else:
-                pair_key = rank  # 'A','J','Q','K' but J/Q/K treated as 10 not splittable? Actually only same rank, J/Q/K are 10 but not same rank.
+                pair_key = None
+
             if pair_key in cls.PAIRS:
-                action = cls.PAIRS[pair_key][dealer_upcard-2]
+                action = cls.PAIRS[pair_key][dealer_upcard - 2]
                 if action == 'P':
                     if can_split:
                         return 'SPLIT'
-                    else:
-                        # fallback to hard total
-                        pass
+                    # fall through to soft/hard
                 else:
+                    if action == 'D' and not can_double:
+                        action = 'H'
                     return action
-        # Soft totals
+
+        # ---- Soft ----
         total = cls.hand_total(player_cards)
-        if any(c.get('rank') == 'A' for c in player_cards) and total <= 21:
-            # Soft total
-            soft_key = total
-            if soft_key in cls.SOFT:
-                action = cls.SOFT[soft_key][dealer_upcard-2]
+        if any(str(c.get('rank', '')).upper() == 'A' for c in player_cards) and total <= 21:
+            if total in cls.SOFT:
+                action = cls.SOFT[total][dealer_upcard - 2]
                 if action == 'D':
                     return 'DOUBLE' if can_double else 'HIT'
                 return action
-        # Hard totals
-        total = cls.hand_total(player_cards)
+
+        # ---- Hard ----
         if total in cls.HARD:
-            action = cls.HARD[total][dealer_upcard-2]
+            action = cls.HARD[total][dealer_upcard - 2]
             if action == 'D':
                 return 'DOUBLE' if can_double else 'HIT'
             return action
@@ -341,14 +327,14 @@ class Strategy:
         total = 0
         aces = 0
         for c in cards:
-            rank = c.get('rank', '').upper()
+            rank = str(c.get('rank', '')).upper()
             if rank == 'A':
                 aces += 1
                 total += 11
-            elif rank in ['J','Q','K']:
+            elif rank in ('J', 'Q', 'K'):
                 total += 10
-            else:
-                total += int(rank) if rank.isdigit() else 0
+            elif rank.isdigit():
+                total += int(rank)
         while total > 21 and aces > 0:
             total -= 10
             aces -= 1
@@ -372,14 +358,20 @@ class SelectorCache:
 
     def load(self):
         if os.path.exists(self.filename):
-            with open(self.filename, 'r') as f:
-                self.data = json.load(f)
+            try:
+                with open(self.filename, 'r') as f:
+                    self.data = json.load(f)
+            except Exception:
+                self.data = {}
         else:
             self.data = {}
 
     def save(self):
-        with open(self.filename, 'w') as f:
-            json.dump(self.data, f, indent=2)
+        try:
+            with open(self.filename, 'w') as f:
+                json.dump(self.data, f, indent=2)
+        except Exception as e:
+            logger.warning(f"Could not save selector cache: {e}")
 
     def get(self, domain: str, action: str) -> Optional[str]:
         return self.data.get(domain, {}).get(action)
@@ -408,9 +400,7 @@ class BlackjackAdvisor:
         self.current_state: Dict[str, Any] = {}
         self._stop = False
 
-    # --------------------------------------------------------------------------
-    # Lifecycle
-    # --------------------------------------------------------------------------
+    # ---- Lifecycle ----
     async def launch(self, url: str):
         p = await async_playwright().start()
         self.browser = await p.chromium.launch(
@@ -424,7 +414,9 @@ class BlackjackAdvisor:
         )
         context = await self.browser.new_context(
             viewport={'width': 1280, 'height': 800},
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            user_agent=('Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                        'AppleWebKit/537.36 (KHTML, like Gecko) '
+                        'Chrome/120.0.0.0 Safari/537.36')
         )
         self.page = await context.new_page()
 
@@ -433,16 +425,17 @@ class BlackjackAdvisor:
 
         logger.info(f"Navigating to {url}")
         await self.page.goto(url, wait_until='domcontentloaded')
-        await self.page.wait_for_load_state('networkidle')
+        try:
+            await self.page.wait_for_load_state('networkidle', timeout=15000)
+        except Exception:
+            pass
 
-        # Inject into main frame
         await self._inject_hooks(self.page.main_frame)
 
         self.page.on('frameattached', self._on_frame_attached)
         self.page.on('framenavigated', self._on_frame_navigated)
         await self._sweep_frames()
 
-        # Wait for heartbeat confirmation
         start = time.time()
         while time.time() - start < HEARTBEAT_TIMEOUT:
             if self.confirmed_frames:
@@ -450,17 +443,19 @@ class BlackjackAdvisor:
                 break
             await asyncio.sleep(0.5)
         if not self.confirmed_frames:
-            logger.warning("No heartbeat received from any frame. Some features may not work.")
+            logger.warning("No heartbeat received from any frame.")
 
         logger.info("Launch complete.")
 
     async def close(self):
+        self._stop = True
         if self.browser:
-            await self.browser.close()
+            try:
+                await self.browser.close()
+            except Exception:
+                pass
 
-    # --------------------------------------------------------------------------
-    # Injection helpers
-    # --------------------------------------------------------------------------
+    # ---- Injection ----
     async def _inject_hooks(self, frame: Frame):
         try:
             await frame.evaluate(GAME_HOOK_SCRIPT)
@@ -482,12 +477,9 @@ class BlackjackAdvisor:
         if not self.page:
             return
         for frame in self.page.frames:
-            if frame != self.page.main_frame:
-                await self._inject_hooks(frame)
+            await self._inject_hooks(frame)
 
-    # --------------------------------------------------------------------------
-    # Heartbeat & State callbacks
-    # --------------------------------------------------------------------------
+    # ---- Callbacks ----
     async def _on_heartbeat(self, url: str):
         self.confirmed_frames.add(url)
         logger.info(f"Heartbeat from {url}")
@@ -497,210 +489,218 @@ class BlackjackAdvisor:
         self.current_state = state
         dealer = state.get('dealer', [])
         player = state.get('player', [])
-        # Update Hi-Lo
         for c in dealer + player:
-            rank = c.get('rank', '').upper()
-            if rank in ['2','3','4','5','6']:
+            rank = str(c.get('rank', '')).upper()
+            if rank in ('2', '3', '4', '5', '6'):
                 self.count += 1
-            elif rank in ['10','J','Q','K','A']:
+            elif rank in ('10', 'J', 'Q', 'K', 'A'):
                 self.count -= 1
         logger.info(f"State: Dealer {len(dealer)} cards, Player {len(player)} cards, Count {self.count}")
 
-    # --------------------------------------------------------------------------
-    # Auto-Discovery
-    # --------------------------------------------------------------------------
+    # ---- Auto-discovery ----
     async def _discover_action_button(self, action: str, frame: Frame) -> Optional[str]:
         keywords = {
-            'HIT': ['hit','h'],
-            'STAND': ['stand','st'],
-            'DOUBLE': ['double','dbl'],
-            'SPLIT': ['split','sp'],
-            'SURRENDER': ['surrender','surr'],
-            'DEAL': ['deal','bet','new game','new round','start','play']
+            'HIT': ['hit'],
+            'STAND': ['stand'],
+            'DOUBLE': ['double', 'dbl'],
+            'SPLIT': ['split'],
+            'SURRENDER': ['surrender', 'surr'],
+            'DEAL': ['deal', 'bet', 'new game', 'new round', 'start', 'play']
         }.get(action, [action.lower()])
 
-        selector = await frame.evaluate(f"""
-            (keywords) => {{
-                const all = document.querySelectorAll('button, [role="button"], [data-action], .btn, [class*="button"], [class*="Button"]');
-                let best = null, bestScore = -1;
-                for (const el of all) {{
-                    const text = (el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim().toLowerCase();
-                    let score = 0;
-                    for (const kw of keywords) {{
-                        if (text.includes(kw)) score += 10;
-                        if ((el.getAttribute('data-action')||'').toLowerCase().includes(kw)) score += 8;
-                        if ((el.className||'').toLowerCase().includes(kw)) score += 4;
-                    }}
-                    if (score > bestScore) {{
-                        bestScore = score;
-                        best = el;
-                    }}
-                }}
-                if (best && bestScore > 5) {{
-                    if (best.id) return '#' + best.id;
-                    if (best.className) return '.' + best.className.split(' ').filter(c=>c).join('.');
-                    return best.tagName.toLowerCase();
-                }}
-                return null;
-            }}
-        """, keywords)
-        if selector:
-            logger.info(f"Discovered selector for {action}: {selector}")
-            return selector
-        return None
-
-    async def _discover_card_areas(self, frame: Frame) -> Tuple[Optional[str], Optional[str]]:
-        result = await frame.evaluate("""
-            () => {
-                const dealer = [], player = [];
-                const dSel = document.querySelectorAll('[class*="dealer"], [id*="dealer"], [class*="opponent"], [class*="banker"]');
-                for (const el of dSel) {
-                    if (el.children.length) {
-                        dealer.push(el.tagName.toLowerCase() + (el.id ? '#'+el.id : '') + (el.className ? '.'+el.className.replace(/ /g,'.') : ''));
-                    }
-                }
-                const pSel = document.querySelectorAll('[class*="player"], [id*="player"], [class*="user"], [class*="hand"]');
-                for (const el of pSel) {
-                    if (el.children.length) {
-                        player.push(el.tagName.toLowerCase() + (el.id ? '#'+el.id : '') + (el.className ? '.'+el.className.replace(/ /g,'.') : ''));
-                    }
-                }
-                if (dealer.length === 0) {
-                    const body = document.body;
-                    const rect = body.getBoundingClientRect();
-                    const mid = rect.height / 2;
-                    const all = body.querySelectorAll('*');
-                    let dCand = [], pCand = [];
+        try:
+            selector = await frame.evaluate("""
+                (keywords) => {
+                    const all = document.querySelectorAll('button, [role="button"], [data-action], .btn, [class*="button"], [class*="Button"]');
+                    let best = null, bestScore = 0;
                     for (const el of all) {
                         const r = el.getBoundingClientRect();
-                        if (r.top < mid && r.height > 30) dCand.push(el);
-                        else if (r.top >= mid && r.height > 30) pCand.push(el);
+                        if (r.width < 2 || r.height < 2) continue;
+                        const text = (el.innerText || el.getAttribute('aria-label') || el.getAttribute('title') || '').trim().toLowerCase();
+                        const dataAction = (el.getAttribute('data-action') || '').toLowerCase();
+                        const cls = (el.className || '').toString().toLowerCase();
+                        let score = 0;
+                        for (const kw of keywords) {
+                            if (text === kw) score += 20;
+                            else if (text.includes(kw)) score += 10;
+                            if (dataAction.includes(kw)) score += 8;
+                            if (cls.includes(kw)) score += 4;
+                        }
+                        if (score > bestScore) {
+                            bestScore = score;
+                            best = el;
+                        }
                     }
-                    if (dCand.length) {
-                        const largest = dCand.reduce((a,b) => a.children.length > b.children.length ? a : b);
-                        dealer.push(largest.tagName.toLowerCase() + (largest.id ? '#'+largest.id : '') + (largest.className ? '.'+largest.className.replace(/ /g,'.') : ''));
+                    if (!best || bestScore < 6) return null;
+                    if (best.id) return '#' + CSS.escape(best.id);
+                    if (best.dataset && best.dataset.action)
+                        return `[data-action="${best.dataset.action}"]`;
+                    // nth-of-type path
+                    const parts = [];
+                    let cur = best;
+                    for (let i = 0; i < 4 && cur && cur.nodeType === 1; i++) {
+                        let tag = cur.tagName.toLowerCase();
+                        if (cur.id) { parts.unshift('#' + CSS.escape(cur.id)); break; }
+                        let idx = 1;
+                        let sib = cur;
+                        while ((sib = sib.previousElementSibling)) {
+                            if (sib.tagName === cur.tagName) idx++;
+                        }
+                        parts.unshift(`${tag}:nth-of-type(${idx})`);
+                        cur = cur.parentElement;
                     }
-                    if (pCand.length) {
-                        const largest = pCand.reduce((a,b) => a.children.length > b.children.length ? a : b);
-                        player.push(largest.tagName.toLowerCase() + (largest.id ? '#'+largest.id : '') + (largest.className ? '.'+largest.className.replace(/ /g,'.') : ''));
-                    }
+                    return parts.join(' > ');
                 }
-                return { dealer: dealer[0] || null, player: player[0] || null };
-            }
-        """)
-        return result.get('dealer'), result.get('player')
+            """, keywords)
+        except Exception as e:
+            logger.debug(f"discover_action_button failed: {e}")
+            return None
 
-    # --------------------------------------------------------------------------
-    # Clicking
-    # --------------------------------------------------------------------------
+        if selector:
+            logger.info(f"Discovered selector for {action}: {selector}")
+        return selector
+
+    async def _discover_card_areas(self, frame: Frame) -> Tuple[Optional[str], Optional[str]]:
+        try:
+            result = await frame.evaluate("""
+                () => {
+                    const dealer = [], player = [];
+                    const dSel = document.querySelectorAll('[class*="dealer"], [id*="dealer"], [class*="opponent"], [class*="banker"]');
+                    for (const el of dSel) {
+                        if (el.children.length) {
+                            dealer.push(el.tagName.toLowerCase() + (el.id ? '#'+el.id : '') + (el.className ? '.'+el.className.toString().replace(/ /g,'.') : ''));
+                        }
+                    }
+                    const pSel = document.querySelectorAll('[class*="player"], [id*="player"], [class*="user"], [class*="hand"]');
+                    for (const el of pSel) {
+                        if (el.children.length) {
+                            player.push(el.tagName.toLowerCase() + (el.id ? '#'+el.id : '') + (el.className ? '.'+el.className.toString().replace(/ /g,'.') : ''));
+                        }
+                    }
+                    return { dealer: dealer[0] || null, player: player[0] || null };
+                }
+            """)
+            return result.get('dealer'), result.get('player')
+        except Exception:
+            return None, None
+
+    # ---- Clicking ----
     async def _click_action(self, action: str, frame: Frame) -> bool:
-        domain = self.page.url if self.page else ''
-        # Try cache
+        domain = 'default'
+        try:
+            from urllib.parse import urlparse
+            domain = urlparse(self.page.url).netloc or 'default'
+        except Exception:
+            pass
+
+        # 1. Cached
         selector = self.cache.get(domain, action)
-        if not selector:
-            selector = await self._discover_action_button(action, frame)
-            if selector:
-                self.cache.set(domain, action, selector)
+        if selector and await self._try_click_selector(selector):
+            return True
 
-        if not selector:
-            # Fallback: generic text selector
-            keywords = {
-                'HIT': ['hit','h'],
-                'STAND': ['stand','st'],
-                'DOUBLE': ['double','dbl'],
-                'SPLIT': ['split','sp'],
-                'SURRENDER': ['surrender','surr'],
-                'DEAL': ['deal','bet','new game','new round','start','play']
-            }.get(action, [action.lower()])
-            for kw in keywords:
-                try:
-                    el = await frame.query_selector(f"button:has-text('{kw}')")
-                    if el:
-                        selector = f"button:has-text('{kw}')"
-                        break
-                except:
-                    pass
-            if not selector:
-                selector = f"button[data-action*='{action.lower()}']"
-
-        if not selector:
-            logger.warning(f"No selector for {action}")
-            return False
-
-        for attempt in range(MAX_CLICK_RETRIES):
-            try:
-                await frame.click(selector, force=True, timeout=2000)
-                logger.info(f"Clicked {action} with selector: {selector}")
+        # 2. Auto-discover
+        for f in self.page.frames:
+            sel = await self._discover_action_button(action, f)
+            if sel and await self._try_click_selector(sel):
+                self.cache.set(domain, action, sel)
                 return True
-            except Exception as e:
-                logger.warning(f"Click attempt {attempt+1} failed: {e}")
-                await asyncio.sleep(0.5)
+
+        # 3. Fallback: text selectors
+        keywords = {
+            'HIT': ['hit'],
+            'STAND': ['stand'],
+            'DOUBLE': ['double', 'dbl'],
+            'SPLIT': ['split'],
+            'SURRENDER': ['surrender', 'surr'],
+            'DEAL': ['deal', 'bet', 'new game', 'new round', 'start', 'play']
+        }.get(action, [action.lower()])
+
+        for kw in keywords:
+            for f in self.page.frames:
+                for sel in (f"button:has-text('{kw}')",
+                            f"[role='button']:has-text('{kw}')",
+                            f"[data-action*='{kw}']"):
+                    if await self._try_click_selector(sel, f):
+                        return True
+
+        logger.warning(f"Could not find button for action: {action}")
         return False
 
-    # --------------------------------------------------------------------------
-    # Main autoplay
-    # --------------------------------------------------------------------------
+    async def _try_click_selector(self, selector: str, frame: Optional[Frame] = None) -> bool:
+        if not self.page:
+            return False
+        frames = [frame] if frame else self.page.frames
+        for f in frames:
+            try:
+                loc = f.locator(selector).first
+                if await loc.count() == 0:
+                    continue
+                if not await loc.is_visible():
+                    continue
+                await loc.click(timeout=1500)
+                logger.info(f"Clicked {selector} in {f.url}")
+                return True
+            except Exception:
+                continue
+        return False
+
+    # ---- Autoplay ----
     async def autoplay(self):
         if not self.page:
             raise RuntimeError("Not launched")
         frame = self.page.main_frame
 
-        for round_num in range(1, self.rounds+1):
+        for round_num in range(1, self.rounds + 1):
             if self._stop:
                 break
 
-            # Watchdog
-            if time.time() - self.last_state_update > STATE_TIMEOUT:
-                logger.warning("State timeout, sweeping frames...")
+            if time.time() - self.last_state_update > STATE_TIMEOUT * 2:
+                logger.warning("State timeout, re-scanning...")
                 await self._sweep_frames()
-                await asyncio.sleep(1.5)
-                # Force scan
-                await frame.evaluate("window.__bja_scan_now()")
+                try:
+                    await frame.evaluate("window.__bja_scan_now && window.__bja_scan_now()")
+                except Exception:
+                    pass
+                await asyncio.sleep(1.0)
                 continue
 
-            # Get state from latest callback or scan
-            state = self.current_state
-            if not state.get('dealer') and not state.get('player'):
-                # Force scan
-                state = await frame.evaluate("window.__bja_scan_now()")
-                self.current_state = state
+            state = self.current_state or {}
+            dealer_cards = state.get('dealer', []) or []
+            player_cards = state.get('player', []) or []
+            buttons = {b.get('action') for b in (state.get('buttons') or [])}
 
-            dealer_cards = state.get('dealer', [])
-            player_cards = state.get('player', [])
-
+            # Nothing yet → wait
             if not dealer_cards and not player_cards:
-                logger.info("No cards, waiting...")
-                await asyncio.sleep(2)
-                continue
-
-            # Determine if betting phase (no dealer cards)
-            if not dealer_cards:
-                # Place bet / deal
-                logger.info("Betting phase, clicking DEAL")
-                success = await self._click_action('DEAL', frame)
-                if not success:
-                    self.null_click_count += 1
-                    if self.null_click_count >= MAX_NULL_CLICKS:
-                        logger.error("Too many null clicks, stopping.")
-                        break
+                # If there is a DEAL button, click it to start a hand
+                if 'DEAL' in buttons:
+                    await self._click_action('DEAL', frame)
+                    await asyncio.sleep(1.5)
                 else:
-                    self.null_click_count = 0
-                await asyncio.sleep(1)
+                    await asyncio.sleep(1.0)
                 continue
 
-            # Game is active
-            dealer_upcard = 0
-            if dealer_cards:
-                dealer_upcard = Strategy.hand_total([dealer_cards[0]])  # upcard only
+            # Player hasn't been dealt yet but dealer has → wait
+            if not player_cards:
+                await asyncio.sleep(0.5)
+                continue
 
-            can_double = len(player_cards) == 2
-            can_split = len(player_cards) == 2 and player_cards[0].get('rank') == player_cards[1].get('rank')
+            upcard = Strategy.hand_total([dealer_cards[0]]) if dealer_cards else 0
+            if not (2 <= upcard <= 11):
+                await asyncio.sleep(0.5)
+                continue
 
-            action = Strategy.get_action(player_cards, dealer_upcard, can_double, can_split, self.count)
-            logger.info(f"Round {round_num}: Player {player_cards}, Dealer up {dealer_upcard}, Action: {action}")
+            can_double = len(player_cards) == 2 and 'DOUBLE' in buttons
+            can_split = (len(player_cards) == 2 and 'SPLIT' in buttons and
+                         str(player_cards[0].get('rank', '')).upper() ==
+                         str(player_cards[1].get('rank', '')).upper())
 
-            success = await self._click_action(action, frame)
-            if success:
+            action = Strategy.get_action(player_cards, upcard, can_double, can_split, self.count)
+            total = Strategy.hand_total(player_cards)
+            logger.info(f"Round {round_num}: Player {player_cards} (={total}), "
+                        f"Dealer up {upcard}, Action: {action}")
+
+            ok = await self._click_action(action, frame)
+            if ok:
                 self.null_click_count = 0
             else:
                 self.null_click_count += 1
@@ -708,20 +708,22 @@ class BlackjackAdvisor:
                     logger.error("Null click limit reached, stopping.")
                     break
 
-            # Wait for next state
             await asyncio.sleep(1.5)
 
         logger.info("Autoplay finished.")
 
-    # --------------------------------------------------------------------------
-    # Run
-    # --------------------------------------------------------------------------
+    # ---- Run ----
     async def run(self, url: str):
         await self.launch(url)
-        await self.autoplay()
-        if not self.headless:
-            input("Press Enter to close browser...")
-        await self.close()
+        try:
+            await self.autoplay()
+        finally:
+            if not self.headless:
+                try:
+                    input("Press Enter to close browser...")
+                except EOFError:
+                    pass
+            await self.close()
 
 # ------------------------------------------------------------------------------
 # 5. Entry point
@@ -734,7 +736,9 @@ async def main():
     parser.add_argument('--bet', type=int, default=1, help='Base bet unit')
     args = parser.parse_args()
 
-    advisor = BlackjackAdvisor(headless=args.headless, rounds=args.rounds, bet_unit=args.bet)
+    advisor = BlackjackAdvisor(headless=args.headless,
+                               rounds=args.rounds,
+                               bet_unit=args.bet)
     try:
         await advisor.run(args.url)
     except KeyboardInterrupt:
@@ -743,4 +747,7 @@ async def main():
         await advisor.close()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
